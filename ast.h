@@ -12,7 +12,10 @@ enum class NodeType {
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT
 };
 
-enum class DataType { INT32, INT64 };
+enum class DataType { INT32, INT64, CLOSURE };
+
+// Forward declarations
+class FunctionDeclNode;
 
 
 
@@ -21,6 +24,9 @@ struct VariableInfo {
     std::string name;
     int scopeDepth;
     int offset = 0;  // Offset within lexical scope object
+    
+    // For closures: back-reference to get captured scopes from funcNode->scope->allNeeded
+    FunctionDeclNode* funcNode = nullptr;
 };
 
 
@@ -103,13 +109,13 @@ public:
         
         // Sort by type size (biggest first)
         std::sort(vars.begin(), vars.end(), [](const auto& a, const auto& b) {
-            return getTypeSize(a.second->type) > getTypeSize(b.second->type);
+            return getTypeSize(*a.second) > getTypeSize(*b.second);
         });
         
         int offset = 0;
         for (auto& [name, var] : vars) {
-            int size = getTypeSize(var->type);
-            int align = size; // Alignment equals size for primitives
+            int size = getTypeSize(*var);
+            int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
             offset = (offset + align - 1) & ~(align - 1); // Align
             var->offset = offset;
             offset += size;
@@ -120,9 +126,7 @@ public:
     }
 
 private:
-    static int getTypeSize(DataType type) {
-        return type == DataType::INT32 ? 4 : 8;
-    }
+    static int getTypeSize(const VariableInfo& var);
 };
 
 class VarDeclNode : public ASTNode {
@@ -152,3 +156,12 @@ class LiteralNode : public ASTNode {
 public:
     LiteralNode(const std::string& val) : ASTNode(NodeType::LITERAL, val) {}
 };
+
+// Implementation of getTypeSize after all classes are defined
+inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
+    if (var.type == DataType::CLOSURE && var.funcNode) {
+        // Base size (function pointer) + captured scope pointers
+        return 8 + (var.funcNode->scope->allNeeded.size() * 8);
+    }
+    return var.type == DataType::INT32 ? 4 : 8;
+}

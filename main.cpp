@@ -55,8 +55,19 @@ void printAST(ASTNode* node, int indent = 0) {
                 std::cout << " [size=" << scope->totalSize << "]";
                 std::cout << " [vars:";
                 for (auto& [name, var] : scope->variables) {
-                    std::cout << " " << name << "@" << var.offset 
-                             << "(" << (var.type == DataType::INT32 ? "i32" : "i64") << ")";
+                    std::cout << " " << name << "@" << var.offset << "(";
+                    if (var.type == DataType::INT32) {
+                        std::cout << "i32";
+                    } else if (var.type == DataType::INT64) {
+                        std::cout << "i64";
+                    } else if (var.type == DataType::CLOSURE) {
+                        int closureSize = 8; // base size
+                        if (var.funcNode && var.funcNode->scope) {
+                            closureSize += var.funcNode->scope->allNeeded.size() * 8;
+                        }
+                        std::cout << "closure:" << closureSize;
+                    }
+                    std::cout << ")";
                 }
                 std::cout << "]";
             }

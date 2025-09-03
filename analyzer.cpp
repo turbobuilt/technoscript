@@ -22,6 +22,16 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
     
     if (node->type == NodeType::FUNCTION_DECL) {
         auto func = static_cast<FunctionDeclNode*>(node);
+        
+        // Create closure variable for function (hoisting)
+        VariableInfo closureVar;
+        closureVar.type = DataType::CLOSURE;
+        closureVar.name = func->funcName;
+        closureVar.scopeDepth = scope->depth;
+        closureVar.funcNode = func;
+        scope->variables[func->funcName] = closureVar;
+        
+        // Recursively collect variables in function body
         collectVariables(func->scope.get(), func->scope.get());
     }
     
