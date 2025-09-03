@@ -19,7 +19,7 @@ class Parser {
 private:
     std::vector<Token> tokens;
     size_t pos = 0;
-    int currentDepth = 1;
+    int currentDepth = 0;
     
     Token& current() { return tokens[pos]; }
     void advance() { if (pos < tokens.size() - 1) pos++; }

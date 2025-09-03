@@ -1,6 +1,7 @@
 #include "parser.h"
 #include <stdexcept>
 #include <cctype>
+#include <iostream>
 
 void Parser::expect(TokenType t) {
     if (current().type != t) throw std::runtime_error("Unexpected token");
@@ -58,11 +59,12 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
 std::unique_ptr<LexicalScopeNode> Parser::parse(const std::string& code) {
     tokens = tokenize(code);
     pos = 0;
-    auto root = std::make_unique<LexicalScopeNode>(1);
+    currentDepth = 0;
+    auto root = std::make_unique<LexicalScopeNode>(nullptr, 0);
     
     while (!match(TokenType::EOF_TOKEN)) {
         auto stmt = parseStatement(root.get());
-        if (stmt) root->children.push_back(std::move(stmt));
+        if (stmt) root->ASTNode::children.push_back(std::move(stmt));
     }
     return root;
 }
@@ -102,12 +104,12 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     expect(TokenType::LBRACE);
     
     auto func = std::make_unique<FunctionDeclNode>(name);
-    func->scope = std::make_unique<LexicalScopeNode>(currentDepth + 1);
+    func->scope = std::make_unique<LexicalScopeNode>(nullptr, currentDepth + 1);
     currentDepth++;
     
     while (!match(TokenType::RBRACE)) {
         auto stmt = parseStatement(func->scope.get());
-        if (stmt) func->scope->children.push_back(std::move(stmt));
+        if (stmt) func->scope->ASTNode::children.push_back(std::move(stmt));
     }
     expect(TokenType::RBRACE);
     currentDepth--;

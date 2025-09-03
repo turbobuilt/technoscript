@@ -3,6 +3,8 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <map>
+#include <set>
 
 enum class NodeType {
     PROGRAM, LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
@@ -34,12 +36,61 @@ public:
 
 class LexicalScopeNode : public ASTNode {
 public:
-    std::unordered_map<std::string, std::unique_ptr<VariableInfo>> variables;
+    std::map<std::string, VariableInfo> variables;
+    std::vector<LexicalScopeNode*> children;
+    LexicalScopeNode* parent;
     int depth;
-    LexicalScopeNode* parent = nullptr;
     
-    LexicalScopeNode(int d, LexicalScopeNode* p = nullptr) 
-        : ASTNode(NodeType::LEXICAL_SCOPE), depth(d), parent(p) {}
+    std::set<int> parentDeps;    // Parent scope depths this scope depends on
+    std::set<int> descendantDeps; // Parent scope depths needed by descendants
+    std::vector<int> allNeeded;     // Combined dependencies (parents first, then descendants, no duplicates)
+    
+    // For codegen: maps required depth -> index in parent's scope array
+    // -1 means it's the immediate parent scope itself
+    std::map<int, int> scopeIndexMap;
+    
+    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(NodeType::LEXICAL_SCOPE), parent(p), depth(d) {
+        if (parent) parent->children.push_back(this);
+    }
+    
+    void updateAllNeeded() {
+        allNeeded.clear();
+        
+        // Add parent deps first
+        for (int depthIdx : parentDeps) {
+            allNeeded.push_back(depthIdx);
+        }
+        
+        // Add descendant deps that aren't already in parent deps
+        for (int depthIdx : descendantDeps) {
+            if (parentDeps.find(depthIdx) == parentDeps.end()) {
+                allNeeded.push_back(depthIdx);
+            }
+        }
+    }
+    
+    void buildScopeIndexMap() {
+        scopeIndexMap.clear();
+        
+        if (!parent) return; // Root scope has no parent
+        
+        // Build map based on what this scope needs and what parent provides
+        for (int neededDepth : allNeeded) {
+            if (neededDepth == parent->depth) {
+                // The needed scope is the immediate parent
+                scopeIndexMap[neededDepth] = -1;
+            } else {
+                // Find where this depth appears in parent's allNeeded array
+                auto& parentAllNeeded = parent->allNeeded;
+                for (int i = 0; i < (int)parentAllNeeded.size(); i++) {
+                    if (parentAllNeeded[i] == neededDepth) {
+                        scopeIndexMap[neededDepth] = i;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 };
 
 class VarDeclNode : public ASTNode {

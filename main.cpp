@@ -13,6 +13,42 @@ void printAST(ASTNode* node, int indent = 0) {
         case NodeType::LEXICAL_SCOPE: {
             auto scope = static_cast<LexicalScopeNode*>(node);
             std::cout << "SCOPE(depth=" << scope->depth << ")";
+            
+            // Print parent dependencies
+            if (!scope->parentDeps.empty()) {
+                std::cout << " [parent-deps:";
+                for (int dep : scope->parentDeps) {
+                    std::cout << " " << dep;
+                }
+                std::cout << "]";
+            }
+            
+            // Print descendant dependencies
+            if (!scope->descendantDeps.empty()) {
+                std::cout << " [desc-deps:";
+                for (int dep : scope->descendantDeps) {
+                    std::cout << " " << dep;
+                }
+                std::cout << "]";
+            }
+            
+            // Print all needed scopes
+            if (!scope->allNeeded.empty()) {
+                std::cout << " [all-needed:";
+                for (int dep : scope->allNeeded) {
+                    std::cout << " " << dep;
+                }
+                std::cout << "]";
+            }
+            
+            // Print scope index map for codegen
+            if (!scope->scopeIndexMap.empty()) {
+                std::cout << " [scope-map:";
+                for (auto& [depth, index] : scope->scopeIndexMap) {
+                    std::cout << " " << depth << "->" << index;
+                }
+                std::cout << "]";
+            }
             break;
         }
         case NodeType::VAR_DECL: 
@@ -61,8 +97,9 @@ function level1() {
     var middle: int64 = 10;
     function level2() {
         var inner: int64 = 5;
+        print("level1", middle)
         function level3() {
-            print(outer, middle, inner)
+            print(outer, inner, middle)
         }
         level3()
     }
