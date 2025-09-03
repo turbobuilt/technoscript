@@ -13,6 +13,7 @@ private:
     void addDescendantDep(LexicalScopeNode* scope, int depthIdx);
     void updateAllNeededArrays(LexicalScopeNode* scope);
     void buildAllScopeIndexMaps(LexicalScopeNode* scope);
+    void packScopes(LexicalScopeNode* scope);
     
 public:
     void analyze(LexicalScopeNode* root);

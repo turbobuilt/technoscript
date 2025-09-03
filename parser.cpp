@@ -23,6 +23,7 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             if (word == "var") result.emplace_back(TokenType::VAR);
             else if (word == "function") result.emplace_back(TokenType::FUNCTION);
             else if (word == "go") result.emplace_back(TokenType::GO);
+            else if (word == "int32") result.emplace_back(TokenType::INT32_TYPE);
             else if (word == "int64") result.emplace_back(TokenType::INT64_TYPE);
             else if (word == "print") result.emplace_back(TokenType::PRINT);
             else result.emplace_back(TokenType::IDENTIFIER, word);
@@ -83,10 +84,20 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     std::string name = current().value;
     expect(TokenType::IDENTIFIER);
     expect(TokenType::COLON);
-    expect(TokenType::INT64_TYPE);
-    expect(TokenType::ASSIGN);
     
-    auto varDecl = std::make_unique<VarDeclNode>(name, DataType::INT64);
+    DataType varType;
+    if (match(TokenType::INT32_TYPE)) {
+        varType = DataType::INT32;
+        advance();
+    } else if (match(TokenType::INT64_TYPE)) {
+        varType = DataType::INT64;
+        advance();
+    } else {
+        throw std::runtime_error("Expected type");
+    }
+    
+    expect(TokenType::ASSIGN);
+    auto varDecl = std::make_unique<VarDeclNode>(name, varType);
     if (match(TokenType::LITERAL)) {
         varDecl->children.push_back(std::make_unique<LiteralNode>(current().value));
         advance();

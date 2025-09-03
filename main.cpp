@@ -49,6 +49,17 @@ void printAST(ASTNode* node, int indent = 0) {
                 }
                 std::cout << "]";
             }
+            
+            // Print packing info
+            if (!scope->variables.empty()) {
+                std::cout << " [size=" << scope->totalSize << "]";
+                std::cout << " [vars:";
+                for (auto& [name, var] : scope->variables) {
+                    std::cout << " " << name << "@" << var.offset 
+                             << "(" << (var.type == DataType::INT32 ? "i32" : "i64") << ")";
+                }
+                std::cout << "]";
+            }
             break;
         }
         case NodeType::VAR_DECL: 
@@ -91,15 +102,18 @@ go test()
     )";
     
     std::string code2 = R"(
-var outer1: int64 = 41;
-var outer: int64 = 42;
+var small: int32 = 1;
+var big1: int64 = 41;
+var tiny: int32 = 2;
+var big2: int64 = 42;
 function level1() {
-    var middle: int64 = 10;
+    var medium: int32 = 10;
+    var large: int64 = 100;
     function level2() {
-        var inner: int64 = 5;
-        print("level1", middle)
+        var mini: int32 = 5;
+        print("level1", medium)
         function level3() {
-            print(outer, inner, middle)
+            print(big2, mini, medium)
         }
         level3()
     }

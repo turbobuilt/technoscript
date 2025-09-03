@@ -7,6 +7,7 @@ void Analyzer::analyze(LexicalScopeNode* root) {
     analyzeScope(root);
     updateAllNeededArrays(root);
     buildAllScopeIndexMaps(root);
+    packScopes(root);
 }
 
 void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
@@ -152,5 +153,22 @@ void Analyzer::setupParentPointers(ASTNode* node, LexicalScopeNode* parent, int 
     
     for (auto& child : node->children) {
         setupParentPointers(child.get(), parent, depth);
+    }
+}
+
+void Analyzer::packScopes(LexicalScopeNode* scope) {
+    scope->pack();
+    
+    // Recursively pack all function scopes
+    for (auto& child : scope->ASTNode::children) {
+        if (child->type == NodeType::FUNCTION_DECL) {
+            auto func = static_cast<FunctionDeclNode*>(child.get());
+            packScopes(func->scope.get());
+        }
+    }
+    
+    // Also pack LexicalScopeNode children
+    for (auto* child : scope->children) {
+        packScopes(child);
     }
 }
