@@ -114,13 +114,12 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     expect(TokenType::RPAREN);
     expect(TokenType::LBRACE);
     
-    auto func = std::make_unique<FunctionDeclNode>(name);
-    func->scope = std::make_unique<LexicalScopeNode>(nullptr, currentDepth + 1);
+    auto func = std::make_unique<FunctionDeclNode>(name, nullptr);
     currentDepth++;
     
     while (!match(TokenType::RBRACE)) {
-        auto stmt = parseStatement(func->scope.get());
-        if (stmt) func->scope->ASTNode::children.push_back(std::move(stmt));
+        auto stmt = parseStatement(func.get());
+        if (stmt) func->ASTNode::children.push_back(std::move(stmt));
     }
     expect(TokenType::RBRACE);
     currentDepth--;

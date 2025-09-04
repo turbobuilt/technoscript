@@ -31,8 +31,11 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
         closureVar.funcNode = func;
         scope->variables[func->funcName] = closureVar;
         
-        // Recursively collect variables in function body
-        collectVariables(func->scope.get(), func->scope.get());
+        // Recursively collect variables in function body (children, not the function itself)
+        for (auto& child : func->ASTNode::children) {
+            collectVariables(child.get(), func);
+        }
+        return; // Don't process children again below
     }
     
     for (auto& child : node->children) {
@@ -53,13 +56,13 @@ void Analyzer::analyzeScope(LexicalScopeNode* scope) {
 }
 
 void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
-    if (node->type == NodeType::IDENTIFIER) {
+    if (node->type == NodeType::IDENTIFIER || node->type == NodeType::FUNCTION_CALL) {
         node->varRef = findVariable(node->value, currentScope);
     }
     
     if (node->type == NodeType::FUNCTION_DECL) {
         auto func = static_cast<FunctionDeclNode*>(node);
-        analyzeScope(func->scope.get());
+        analyzeScope(func);
         return;
     }
     
@@ -120,7 +123,7 @@ void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
-            updateAllNeededArrays(func->scope.get());
+            updateAllNeededArrays(func);
         }
     }
     
@@ -137,7 +140,7 @@ void Analyzer::buildAllScopeIndexMaps(LexicalScopeNode* scope) {
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
-            buildAllScopeIndexMaps(func->scope.get());
+            buildAllScopeIndexMaps(func);
         }
     }
     
@@ -148,17 +151,12 @@ void Analyzer::buildAllScopeIndexMaps(LexicalScopeNode* scope) {
 }
 
 void Analyzer::setupParentPointers(ASTNode* node, LexicalScopeNode* parent, int depth) {
-    if (node->type == NodeType::LEXICAL_SCOPE) {
+    if (node->type == NodeType::LEXICAL_SCOPE || node->type == NodeType::FUNCTION_DECL) {
         auto scope = static_cast<LexicalScopeNode*>(node);
         scope->parent = parent;
         scope->depth = depth;
         parent = scope;
         depth++;
-    }
-    
-    if (node->type == NodeType::FUNCTION_DECL) {
-        auto func = static_cast<FunctionDeclNode*>(node);
-        setupParentPointers(func->scope.get(), parent, depth);
     }
     
     for (auto& child : node->children) {
@@ -173,7 +171,7 @@ void Analyzer::packScopes(LexicalScopeNode* scope) {
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
-            packScopes(func->scope.get());
+            packScopes(func);
         }
     }
     

@@ -10,9 +10,17 @@ void printAST(ASTNode* node, int indent = 0) {
     
     switch (node->type) {
         case NodeType::PROGRAM: std::cout << "PROGRAM"; break;
+        case NodeType::FUNCTION_DECL:
+            // Fall through to LEXICAL_SCOPE
         case NodeType::LEXICAL_SCOPE: {
             auto scope = static_cast<LexicalScopeNode*>(node);
             std::cout << "SCOPE(depth=" << scope->depth << ")";
+            
+            // If this scope is also a function
+            if (node->type == NodeType::FUNCTION_DECL) {
+                auto func = static_cast<FunctionDeclNode*>(scope);
+                std::cout << " FUNC(" << func->funcName << ")";
+            }
             
             // Print parent dependencies
             if (!scope->parentDeps.empty()) {
@@ -62,8 +70,8 @@ void printAST(ASTNode* node, int indent = 0) {
                         std::cout << "i64";
                     } else if (var.type == DataType::CLOSURE) {
                         int closureSize = 8; // base size
-                        if (var.funcNode && var.funcNode->scope) {
-                            closureSize += var.funcNode->scope->allNeeded.size() * 8;
+                        if (var.funcNode) {
+                            closureSize += var.funcNode->allNeeded.size() * 8;
                         }
                         std::cout << "closure:" << closureSize;
                     }
@@ -76,10 +84,9 @@ void printAST(ASTNode* node, int indent = 0) {
         case NodeType::VAR_DECL: 
             std::cout << "VAR " << static_cast<VarDeclNode*>(node)->varName; 
             break;
-        case NodeType::FUNCTION_DECL: std::cout << "FUNC " << node->value; break;
         case NodeType::FUNCTION_CALL: {
             auto* call = static_cast<FunctionCallNode*>(node);
-            std::cout << "CALL " << call->funcName;
+            std::cout << "CALL " << call->value;
             if (!call->args.empty()) {
                 std::cout << "(";
                 for (size_t i = 0; i < call->args.size(); i++) {
@@ -105,11 +112,6 @@ void printAST(ASTNode* node, int indent = 0) {
     
     for (auto& child : node->children) {
         printAST(child.get(), indent + 1);
-    }
-    
-    if (node->type == NodeType::FUNCTION_DECL) {
-        auto func = static_cast<FunctionDeclNode*>(node);
-        if (func->scope) printAST(func->scope.get(), indent + 1);
     }
 }
 

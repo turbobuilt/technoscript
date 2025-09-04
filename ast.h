@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <stdexcept>
 
 enum class NodeType {
     PROGRAM, LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
@@ -23,11 +24,9 @@ class LexicalScopeNode;
 struct VariableInfo {
     DataType type;
     std::string name;
-    int offset = 0;  // Offset within lexical scope object
-    LexicalScopeNode* definedIn = nullptr;  // Scope where this variable is defined
-    
-    // For closures: back-reference to get captured scopes from funcNode->scope->allNeeded
-    FunctionDeclNode* funcNode = nullptr;
+    int offset = 0;
+    LexicalScopeNode* definedIn = nullptr;
+    FunctionDeclNode* funcNode = nullptr; // For closures: back-reference to function
 };
 
 
@@ -102,6 +101,10 @@ public:
         }
     }
     
+    int getIndexInCurrentScope(LexicalScopeNode* activeScope) {
+        return activeScope->scopeIndexMap.at(this->depth);
+    }
+    
     void pack() {
         std::vector<std::pair<std::string, VariableInfo*>> vars;
         for (auto& [name, var] : variables) {
@@ -139,18 +142,43 @@ public:
         : ASTNode(NodeType::VAR_DECL), varName(name), varType(type) {}
 };
 
-class FunctionDeclNode : public ASTNode {
+class FunctionDeclNode : public LexicalScopeNode {
 public:
     std::string funcName;
-    std::unique_ptr<LexicalScopeNode> scope;
+    std::vector<std::string> params;
     
-    FunctionDeclNode(const std::string& name) 
-        : ASTNode(NodeType::FUNCTION_DECL, name), funcName(name) {}
+    FunctionDeclNode(const std::string& name, LexicalScopeNode* p = nullptr) 
+        : LexicalScopeNode(p), funcName(name) {
+        type = NodeType::FUNCTION_DECL;
+        value = name;
+    }
 };
 
 class IdentifierNode : public ASTNode {
 public:
+    struct VariableAccess {
+        int parameterIndex; // -1 if in current scope, else index in parent params
+        int offset;
+    };
+    
     IdentifierNode(const std::string& name) : ASTNode(NodeType::IDENTIFIER, name) {}
+    
+    // any time this is accessed it could be in the current scope or in an ancestor scope. Ancestor scopes are passed as "hidden params" after actual params. This function tells us the index of that scope address, and the offset in it we can find this variable at.
+    VariableAccess getVariableAccess(LexicalScopeNode* currentScope) {
+        if (!varRef) throw std::runtime_error("Variable not analyzed: " + value);
+        if (!varRef->definedIn) throw std::runtime_error("Variable scope not found: " + value);
+        
+        LexicalScopeNode* definingScope = varRef->definedIn;
+        
+        if (definingScope == currentScope) {
+            return {-1, varRef->offset};
+        } else {
+            int scopeIndex = definingScope->getIndexInCurrentScope(currentScope);
+            FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(currentScope);
+            int paramIndex = currentFunc->params.size() + scopeIndex;
+            return {paramIndex, varRef->offset};
+        }
+    }
 };
 
 class LiteralNode : public ASTNode {
@@ -158,19 +186,17 @@ public:
     LiteralNode(const std::string& val) : ASTNode(NodeType::LITERAL, val) {}
 };
 
-class FunctionCallNode : public ASTNode {
+class FunctionCallNode : public IdentifierNode {
 public:
-    std::string funcName;
     std::vector<std::unique_ptr<ASTNode>> args;
-    
-    FunctionCallNode(const std::string& name) : ASTNode(NodeType::FUNCTION_CALL, name), funcName(name) {}
+
+    FunctionCallNode(const std::string& name) : IdentifierNode(name) {}
 };
 
 // Implementation of getTypeSize after all classes are defined
 inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
     if (var.type == DataType::CLOSURE && var.funcNode) {
-        // Base size (function pointer) + captured scope pointers
-        return 8 + (var.funcNode->scope->allNeeded.size() * 8);
+        return 8 + (var.funcNode->allNeeded.size() * 8);
     }
     return var.type == DataType::INT32 ? 4 : 8;
 }
