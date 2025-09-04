@@ -131,9 +131,16 @@ std::unique_ptr<ASTNode> Parser::parseFunctionCall() {
     std::string name = current().value;
     expect(TokenType::IDENTIFIER);
     expect(TokenType::LPAREN);
-    expect(TokenType::RPAREN);
     
-    auto call = std::make_unique<ASTNode>(NodeType::FUNCTION_CALL, name);
+    auto call = std::make_unique<FunctionCallNode>(name);
+    
+    // Parse arguments if any (for future extension)
+    while (!match(TokenType::RPAREN)) {
+        // TODO: Parse arguments when expression parsing is implemented
+        advance(); // Skip tokens for now
+    }
+    
+    expect(TokenType::RPAREN);
     return call;
 }
 

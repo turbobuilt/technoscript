@@ -77,7 +77,19 @@ void printAST(ASTNode* node, int indent = 0) {
             std::cout << "VAR " << static_cast<VarDeclNode*>(node)->varName; 
             break;
         case NodeType::FUNCTION_DECL: std::cout << "FUNC " << node->value; break;
-        case NodeType::FUNCTION_CALL: std::cout << "CALL " << node->value; break;
+        case NodeType::FUNCTION_CALL: {
+            auto* call = static_cast<FunctionCallNode*>(node);
+            std::cout << "CALL " << call->funcName;
+            if (!call->args.empty()) {
+                std::cout << "(";
+                for (size_t i = 0; i < call->args.size(); i++) {
+                    if (i > 0) std::cout << ",";
+                    printAST(call->args[i].get(), indent + 1);
+                }
+                std::cout << ")";
+            }
+            break;
+        }
         case NodeType::IDENTIFIER: {
             std::cout << "ID " << node->value;
             if (node->varRef) {

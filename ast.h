@@ -158,6 +158,14 @@ public:
     LiteralNode(const std::string& val) : ASTNode(NodeType::LITERAL, val) {}
 };
 
+class FunctionCallNode : public ASTNode {
+public:
+    std::string funcName;
+    std::vector<std::unique_ptr<ASTNode>> args;
+    
+    FunctionCallNode(const std::string& name) : ASTNode(NodeType::FUNCTION_CALL, name), funcName(name) {}
+};
+
 // Implementation of getTypeSize after all classes are defined
 inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
     if (var.type == DataType::CLOSURE && var.funcNode) {
