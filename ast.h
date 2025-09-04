@@ -16,14 +16,15 @@ enum class DataType { INT32, INT64, CLOSURE };
 
 // Forward declarations
 class FunctionDeclNode;
+class LexicalScopeNode;
 
 
 
 struct VariableInfo {
     DataType type;
     std::string name;
-    int scopeDepth;
     int offset = 0;  // Offset within lexical scope object
+    LexicalScopeNode* definedIn = nullptr;  // Scope where this variable is defined
     
     // For closures: back-reference to get captured scopes from funcNode->scope->allNeeded
     FunctionDeclNode* funcNode = nullptr;

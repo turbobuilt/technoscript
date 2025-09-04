@@ -16,7 +16,7 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
         VariableInfo varInfo;
         varInfo.type = varDecl->varType;
         varInfo.name = varDecl->varName;
-        varInfo.scopeDepth = scope->depth;
+        varInfo.definedIn = scope;
         scope->variables[varDecl->varName] = varInfo;
     }
     
@@ -27,7 +27,7 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
         VariableInfo closureVar;
         closureVar.type = DataType::CLOSURE;
         closureVar.name = func->funcName;
-        closureVar.scopeDepth = scope->depth;
+        closureVar.definedIn = scope;
         closureVar.funcNode = func;
         scope->variables[func->funcName] = closureVar;
         

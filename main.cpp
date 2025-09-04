@@ -81,7 +81,7 @@ void printAST(ASTNode* node, int indent = 0) {
         case NodeType::IDENTIFIER: {
             std::cout << "ID " << node->value;
             if (node->varRef) {
-                std::cout << " -> depth" << node->varRef->scopeDepth;
+                std::cout << " -> depth" << node->varRef->definedIn->depth;
             }
             break;
         }
