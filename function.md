@@ -42,3 +42,8 @@ function y(){
 }
 
 The first thing that will happen is that a variable called y will be initialized with the address of y and the lexical scope address that contains x
+
+
+heap allocation is tough, but we will allocate a big chunk. and we will move the pointer forward the correct amount, allocating more as needed. For now, this is all we will do, no memory clean up.
+
+all instructions emitted must return the length. so we can compute the 

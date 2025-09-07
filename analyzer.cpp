@@ -6,7 +6,7 @@ void Analyzer::analyze(LexicalScopeNode* root) {
     setupParentPointers(root, nullptr, 0);
     analyzeScope(root);
     updateAllNeededArrays(root);
-    buildAllScopeIndexMaps(root);
+    buildAllScopeDepthToParentParameterIndexMaps(root);
     packScopes(root);
 }
 
@@ -72,7 +72,7 @@ void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
 }
 
 VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* scope) {
-    LexicalScopeNode* current = scope->parent;
+    LexicalScopeNode* current = scope->parentFunctionScope;
     LexicalScopeNode* defScope = nullptr;
     
     // Find where variable is defined
@@ -82,7 +82,7 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
             defScope = current;
             break;
         }
-        current = current->parent;
+        current = current->parentFunctionScope;
     }
     
     if (defScope) {
@@ -90,10 +90,10 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
         addParentDep(scope, defScope->depth);
         
         // Add descendant dependencies to all parents up to definition
-        LexicalScopeNode* parent = scope->parent;
+        LexicalScopeNode* parent = scope->parentFunctionScope;
         while (parent && parent != defScope) {
             addDescendantDep(parent, defScope->depth);
-            parent = parent->parent;
+            parent = parent->parentFunctionScope;
         }
         
         return &defScope->variables[name];
@@ -133,27 +133,22 @@ void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
     }
 }
 
-void Analyzer::buildAllScopeIndexMaps(LexicalScopeNode* scope) {
-    scope->buildScopeIndexMap();
+void Analyzer::buildAllScopeDepthToParentParameterIndexMaps(LexicalScopeNode* scope) {
+    scope->buildScopeDepthToParentParameterIndexMap();
     
-    // Recursively build maps for all function scopes
+    // Traverse AST children (not scope children)
     for (auto& child : scope->ASTNode::children) {
-        if (child->type == NodeType::FUNCTION_DECL) {
-            auto func = static_cast<FunctionDeclNode*>(child.get());
-            buildAllScopeIndexMaps(func);
+        if (child->type == NodeType::FUNCTION_DECL || child->type == NodeType::LEXICAL_SCOPE) {
+            LexicalScopeNode* childScope = static_cast<LexicalScopeNode*>(child.get());
+            buildAllScopeDepthToParentParameterIndexMaps(childScope);
         }
-    }
-    
-    // Also build for LexicalScopeNode children
-    for (auto* child : scope->children) {
-        buildAllScopeIndexMaps(child);
     }
 }
 
 void Analyzer::setupParentPointers(ASTNode* node, LexicalScopeNode* parent, int depth) {
     if (node->type == NodeType::LEXICAL_SCOPE || node->type == NodeType::FUNCTION_DECL) {
         auto scope = static_cast<LexicalScopeNode*>(node);
-        scope->parent = parent;
+        scope->parentFunctionScope = parent;
         scope->depth = depth;
         parent = scope;
         depth++;

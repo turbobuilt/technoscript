@@ -46,7 +46,7 @@ class LexicalScopeNode : public ASTNode {
 public:
     std::map<std::string, VariableInfo> variables;
     std::vector<LexicalScopeNode*> children;
-    LexicalScopeNode* parent;
+    LexicalScopeNode* parentFunctionScope;
     int depth;
     
     std::set<int> parentDeps;    // Parent scope depths this scope depends on
@@ -54,12 +54,12 @@ public:
     std::vector<int> allNeeded;     // Combined dependencies (parents first, then descendants, no duplicates)
     int totalSize = 0;              // Total packed size of this scope
     
-    // For codegen: maps required depth -> index in parent's scope array
-    // -1 means it's the immediate parent scope itself
-    std::map<int, int> scopeIndexMap;
+    // For codegen: maps required depth -> parameter index in parent function
+    // -1 means it's the immediate parent scope itself (stored in current scope)
+    std::map<int, int> scopeDepthToParentParameterIndexMap;
     
-    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(NodeType::LEXICAL_SCOPE), parent(p), depth(d) {
-        if (parent) parent->children.push_back(this);
+    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(NodeType::LEXICAL_SCOPE), parentFunctionScope(p), depth(d) {
+        if (parentFunctionScope) parentFunctionScope->children.push_back(this);
     }
     
     void updateAllNeeded() {
@@ -78,31 +78,10 @@ public:
         }
     }
     
-    void buildScopeIndexMap() {
-        scopeIndexMap.clear();
-        
-        if (!parent) return; // Root scope has no parent
-        
-        // Build map based on what this scope needs and what parent provides
-        for (int neededDepth : allNeeded) {
-            if (neededDepth == parent->depth) {
-                // The needed scope is the immediate parent
-                scopeIndexMap[neededDepth] = -1;
-            } else {
-                // Find where this depth appears in parent's allNeeded array
-                auto& parentAllNeeded = parent->allNeeded;
-                for (int i = 0; i < (int)parentAllNeeded.size(); i++) {
-                    if (parentAllNeeded[i] == neededDepth) {
-                        scopeIndexMap[neededDepth] = i;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    void buildScopeDepthToParentParameterIndexMap();
     
-    int getIndexInCurrentScope(LexicalScopeNode* activeScope) {
-        return activeScope->scopeIndexMap.at(this->depth);
+    int getParameterIndexInCurrentScope(LexicalScopeNode* activeScope) {
+        return activeScope->scopeDepthToParentParameterIndexMap.at(this->depth);
     }
     
     void pack() {
@@ -163,7 +142,7 @@ public:
     
     IdentifierNode(const std::string& name) : ASTNode(NodeType::IDENTIFIER, name) {}
     
-    // any time this is accessed it could be in the current scope or in an ancestor scope. Ancestor scopes are passed as "hidden params" after actual params. This function tells us the index of that scope address, and the offset in it we can find this variable at.
+    // any time this is accessed it could be in the current scope or in an ancestor scope. Ancestor scopes are passed as "hidden params" after actual params. This function tells us the parameter index of that scope address, and the offset in it we can find this variable at.
     VariableAccess getVariableAccess(LexicalScopeNode* currentScope) {
         if (!varRef) throw std::runtime_error("Variable not analyzed: " + value);
         if (!varRef->definedIn) throw std::runtime_error("Variable scope not found: " + value);
@@ -173,9 +152,7 @@ public:
         if (definingScope == currentScope) {
             return {-1, varRef->offset};
         } else {
-            int scopeIndex = definingScope->getIndexInCurrentScope(currentScope);
-            FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(currentScope);
-            int paramIndex = currentFunc->params.size() + scopeIndex;
+            int paramIndex = definingScope->getParameterIndexInCurrentScope(currentScope);
             return {paramIndex, varRef->offset};
         }
     }
@@ -199,4 +176,36 @@ inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
         return 8 + (var.funcNode->allNeeded.size() * 8);
     }
     return var.type == DataType::INT32 ? 4 : 8;
+}
+
+// Implementation of buildScopeDepthToParentParameterIndexMap after all classes are defined
+inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
+    scopeDepthToParentParameterIndexMap.clear();
+    
+    if (!parentFunctionScope) return; // Root scope has no parent
+    
+    // Only function scopes need parameter mapping
+    if (this->type != NodeType::FUNCTION_DECL) return;
+    
+    // Get the current function's parameter count
+    FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
+    int currentParamCount = currentFunc->params.size();
+    
+    // Build map based on what this scope needs and what parent provides
+    for (int neededDepth : allNeeded) {
+        if (neededDepth == parentFunctionScope->depth) {
+            // The needed scope is the immediate parent
+            scopeDepthToParentParameterIndexMap[neededDepth] = -1;
+        } else {
+            // Find where this depth appears in parent's allNeeded array
+            auto& parentAllNeeded = parentFunctionScope->allNeeded;
+            for (int i = 0; i < (int)parentAllNeeded.size(); i++) {
+                if (parentAllNeeded[i] == neededDepth) {
+                    // Add current function's parameter count to get final parameter index
+                    scopeDepthToParentParameterIndexMap[neededDepth] = currentParamCount + i;
+                    break;
+                }
+            }
+        }
+    }
 }

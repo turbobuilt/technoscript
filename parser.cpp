@@ -111,10 +111,20 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     std::string name = current().value;
     expect(TokenType::IDENTIFIER);
     expect(TokenType::LPAREN);
+    
+    auto func = std::make_unique<FunctionDeclNode>(name, nullptr);
+    
+    // Parse parameters
+    while (!match(TokenType::RPAREN)) {
+        std::string paramName = current().value;
+        expect(TokenType::IDENTIFIER);
+        func->params.push_back(paramName);
+        if (match(TokenType::COMMA)) advance();
+    }
+    
     expect(TokenType::RPAREN);
     expect(TokenType::LBRACE);
     
-    auto func = std::make_unique<FunctionDeclNode>(name, nullptr);
     currentDepth++;
     
     while (!match(TokenType::RBRACE)) {
@@ -133,10 +143,19 @@ std::unique_ptr<ASTNode> Parser::parseFunctionCall() {
     
     auto call = std::make_unique<FunctionCallNode>(name);
     
-    // Parse arguments if any (for future extension)
+    // Parse arguments
     while (!match(TokenType::RPAREN)) {
-        // TODO: Parse arguments when expression parsing is implemented
-        advance(); // Skip tokens for now
+        if (match(TokenType::IDENTIFIER)) {
+            call->args.push_back(std::make_unique<IdentifierNode>(current().value));
+            advance();
+        } else if (match(TokenType::STRING)) {
+            call->args.push_back(std::make_unique<LiteralNode>(current().value));
+            advance();
+        } else if (match(TokenType::LITERAL)) {
+            call->args.push_back(std::make_unique<LiteralNode>(current().value));
+            advance();
+        }
+        if (match(TokenType::COMMA)) advance();
     }
     
     expect(TokenType::RPAREN);
