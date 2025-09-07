@@ -125,6 +125,7 @@ class FunctionDeclNode : public LexicalScopeNode {
 public:
     std::string funcName;
     std::vector<std::string> params;
+    uint64_t functionAddress = 0;  // Set during codegen, used for patching closures
     
     FunctionDeclNode(const std::string& name, LexicalScopeNode* p = nullptr) 
         : LexicalScopeNode(p), funcName(name) {

@@ -53,6 +53,15 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             total_length += generatePrintStatement(node, current_scope);
             break;
         }
+        case NodeType::FUNCTION_DECL: {
+            // Set the function address to current position in buffer
+            FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(node);
+            funcDecl->functionAddress = emitter.buffer.size();
+            
+            // TODO: Generate function body later
+            // For now, just skip function generation
+            break;
+        }
         case NodeType::FUNCTION_CALL:
         case NodeType::GO_STMT:
             // TODO: Implement these later
@@ -154,15 +163,70 @@ size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_
     return total_length;
 }
 
+size_t Codegen::createClosures(LexicalScopeNode* scope) {
+    size_t total_length = 0;
+    
+    // Loop through all variables in this scope
+    for (auto& [name, varInfo] : scope->variables) {
+        if (varInfo.type == DataType::CLOSURE) {
+            // This is a closure variable - need to create the closure structure
+            FunctionDeclNode* funcNode = varInfo.funcNode;
+            if (!funcNode) continue;
+            
+            // Closure structure: [function_address][scope_addr_1][scope_addr_2]...
+            // First, load the function address into RAX using placeholder
+            
+            // mov rax, <placeholder>
+            total_length += emitter.emitBytes({0x48, 0xB8}); // mov rax, imm64 prefix
+            
+            // Create patch entry with exact offset
+            FunctionPatch patch;
+            patch.func = funcNode;
+            total_length += emitter.emitFunctionAddressPlaceholder(patch.offset_in_buffer);
+            function_patches.push_back(patch);
+            
+            // Store function address at R15 + offset
+            total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset);
+            
+            // Now store addresses of needed parent scopes
+            // For each scope in funcNode->allNeeded, we need to store its address
+            for (size_t i = 0; i < funcNode->allNeeded.size(); i++) {
+                // TODO: Get address of parent scope at depth funcNode->allNeeded[i]
+                // For now, just store 0 as placeholder
+                total_length += emitter.emitMovRAXImm64(0);
+                total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset + 8 + (i * 8));
+            }
+        }
+    }
+    
+    return total_length;
+}
+
+void Codegen::patchFunctionAddresses() {
+    // Patch all function addresses in the machine code buffer
+    for (const auto& patch : function_patches) {
+        uint64_t func_addr = patch.func->functionAddress;
+        
+        // Write the address into the buffer at the exact offset
+        for (int i = 0; i < 8; i++) {
+            emitter.buffer[patch.offset_in_buffer + i] = static_cast<uint8_t>((func_addr >> (i * 8)) & 0xFF);
+        }
+    }
+}
+
 void Codegen::generateProgram(ASTNode& root) {
     emitter.clear();
     initExternFunctions();
+    function_patches.clear();
     
     // Cast root to LexicalScopeNode (global scope)
     LexicalScopeNode* global_scope = static_cast<LexicalScopeNode*>(&root);
     
     // Allocate memory for global scope
     allocateScope(global_scope, true);
+    
+    // Create closures for functions in global scope
+    createClosures(global_scope);
     
     // Walk the AST and generate code for all children (these are unique_ptr<ASTNode>)
     for (auto& child : global_scope->ASTNode::children) {
@@ -185,6 +249,15 @@ void Codegen::writeProgramToExecutable() {
         std::cerr << "Failed to allocate executable memory" << std::endl;
         return;
     }
+    
+    // Convert relative function addresses to absolute addresses in executable memory
+    uint64_t base_address = reinterpret_cast<uint64_t>(exec_mem);
+    for (const auto& patch : function_patches) {
+        patch.func->functionAddress = base_address + patch.func->functionAddress;
+    }
+    
+    // Patch function addresses with absolute addresses
+    patchFunctionAddresses();
     
     // Copy machine code to executable memory
     std::memcpy(exec_mem, emitter.buffer.data(), emitter.buffer.size());

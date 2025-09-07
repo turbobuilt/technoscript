@@ -10,6 +10,10 @@ int main() {
     std::string code0 = R"(
 var x: int64 = 10;
 print(x)
+
+function test() {
+
+}
     )";
     std::string code1 = R"(
 var x: int64 = 0;

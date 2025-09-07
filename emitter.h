@@ -75,6 +75,13 @@ public:
         // mov rax, address; call rax
         return emitMovRAXImm64(address) + emitBytes({0xFF, 0xD0}); // call rax (12 bytes total)
     }
+    
+    // Emit placeholder for function address that will be patched later
+    // Returns the exact offset where the 8-byte address should be written
+    size_t emitFunctionAddressPlaceholder(size_t& patch_offset) {
+        patch_offset = buffer.size(); // Store exact offset for patching
+        return emitU64(0); // 8 bytes of zeros as placeholder
+    }
 
     // Append raw data (e.g. string literal)
     size_t emitData(const std::string& s) { buffer.insert(buffer.end(), s.begin(), s.end()); return s.size(); }
