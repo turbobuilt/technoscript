@@ -23,6 +23,9 @@ private:
     // Allocate memory for lexical scope - returns instruction length
     size_t allocateScope(LexicalScopeNode* scope, bool is_global = false);
     
+    // Restore previous lexical scope - returns instruction length
+    size_t restoreScope();
+    
     // Create closures in the current scope - returns instruction length
     size_t createClosures(LexicalScopeNode* scope);
     
@@ -35,6 +38,7 @@ private:
     size_t generateLiteral(LiteralNode* node);
     size_t generatePrintStatement(ASTNode* node, LexicalScopeNode* current_scope);
     size_t generateIdentifier(IdentifierNode* node, LexicalScopeNode* current_scope);
+    size_t generateFunctionCall(FunctionCallNode* node, LexicalScopeNode* current_scope);
     
 public:
     void generateProgram(ASTNode& root);

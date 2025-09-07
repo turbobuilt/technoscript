@@ -30,6 +30,7 @@ public:
     size_t emitMovRAXRDI() { return emitBytes({0x48, 0x89, 0xF8}); } // mov rax, rdi
     size_t emitAddALImm8(uint8_t imm) { return emitBytes({0x04, imm}); } // add al, imm8
     size_t emitPushRAX() { return emitByte(0x50); }
+    size_t emitPopRAX() { return emitByte(0x58); } // pop rax
     size_t emitAddRSPImm8(uint8_t imm) { return emitBytes({0x48, 0x83, 0xC4, imm}); } // add rsp, imm8
     size_t emitMovRSIRSP() { return emitBytes({0x48, 0x89, 0xE6}); } // mov rsi, rsp
     size_t emitRet() { return emitByte(0xC3); }
@@ -81,6 +82,42 @@ public:
     size_t emitFunctionAddressPlaceholder(size_t& patch_offset) {
         patch_offset = buffer.size(); // Store exact offset for patching
         return emitU64(0); // 8 bytes of zeros as placeholder
+    }
+    
+    // Load parameter by index into RAX (System V ABI)
+    size_t emitLoadParamToRAX(int param_index) {
+        switch (param_index) {
+            case 0: return emitBytes({0x48, 0x89, 0xF8}); // mov rax, rdi
+            case 1: return emitBytes({0x48, 0x89, 0xF0}); // mov rax, rsi  
+            case 2: return emitBytes({0x48, 0x89, 0xD0}); // mov rax, rdx
+            case 3: return emitBytes({0x48, 0x89, 0xC8}); // mov rax, rcx
+            case 4: return emitBytes({0x4C, 0x89, 0xC0}); // mov rax, r8
+            case 5: return emitBytes({0x4C, 0x89, 0xC8}); // mov rax, r9
+            default:
+                // Parameter is on stack - TODO: implement stack parameter access
+                return 0;
+        }
+    }
+    
+    // System V ABI parameter register operations
+    // Parameter registers: RDI, RSI, RDX, RCX, R8, R9 (0-5)
+    size_t emitMovRAXFromParam(int param_index) {
+        switch (param_index) {
+            case 0: return emitBytes({0x48, 0x89, 0xF8}); // mov rax, rdi
+            case 1: return emitBytes({0x48, 0x89, 0xF0}); // mov rax, rsi  
+            case 2: return emitBytes({0x48, 0x89, 0xD0}); // mov rax, rdx
+            case 3: return emitBytes({0x48, 0x89, 0xC8}); // mov rax, rcx
+            case 4: return emitBytes({0x4C, 0x89, 0xC0}); // mov rax, r8
+            case 5: return emitBytes({0x4C, 0x89, 0xC8}); // mov rax, r9
+            default:
+                // Parameter on stack: mov rax, [rsp + 8 + (param_index - 6) * 8]
+                int stack_offset = 8 + (param_index - 6) * 8;
+                if (stack_offset <= 127) {
+                    return emitBytes({0x48, 0x8B, 0x44, 0x24, static_cast<uint8_t>(stack_offset)}); // mov rax, [rsp+offset8]
+                } else {
+                    return emitBytes({0x48, 0x8B, 0x84, 0x24}) + emitU32(static_cast<uint32_t>(stack_offset)); // mov rax, [rsp+offset32]
+                }
+        }
     }
 
     // Append raw data (e.g. string literal)

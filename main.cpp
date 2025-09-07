@@ -12,7 +12,7 @@ var x: int64 = 10;
 print(x)
 
 function test() {
-
+    print(x)
 }
     )";
     std::string code1 = R"(
@@ -50,8 +50,8 @@ level1()
     Analyzer analyzer;
     Codegen codeGen;
     
-    std::cout << "=== Parsing Code 0 ===\n";
-    auto ast1 = parser.parse(code0);
+    std::cout << "=== Parsing Code 1 ===\n";
+    auto ast1 = parser.parse(code1);
     analyzer.analyze(ast1.get());
     printAST(ast1.get());
     codeGen.generateProgram(*ast1);
