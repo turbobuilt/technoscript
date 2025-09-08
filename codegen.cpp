@@ -235,13 +235,61 @@ size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNod
         total_length += emitter.emitMovParamFromRAX(static_cast<int>(i));
     }
     
+    // Now we need to pass the lexical scope addresses as additional parameters
+    // Get the closure's location (variable access) instead of loading its content
+    auto access = static_cast<IdentifierNode*>(funcCall)->getVariableAccess(current_scope);
+    
+    // Get the function being called to know how many scope addresses it needs
+    FunctionDeclNode* targetFunc = nullptr;
+    if (funcCall->varRef && funcCall->varRef->funcNode) {
+        targetFunc = funcCall->varRef->funcNode;
+    }
+    
+    if (targetFunc) {
+        // Pass lexical scope addresses as additional parameters
+        // These start after the regular arguments
+        size_t scopeParamStartIndex = funcCall->args.size();
+        
+        for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
+            size_t paramIndex = scopeParamStartIndex + i;
+            
+            if (paramIndex < 6) {
+                // Load scope address from closure structure: [closure_base + 8 + (i * 8)] into RAX
+                int offset = access.offset + 8 + (i * 8); // Skip function address (first 8 bytes)
+                
+                if (funcCall->varRef->definedIn == current_scope) {
+                    // Closure is in current scope - access via R15 + offset
+                    total_length += emitter.emitMovRegFromMemory(static_cast<int>(Register::RAX), 15, offset);
+                } else {
+                    // Closure is in parent scope - need more complex loading
+                    // For now, throw an error as this case needs additional implementation
+                    throw std::runtime_error("Function calls to closures in parent scopes not yet implemented");
+                }
+                
+                // Move RAX to the appropriate parameter register
+                total_length += emitter.emitMovParamFromRAX(static_cast<int>(paramIndex));
+            } else {
+                // TODO: Handle more than 6 total parameters (args + scopes) by pushing to stack
+                std::cerr << "Warning: Function calls with more than 6 total parameters (args + scopes) not yet supported" << std::endl;
+                break;
+            }
+        }
+    }
+    
     // TODO: Handle arguments beyond 6 by pushing to stack
-    if (funcCall->args.size() > 6) {
-        std::cerr << "Warning: Function calls with more than 6 arguments not yet supported" << std::endl;
+    size_t totalParams = funcCall->args.size() + (targetFunc ? targetFunc->allNeeded.size() : 0);
+    if (totalParams > 6) {
+        std::cerr << "Warning: Function calls with more than 6 total parameters not yet supported" << std::endl;
     }
 
-    // Get the function address directly (this loads function address into RAX)
-    total_length += loadVariableIntoRegister(static_cast<IdentifierNode*>(funcCall), current_scope, Register::RAX);
+    // Load the function address from the closure: [closure_base] into RAX  
+    if (funcCall->varRef->definedIn == current_scope) {
+        // Closure is in current scope - access function address via R15 + offset
+        total_length += emitter.emitMovRegFromMemory(static_cast<int>(Register::RAX), 15, access.offset);
+    } else {
+        // Closure is in parent scope - use existing loadVariableIntoRegister for now
+        total_length += loadVariableIntoRegister(static_cast<IdentifierNode*>(funcCall), current_scope, Register::RAX);
+    }
 
     // Call the function - this pushes return address and jumps
     total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
@@ -448,6 +496,8 @@ void Codegen::writeProgramToExecutable() {
     // Copy machine code to executable memory AFTER patching
     std::memcpy(exec_mem, emitter.buffer.data(), emitter.buffer.size());
     
+    // Disassemble the patched code
+    disassembleCode(emitter.buffer, base_address);
     
     // Execute the code
     typedef void (*func_ptr)();
@@ -498,4 +548,52 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, LexicalScop
     }
     
     return total_length;
+}
+
+void Codegen::disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address) {
+    csh handle;
+    cs_insn *insn;
+    size_t count;
+    
+    // Initialize capstone for x86-64
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
+        std::cerr << "Failed to initialize Capstone disassembler" << std::endl;
+        return;
+    }
+    
+    // Disassemble the code
+    count = cs_disasm(handle, code.data(), code.size(), base_address, 0, &insn);
+    
+    if (count > 0) {
+        std::cout << "\n=== DISASSEMBLY OF PATCHED CODE ===\n";
+        std::cout << "Base address: 0x" << std::hex << base_address << std::dec << "\n";
+        std::cout << "Code size: " << code.size() << " bytes\n\n";
+        
+        for (size_t j = 0; j < count; j++) {
+            std::cout << "0x" << std::hex << insn[j].address << std::dec << ":\t";
+            
+            // Print hex bytes
+            std::cout << std::hex;
+            for (size_t k = 0; k < insn[j].size; k++) {
+                std::cout << std::setfill('0') << std::setw(2) << (int)insn[j].bytes[k] << " ";
+            }
+            
+            // Pad with spaces for alignment
+            for (size_t k = insn[j].size; k < 8; k++) {
+                std::cout << "   ";
+            }
+            
+            std::cout << std::dec << "\t" << insn[j].mnemonic << "\t" << insn[j].op_str << std::endl;
+        }
+        
+        std::cout << "\n=== END DISASSEMBLY ===\n\n";
+        
+        // Free memory allocated by cs_disasm()
+        cs_free(insn, count);
+    } else {
+        std::cerr << "Failed to disassemble code" << std::endl;
+    }
+    
+    // Close capstone handle
+    cs_close(&handle);
 }

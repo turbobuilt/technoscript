@@ -4,6 +4,7 @@
 #include "library.h"
 #include <unordered_map>
 #include <sys/mman.h>
+#include <capstone/capstone.h>
 
 // Enum for commonly used registers
 enum class Register {
@@ -73,6 +74,9 @@ private:
     // Helper to load any variable into a specified register
     // This provides much more flexibility for register allocation and reduces unnecessary moves
     size_t loadVariableIntoRegister(IdentifierNode* identifier, LexicalScopeNode* current_scope, Register target_reg);
+    
+    // Disassembly helper
+    void disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address = 0);
     
 public:
     void generateProgram(ASTNode& root);

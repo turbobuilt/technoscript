@@ -47,3 +47,13 @@ The first thing that will happen is that a variable called y will be initialized
 heap allocation is tough, but we will allocate a big chunk. and we will move the pointer forward the correct amount, allocating more as needed. For now, this is all we will do, no memory clean up.
 
 all instructions emitted must return the length. so we can compute the 
+
+we want helpers on ast nodes to:
+
+1. get a parameter by index into a given register
+2. get variable value into a given register, given the current scope
+  - checks if it's in the current scope - r15+offset
+  - if in an ancestor scope
+    - get the ancestor scope parameter index based on depth from scopeDepthToParentParameterIndexMap
+    - then get that parameter by index into a register
+    - the code to access is then the offset of the variable in it's own scope from that register.

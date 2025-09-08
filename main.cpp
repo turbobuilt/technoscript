@@ -30,13 +30,30 @@ test(100, 200, 300)
     Analyzer analyzer;
     Codegen codeGen;
     
-    std::cout << "=== Testing function call with literal arguments ===\n";
-    auto ast2 = parser.parse(code_literal);
-    analyzer.analyze(ast2.get());
-    printAST(ast2.get());
-    Codegen codeGen2;
-    codeGen2.generateProgram(*ast2);
-    codeGen2.writeProgramToExecutable();
+    std::string code_closure = R"(
+var x: int64 = 42;
+function inner() {
+    print(x)
+}
+inner()
+    )";
+    
+    std::string code_closure_with_params = R"(
+var x: int64 = 42;
+function inner(y) {
+    print(x)
+    print(y)
+}
+inner(100)
+    )";
+    
+    std::cout << "=== Testing closure with params and parent scope access ===\n";
+    auto ast4 = parser.parse(code_closure_with_params);
+    analyzer.analyze(ast4.get());
+    printAST(ast4.get());
+    Codegen codeGen4;
+    codeGen4.generateProgram(*ast4);
+    codeGen4.writeProgramToExecutable();
     
     return 0;
 }
