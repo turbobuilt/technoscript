@@ -31,6 +31,15 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
         closureVar.funcNode = func;
         scope->variables[func->funcName] = closureVar;
         
+        // Add function parameters as variables in the function scope
+        for (const std::string& paramName : func->params) {
+            VariableInfo paramVar;
+            paramVar.type = DataType::INT64; // Default type for now (should be improved with actual type analysis)
+            paramVar.name = paramName;
+            paramVar.definedIn = func;
+            func->variables[paramName] = paramVar;
+        }
+        
         // Recursively collect variables in function body (children, not the function itself)
         for (auto& child : func->ASTNode::children) {
             collectVariables(child.get(), func);
@@ -64,6 +73,14 @@ void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
         auto func = static_cast<FunctionDeclNode*>(node);
         analyzeScope(func);
         return;
+    }
+    
+    // Special handling for function calls - analyze their arguments
+    if (node->type == NodeType::FUNCTION_CALL) {
+        auto funcCall = static_cast<FunctionCallNode*>(node);
+        for (auto& arg : funcCall->args) {
+            analyzeNode(arg.get(), currentScope);
+        }
     }
     
     for (auto& child : node->children) {

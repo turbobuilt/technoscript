@@ -7,63 +7,36 @@
 #include "codegen.h"
 
 int main() {
-    std::string code0 = R"(
-var x: int64 = 10;
-print(x)
-
-function test() {
+    std::string code_simple = R"(
+var a: int64 = 10;
+var b: int64 = 20;
+function add(x, y) {
     print(x)
+    print(y)
 }
-    )";
-    std::string code1 = R"(
-var x: int64 = 0;
-function test() {
-    var y: int64 = 10;
-    print("hello world", x, y)
-}
-test()
-go test()
+add(a, b)
     )";
     
-    std::string code2 = R"(
-var small: int32 = 1;
-var big1: int64 = 41;
-var tiny: int32 = 2;
-var big2: int64 = 42;
-function level1() {
-    var medium: int32 = 10;
-    var large: int64 = 100;
-    function level2() {
-        var mini: int32 = 5;
-        print("level1", medium)
-        function level3(test) {
-            print(big2, mini, medium)
-        }
-        level3(mini)
-    }
-    level2()
+    std::string code_literal = R"(
+function test(a, b, c) {
+    print(a)
+    print(b) 
+    print(c)
 }
-level1()
+test(100, 200, 300)
     )";
     
     Parser parser;
     Analyzer analyzer;
     Codegen codeGen;
     
-    std::cout << "=== Parsing Code 1 ===\n";
-    auto ast1 = parser.parse(code1);
-    analyzer.analyze(ast1.get());
-    printAST(ast1.get());
-    codeGen.generateProgram(*ast1);
-    // Execute the emitted machine code (will call sys_exit after printing Hello, world)
-    codeGen.writeProgramToExecutable();
-
-
-    
-    // std::cout << "\n=== Parsing Code 2 ===\n";
-    // auto ast2 = parser.parse(code2);
-    // analyzer.analyze(ast2.get());
-    // printAST(ast2.get());
+    std::cout << "=== Testing function call with literal arguments ===\n";
+    auto ast2 = parser.parse(code_literal);
+    analyzer.analyze(ast2.get());
+    printAST(ast2.get());
+    Codegen codeGen2;
+    codeGen2.generateProgram(*ast2);
+    codeGen2.writeProgramToExecutable();
     
     return 0;
 }

@@ -168,7 +168,9 @@ class FunctionCallNode : public IdentifierNode {
 public:
     std::vector<std::unique_ptr<ASTNode>> args;
 
-    FunctionCallNode(const std::string& name) : IdentifierNode(name) {}
+    FunctionCallNode(const std::string& name) : IdentifierNode(name) {
+        type = NodeType::FUNCTION_CALL;  // Override the type set by IdentifierNode
+    }
 };
 
 // Implementation of getTypeSize after all classes are defined

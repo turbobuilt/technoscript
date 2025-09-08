@@ -75,7 +75,17 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
     if (match(TokenType::FUNCTION)) return parseFunctionDecl();
     if (match(TokenType::PRINT)) return parsePrintStmt();
     if (match(TokenType::GO)) return parseGoStmt();
-    if (match(TokenType::IDENTIFIER)) return parseFunctionCall();
+    if (match(TokenType::IDENTIFIER)) {
+        // Look ahead to see if this is a function call
+        if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN) {
+            return parseFunctionCall();
+        } else {
+            // Just return an identifier node
+            auto identifier = std::make_unique<IdentifierNode>(current().value);
+            advance();
+            return identifier;
+        }
+    }
     return nullptr;
 }
 
@@ -118,6 +128,13 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     while (!match(TokenType::RPAREN)) {
         std::string paramName = current().value;
         expect(TokenType::IDENTIFIER);
+        
+        // Skip type annotation if present (e.g., ": int64")
+        if (match(TokenType::COLON)) {
+            advance(); // skip colon
+            expect(TokenType::IDENTIFIER); // skip type name
+        }
+        
         func->params.push_back(paramName);
         if (match(TokenType::COMMA)) advance();
     }
@@ -155,7 +172,9 @@ std::unique_ptr<ASTNode> Parser::parseFunctionCall() {
             call->args.push_back(std::make_unique<LiteralNode>(current().value));
             advance();
         }
-        if (match(TokenType::COMMA)) advance();
+        if (match(TokenType::COMMA)) {
+            advance();
+        }
     }
     
     expect(TokenType::RPAREN);
