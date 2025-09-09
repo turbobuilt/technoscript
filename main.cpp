@@ -47,13 +47,25 @@ function inner(y) {
 inner(100)
     )";
     
-    std::cout << "=== Testing closure with params and parent scope access ===\n";
-    auto ast4 = parser.parse(code_closure_with_params);
-    analyzer.analyze(ast4.get());
-    printAST(ast4.get());
-    Codegen codeGen4;
-    codeGen4.generateProgram(*ast4);
-    codeGen4.writeProgramToExecutable();
+    std::string code_robust_test = R"(
+var x: int64 = 42;
+var y: int64 = 100;
+function helper(param) {
+    print(param)
+}
+helper(x)
+print(y)
+helper(y)
+print(x)
+    )";
+    
+    std::cout << "=== Testing robust function calling - variables should be preserved ===\n";
+    auto ast5 = parser.parse(code_robust_test);
+    analyzer.analyze(ast5.get());
+    printAST(ast5.get());
+    Codegen codeGen5;
+    codeGen5.generateProgram(*ast5);
+    codeGen5.writeProgramToExecutable();
     
     return 0;
 }

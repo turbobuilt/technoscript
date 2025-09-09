@@ -57,3 +57,6 @@ we want helpers on ast nodes to:
     - get the ancestor scope parameter index based on depth from scopeDepthToParentParameterIndexMap
     - then get that parameter by index into a register
     - the code to access is then the offset of the variable in it's own scope from that register.
+
+we must also push all parameters to the stack in the prologue and pop them (by moving stack pointer) in the epilogue
+after each function call, we will restore the parameters.

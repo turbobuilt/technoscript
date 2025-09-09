@@ -97,39 +97,44 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             total_length += emitter.emitBytes({0x55}); // push rbp
             total_length += emitter.emitBytes({0x48, 0x89, 0xE5}); // mov rbp, rsp
             
-            // Handle function parameters - move from System V ABI registers to function scope variables
+            // Handle function parameters - save them to stack instead of lexical scope
+            // This prevents corrupting the caller's lexical scope memory
             for (size_t i = 0; i < funcDecl->params.size() && i < 6; i++) {
-                const std::string& paramName = funcDecl->params[i];
+                // Move parameter from register to RAX
+                total_length += emitter.emitMovRAXFromParam(static_cast<int>(i));
                 
-                // Find the parameter variable in the function scope
-                auto it = funcDecl->variables.find(paramName);
-                if (it != funcDecl->variables.end()) {
-                    VariableInfo& paramVar = it->second;
-                    
-                    // Move parameter from register to RAX, then to variable location
-                    total_length += emitter.emitMovRAXFromParam(static_cast<int>(i));
-                    
-                    // Store RAX to R15 + offset (parameter variable location)
-                    if (paramVar.type == DataType::INT64) {
-                        total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(paramVar.offset);
-                    } else if (paramVar.type == DataType::INT32) {
-                        total_length += emitter.emitMovDwordPtrR15PlusOffsetEAX(paramVar.offset);
-                    }
-                }
+                // Push parameter to stack (parameters will be accessed via stack offsets)
+                total_length += emitter.emitBytes({0x50}); // push rax
             }
+            
+            // ROBUST FUNCTION CALLING: Save all variables to stack in prologue
+            // This ensures that any function calls within this function won't clobber our variables
+            total_length += saveVariablesToStack(funcDecl);
             
             // Generate function body (children of this node)
             for (auto& child : funcDecl->ASTNode::children) {
                 total_length += generateNode(child.get(), funcDecl);
             }
             
-            // Add some debug output before returning
-            // Generate a function that writes a specific value to R15+8 
-            // mov qword ptr [r15+8], 0x12345678
-            total_length += emitter.emitBytes({0x49, 0xC7, 0x47, 0x08}); // mov qword ptr [r15+8], imm32
-            total_length += emitter.emitU32(0x12345678); // immediate value
+            // Function epilogue - clean up stack and restore stack frame
+            // Calculate total cleanup: saved variables + parameters
+            size_t var_count = funcDecl->variables.size();
+            size_t param_count = funcDecl->params.size();
+            size_t total_stack_items = var_count + param_count;
             
-            // Function epilogue - restore stack frame and return
+            if (total_stack_items > 0) {
+                if (total_stack_items * 8 <= 127) {
+                    // Use 8-bit immediate for small counts
+                    total_length += emitter.emitBytes({0x48, 0x83, 0xC4}); // add rsp, imm8
+                    total_length += emitter.emitBytes({static_cast<uint8_t>(total_stack_items * 8)});
+                } else {
+                    // Use 32-bit immediate for larger counts
+                    total_length += emitter.emitBytes({0x48, 0x81, 0xC4}); // add rsp, imm32
+                    uint32_t cleanup_amount = static_cast<uint32_t>(total_stack_items * 8);
+                    total_length += emitter.emitU32(cleanup_amount);
+                }
+            }
+            
             total_length += emitter.emitBytes({0x48, 0x89, 0xEC}); // mov rsp, rbp
             total_length += emitter.emitBytes({0x5D}); // pop rbp
             total_length += emitter.emitBytes({0xC3}); // ret
@@ -294,6 +299,10 @@ size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNod
     // Call the function - this pushes return address and jumps
     total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
 
+    // ROBUST FUNCTION CALLING: Restore all variables from stack after function call
+    // This ensures that our variables maintain their values even if the called function clobbered registers
+    total_length += restoreVariablesFromStack(current_scope);
+
     return total_length;
 }size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_scope) {
     size_t total_length = 0;
@@ -309,6 +318,9 @@ size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNod
         // Call print_int64 function
         uint64_t print_addr = extern_function_addresses["print_int64"];
         total_length += emitter.emitCallAbsolute(print_addr);
+        
+        // ROBUST FUNCTION CALLING: Restore variables after external function call
+        total_length += restoreVariablesFromStack(current_scope);
     }
     
     return total_length;
@@ -515,7 +527,43 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, LexicalScop
     
     // Check if variable is defined in the current scope
     if (identifier->varRef->definedIn == current_scope) {
-        // Variable is in current scope - access via R15 + offset
+        // Check if this is a function parameter (if we're in a function scope)
+        if (current_scope->type == NodeType::FUNCTION_DECL) {
+            FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(current_scope);
+            
+            // Check if this variable is a parameter
+            auto paramIt = std::find(funcDecl->params.begin(), funcDecl->params.end(), identifier->value);
+            if (paramIt != funcDecl->params.end()) {
+                // This is a parameter - load from stack instead of R15
+                size_t paramIndex = paramIt - funcDecl->params.begin();
+                
+                if (paramIndex < 6) { // Only first 6 params are in registers/stack
+                    // Calculate stack position: parameters are at bottom of stack frame
+                    // Stack layout: [saved_variables...][parameters...]
+                    size_t var_count = funcDecl->variables.size();
+                    int stack_offset = (var_count + paramIndex) * 8;
+                    
+                    // Load parameter from stack into RAX first
+                    if (stack_offset <= 127) {
+                        total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, static_cast<uint8_t>(stack_offset)}); // mov rax, [rsp+offset8]
+                    } else {
+                        total_length += emitter.emitBytes({0x48, 0x8B, 0x84, 0x24}); // mov rax, [rsp+offset32]
+                        total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
+                    }
+                    
+                    // If target register is not RAX, move from RAX to target register
+                    if (reg_num != 0) {
+                        total_length += emitter.emitMovRegFromReg(reg_num, 0);
+                    }
+                } else {
+                    throw std::runtime_error("Parameters beyond index 5 not yet supported");
+                }
+                
+                return total_length;
+            }
+        }
+        
+        // Regular variable - access via R15 + offset
         total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.offset); // R15 = 15
     } else {
         // Variable is in a parent scope - need to load scope address from parameter
@@ -548,6 +596,65 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, LexicalScop
     }
     
     return total_length;
+}
+
+size_t Codegen::saveVariablesToStack(LexicalScopeNode* scope) {
+    size_t total_length = 0;
+    
+    // Push all variables from this scope to the stack
+    // We iterate through variables in the scope and push their current values
+    for (const auto& var_pair : scope->variables) {
+        const VariableInfo& var = var_pair.second;
+        
+        // Load variable into RAX first
+        total_length += emitter.emitMovRegFromMemory(0, 15, var.offset); // RAX from [R15 + offset]
+        
+        // Push RAX to stack
+        total_length += emitter.emitBytes({0x50}); // push rax
+    }
+    
+    return total_length;
+}
+
+size_t Codegen::restoreVariablesFromStack(LexicalScopeNode* scope) {
+    // After a function call, we need to restore parameters from stack back to registers
+    // This only applies when we're inside a function that has parameters
+    if (scope->type == NodeType::FUNCTION_DECL) {
+        FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(scope);
+        size_t total_length = 0;
+        
+        // Only restore if we have parameters
+        size_t param_count = funcDecl->params.size();
+        if (param_count > 0) {
+            // Calculate stack positions: parameters are at the bottom of our stack frame  
+            // Stack layout (from RSP): [saved_variables...][parameters...]
+            size_t var_count = funcDecl->variables.size();
+            
+            // Restore parameters from stack to registers
+            for (size_t i = 0; i < param_count && i < 6; i++) {
+                // Parameters were pushed in order, so parameter i is at offset:
+                // (total_items - param_count + i) * 8 from RSP
+                int stack_offset = (var_count + param_count - param_count + i) * 8;
+                // Simplified: int stack_offset = (var_count + i) * 8;
+                stack_offset = (var_count + i) * 8;
+                
+                // Load parameter from stack into RAX first
+                if (stack_offset <= 127) {
+                    total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, static_cast<uint8_t>(stack_offset)}); // mov rax, [rsp+offset8]
+                } else {
+                    total_length += emitter.emitBytes({0x48, 0x8B, 0x84, 0x24}); // mov rax, [rsp+offset32]
+                    total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
+                }
+                
+                // Move RAX to the appropriate parameter register
+                total_length += emitter.emitMovParamFromRAX(static_cast<int>(i));
+            }
+        }
+        
+        return total_length;
+    }
+    
+    return 0;
 }
 
 void Codegen::disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address) {

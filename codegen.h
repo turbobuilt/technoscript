@@ -75,6 +75,12 @@ private:
     // This provides much more flexibility for register allocation and reduces unnecessary moves
     size_t loadVariableIntoRegister(IdentifierNode* identifier, LexicalScopeNode* current_scope, Register target_reg);
     
+    // Save all function variables to stack (call in prologue)
+    size_t saveVariablesToStack(LexicalScopeNode* scope);
+    
+    // Restore all function variables from stack (call after function calls)
+    size_t restoreVariablesFromStack(LexicalScopeNode* scope);
+    
     // Disassembly helper
     void disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address = 0);
     
