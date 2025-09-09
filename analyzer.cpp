@@ -67,6 +67,15 @@ void Analyzer::analyzeScope(LexicalScopeNode* scope) {
 void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
     if (node->type == NodeType::IDENTIFIER || node->type == NodeType::FUNCTION_CALL) {
         node->varRef = findVariable(node->value, currentScope);
+        
+        // Set the accessedIn property for identifier nodes
+        if (node->type == NodeType::IDENTIFIER) {
+            auto identifier = static_cast<IdentifierNode*>(node);
+            identifier->accessedIn = currentScope;
+        } else if (node->type == NodeType::FUNCTION_CALL) {
+            auto funcCall = static_cast<FunctionCallNode*>(node);
+            funcCall->accessedIn = currentScope;
+        }
     }
     
     if (node->type == NodeType::FUNCTION_DECL) {

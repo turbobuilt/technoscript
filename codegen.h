@@ -54,6 +54,9 @@ private:
     // Allocate memory for lexical scope - returns instruction length
     size_t allocateScope(LexicalScopeNode* scope, bool is_global = false);
     
+    // Unified scope setup (allocate + create closures) - returns instruction length
+    size_t setupScope(LexicalScopeNode* scope, bool is_global = false);
+    
     // Restore previous lexical scope - returns instruction length
     size_t restoreScope();
     
@@ -74,12 +77,6 @@ private:
     // Helper to load any variable into a specified register
     // This provides much more flexibility for register allocation and reduces unnecessary moves
     size_t loadVariableIntoRegister(IdentifierNode* identifier, LexicalScopeNode* current_scope, Register target_reg);
-    
-    // Save all function variables to stack (call in prologue)
-    size_t saveVariablesToStack(LexicalScopeNode* scope);
-    
-    // Restore all function variables from stack (call after function calls)
-    size_t restoreVariablesFromStack(LexicalScopeNode* scope);
     
     // Disassembly helper
     void disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address = 0);

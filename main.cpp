@@ -7,60 +7,23 @@
 #include "codegen.h"
 
 int main() {
-    std::string code_simple = R"(
+    std::string code = R"(
 var a: int64 = 10;
 var b: int64 = 20;
-function add(x, y) {
+function add(x) {
     print(x)
-    print(y)
+    print(b)
 }
-add(a, b)
-    )";
-    
-    std::string code_literal = R"(
-function test(a, b, c) {
-    print(a)
-    print(b) 
-    print(c)
-}
-test(100, 200, 300)
+add(a)
     )";
     
     Parser parser;
     Analyzer analyzer;
     Codegen codeGen;
     
-    std::string code_closure = R"(
-var x: int64 = 42;
-function inner() {
-    print(x)
-}
-inner()
-    )";
-    
-    std::string code_closure_with_params = R"(
-var x: int64 = 42;
-function inner(y) {
-    print(x)
-    print(y)
-}
-inner(100)
-    )";
-    
-    std::string code_robust_test = R"(
-var x: int64 = 42;
-var y: int64 = 100;
-function helper(param) {
-    print(param)
-}
-helper(x)
-print(y)
-helper(y)
-print(x)
-    )";
     
     std::cout << "=== Testing robust function calling - variables should be preserved ===\n";
-    auto ast5 = parser.parse(code_robust_test);
+    auto ast5 = parser.parse(code);
     analyzer.analyze(ast5.get());
     printAST(ast5.get());
     Codegen codeGen5;

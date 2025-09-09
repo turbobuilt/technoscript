@@ -14,13 +14,11 @@ size_t Codegen::allocateScope(LexicalScopeNode* scope, bool is_global) {
     size_t total_length = 0;
     
     // Save R15 (current lexical scope pointer) on stack
-    total_length += emitter.emitPushR15();
+    total_length += emitter.emitBytes({0x41, 0x57}); // push r15
     
-    // For debugging: use a simple approach - allocate using brk syscall or just use a hardcoded address
-    // Let's allocate memory using the brk syscall instead
-    // First get current brk
-    total_length += emitter.emitMovRAXImm64(12);       // sys_brk
-    total_length += emitter.emitXorRdiRdi();           // addr = 0 (get current brk)
+    // Get current brk (program break) - this will be our allocated memory
+    total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
+    total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
     total_length += emitter.emitSyscall();
     
     // Save current brk in RBX
@@ -28,10 +26,13 @@ size_t Codegen::allocateScope(LexicalScopeNode* scope, bool is_global) {
     
     // Set new brk to current + scope size
     total_length += emitter.emitMovRAXImm64(12);       // sys_brk
-    total_length += emitter.emitBytes({0x48, 0x89, 0xDF}); // mov rdi, rbx
-    total_length += emitter.emitBytes({0x48, 0x81, 0xC7}); // add rdi, imm32
+    total_length += emitter.emitBytes({0x48, 0x89, 0xD9}); // mov rcx, rbx  
+    total_length += emitter.emitBytes({0x48, 0x81, 0xC1}); // add rcx, imm32
     total_length += emitter.emitU32(static_cast<uint32_t>(scope->totalSize));
+    total_length += emitter.emitBytes({0x49, 0x89, 0xCA}); // mov r10, rcx (use R10 instead of RDI)
+    total_length += emitter.emitBytes({0x4C, 0x89, 0xD7}); // mov rdi, r10 (move to RDI only for syscall)
     total_length += emitter.emitSyscall();
+    total_length += emitter.emitBytes({0x4C, 0x89, 0xD1}); // mov rcx, r10 (restore rcx from r10 for later use)
     
     // Use the old brk value as our allocated memory
     total_length += emitter.emitBytes({0x48, 0x89, 0xD8}); // mov rax, rbx
@@ -39,17 +40,24 @@ size_t Codegen::allocateScope(LexicalScopeNode* scope, bool is_global) {
     // Move allocated memory address to R15 (our lexical scope pointer)
     total_length += emitter.emitMovR15RAX();
     
-    // Debug: Check if mmap succeeded by comparing RAX to -1
-    // This is just for debugging - we'll print the result
-    // mov rdi, rax; mov rax, 1; mov rsi, 1; mov rdx, 8; syscall (write to stdout)
-    // But for now, let's just continue...
-    
     return total_length;
 }
 
 size_t Codegen::restoreScope() {
     // Restore previous R15 value from stack
     return emitter.emitPopR15();
+}
+
+size_t Codegen::setupScope(LexicalScopeNode* scope, bool is_global) {
+    size_t total_length = 0;
+    
+    // Allocate memory for this scope
+    total_length += allocateScope(scope, is_global);
+    
+    // Create closures (implement hoisting) - this is the same for both global and function scopes
+    total_length += createClosures(scope);
+    
+    return total_length;
 }
 
 size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
@@ -92,49 +100,17 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             // Set the function address to current position in buffer
             funcDecl->functionAddress = emitter.buffer.size();
             
-            // Function prologue - establish new stack frame
-            // Push base pointer and set up new frame
+            // Simplified prologue - caller already set up R15 with parameters
             total_length += emitter.emitBytes({0x55}); // push rbp
             total_length += emitter.emitBytes({0x48, 0x89, 0xE5}); // mov rbp, rsp
             
-            // Handle function parameters - save them to stack instead of lexical scope
-            // This prevents corrupting the caller's lexical scope memory
-            for (size_t i = 0; i < funcDecl->params.size() && i < 6; i++) {
-                // Move parameter from register to RAX
-                total_length += emitter.emitMovRAXFromParam(static_cast<int>(i));
-                
-                // Push parameter to stack (parameters will be accessed via stack offsets)
-                total_length += emitter.emitBytes({0x50}); // push rax
-            }
-            
-            // ROBUST FUNCTION CALLING: Save all variables to stack in prologue
-            // This ensures that any function calls within this function won't clobber our variables
-            total_length += saveVariablesToStack(funcDecl);
-            
             // Generate function body (children of this node)
+            // Parameters are already in R15+offset, no need to copy from registers
             for (auto& child : funcDecl->ASTNode::children) {
                 total_length += generateNode(child.get(), funcDecl);
             }
             
-            // Function epilogue - clean up stack and restore stack frame
-            // Calculate total cleanup: saved variables + parameters
-            size_t var_count = funcDecl->variables.size();
-            size_t param_count = funcDecl->params.size();
-            size_t total_stack_items = var_count + param_count;
-            
-            if (total_stack_items > 0) {
-                if (total_stack_items * 8 <= 127) {
-                    // Use 8-bit immediate for small counts
-                    total_length += emitter.emitBytes({0x48, 0x83, 0xC4}); // add rsp, imm8
-                    total_length += emitter.emitBytes({static_cast<uint8_t>(total_stack_items * 8)});
-                } else {
-                    // Use 32-bit immediate for larger counts
-                    total_length += emitter.emitBytes({0x48, 0x81, 0xC4}); // add rsp, imm32
-                    uint32_t cleanup_amount = static_cast<uint32_t>(total_stack_items * 8);
-                    total_length += emitter.emitU32(cleanup_amount);
-                }
-            }
-            
+            // Simplified epilogue - caller handles R15 restoration
             total_length += emitter.emitBytes({0x48, 0x89, 0xEC}); // mov rsp, rbp
             total_length += emitter.emitBytes({0x5D}); // pop rbp
             total_length += emitter.emitBytes({0xC3}); // ret
@@ -228,83 +204,122 @@ size_t Codegen::generateIdentifier(IdentifierNode* identifier, LexicalScopeNode*
 size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNode* current_scope) {
     size_t total_length = 0;
     
-    // System V ABI: Parameter registers are RDI, RSI, RDX, RCX, R8, R9 (0-5)
-    // Parameters beyond 6 go on the stack (not implemented yet)
-    
-    // First, generate code for each argument and move to appropriate parameter register
-    for (size_t i = 0; i < funcCall->args.size() && i < 6; i++) {
-        // Generate code to evaluate the argument (result in RAX)
-        total_length += generateNode(funcCall->args[i].get(), current_scope);
-        
-        // Move RAX to the appropriate parameter register
-        total_length += emitter.emitMovParamFromRAX(static_cast<int>(i));
-    }
-    
-    // Now we need to pass the lexical scope addresses as additional parameters
-    // Get the closure's location (variable access) instead of loading its content
-    auto access = static_cast<IdentifierNode*>(funcCall)->getVariableAccess(current_scope);
-    
-    // Get the function being called to know how many scope addresses it needs
+    // Get the function being called
     FunctionDeclNode* targetFunc = nullptr;
     if (funcCall->varRef && funcCall->varRef->funcNode) {
         targetFunc = funcCall->varRef->funcNode;
     }
+    if (!targetFunc) {
+        throw std::runtime_error("Cannot call function - no target function found");
+    }
     
-    if (targetFunc) {
-        // Pass lexical scope addresses as additional parameters
-        // These start after the regular arguments
-        size_t scopeParamStartIndex = funcCall->args.size();
-        
-        for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
-            size_t paramIndex = scopeParamStartIndex + i;
-            
-            if (paramIndex < 6) {
-                // Load scope address from closure structure: [closure_base + 8 + (i * 8)] into RAX
-                int offset = access.offset + 8 + (i * 8); // Skip function address (first 8 bytes)
+    // Load the function address into RBX
+    auto access = funcCall->getVariableAccess();
+    
+    if (access.parameterIndex == -1) {
+        // Function address is in current scope - load directly into RBX
+        total_length += emitter.emitMovRegFromMemory(3, 15, access.offset); // mov rbx, [r15 + offset]
+    } else {
+        // Function address is in parent scope - load scope address from parameter, then access function
+        total_length += emitter.emitMovRAXFromParam(access.parameterIndex);
+        // Now load function address from [rax + offset] into RBX
+        if (access.offset == 0) {
+            total_length += emitter.emitBytes({0x48, 0x8B, 0x18}); // mov rbx, [rax]
+        } else {
+            total_length += emitter.emitBytes({0x48, 0x8B, 0x58, static_cast<uint8_t>(access.offset)}); // mov rbx, [rax + offset]
+        }
+    }
+    
+    // NEW CALLING CONVENTION:
+    // 1. Push R15 (save parent scope)
+    total_length += emitter.emitBytes({0x41, 0x57}); // push r15
+    
+    // 2. Save function address (RBX) on stack since we'll need it later
+    total_length += emitter.emitBytes({0x53}); // push rbx
+    
+    // 3. Evaluate all arguments first and save them on stack (before changing R15)
+    std::vector<size_t> arg_stack_positions;
+    for (size_t i = 0; i < funcCall->args.size(); i++) {
+        // Generate code to evaluate the argument (result in RAX)
+        total_length += generateNode(funcCall->args[i].get(), current_scope);
+        // Push argument value onto stack
+        total_length += emitter.emitBytes({0x50}); // push rax
+        arg_stack_positions.push_back(i);
+    }
+    
+    // 4. Allocate scope object for target function
+    // Get current brk (program break) - this will be our allocated memory
+    total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
+    total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
+    total_length += emitter.emitSyscall();
+    
+    // Save current brk in RCX (instead of RBX to avoid conflict)
+    total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
+    
+    // Set new brk to current + scope size
+    total_length += emitter.emitMovRAXImm64(12);       // sys_brk
+    total_length += emitter.emitBytes({0x48, 0x89, 0xCA}); // mov rdx, rcx  
+    total_length += emitter.emitBytes({0x48, 0x81, 0xC2}); // add rdx, imm32
+    total_length += emitter.emitU32(static_cast<uint32_t>(targetFunc->totalSize));
+    total_length += emitter.emitBytes({0x48, 0x89, 0xD7}); // mov rdi, rdx
+    total_length += emitter.emitSyscall();
+    
+    // Use the old brk value as our allocated memory
+    total_length += emitter.emitBytes({0x48, 0x89, 0xC8}); // mov rax, rcx
+    
+    // Move allocated memory address to R15 (our lexical scope pointer)
+    total_length += emitter.emitMovR15RAX();
+    
+    // 5. Copy parameters from stack to R15+offset (in reverse order since stack is LIFO)
+    int param_offset = 0;
+    for (int i = funcCall->args.size() - 1; i >= 0; i--) {
+        total_length += emitter.emitBytes({0x58}); // pop rax
+        // Store parameter at R15+param_offset
+        total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(param_offset);
+        param_offset += 8;
+    }
+    
+    // 6. Add hidden parameters for parent scopes that the function needs
+    for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
+        int neededDepth = targetFunc->allNeeded[i];
+        if (neededDepth != targetFunc->depth) { // Don't pass current scope to itself
+            // Get the parameter index for this scope depth
+            auto it = targetFunc->scopeDepthToParentParameterIndexMap.find(neededDepth);
+            if (it != targetFunc->scopeDepthToParentParameterIndexMap.end()) {
+                int paramIndex = it->second;
                 
-                if (funcCall->varRef->definedIn == current_scope) {
-                    // Closure is in current scope - access via R15 + offset
-                    total_length += emitter.emitMovRegFromMemory(static_cast<int>(Register::RAX), 15, offset);
+                if (neededDepth == current_scope->depth) {
+                    // This is the current scope - pass R15 (before we changed it)
+                    // We need to get the original R15 from the stack
+                    // The original R15 is at [rsp + 8] (since we pushed rbx after r15)
+                    total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, 0x08}); // mov rax, [rsp + 8]
                 } else {
-                    // Closure is in parent scope - need more complex loading
-                    // For now, throw an error as this case needs additional implementation
-                    throw std::runtime_error("Function calls to closures in parent scopes not yet implemented");
+                    // This scope should be passed from our parent - not implemented yet
+                    // For now, just pass the current scope
+                    total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, 0x08}); // mov rax, [rsp + 8]
                 }
                 
-                // Move RAX to the appropriate parameter register
-                total_length += emitter.emitMovParamFromRAX(static_cast<int>(paramIndex));
-            } else {
-                // TODO: Handle more than 6 total parameters (args + scopes) by pushing to stack
-                std::cerr << "Warning: Function calls with more than 6 total parameters (args + scopes) not yet supported" << std::endl;
-                break;
+                // Store parent scope pointer at R15+param_offset
+                total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(param_offset);
+                param_offset += 8;
             }
         }
     }
     
-    // TODO: Handle arguments beyond 6 by pushing to stack
-    size_t totalParams = funcCall->args.size() + (targetFunc ? targetFunc->allNeeded.size() : 0);
-    if (totalParams > 6) {
-        std::cerr << "Warning: Function calls with more than 6 total parameters not yet supported" << std::endl;
-    }
-
-    // Load the function address from the closure: [closure_base] into RAX  
-    if (funcCall->varRef->definedIn == current_scope) {
-        // Closure is in current scope - access function address via R15 + offset
-        total_length += emitter.emitMovRegFromMemory(static_cast<int>(Register::RAX), 15, access.offset);
-    } else {
-        // Closure is in parent scope - use existing loadVariableIntoRegister for now
-        total_length += loadVariableIntoRegister(static_cast<IdentifierNode*>(funcCall), current_scope, Register::RAX);
-    }
-
-    // Call the function - this pushes return address and jumps
+    // 7. Restore function address from stack
+    total_length += emitter.emitBytes({0x5B}); // pop rbx
+    
+    // 7. Call the function directly (RBX contains the function address)
+    total_length += emitter.emitBytes({0x48, 0x89, 0xD8}); // mov rax, rbx
     total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
-
-    // ROBUST FUNCTION CALLING: Restore all variables from stack after function call
-    // This ensures that our variables maintain their values even if the called function clobbered registers
-    total_length += restoreVariablesFromStack(current_scope);
-
+    
+    // 8. Restore R15 (parent scope)
+    total_length += emitter.emitPopR15();
+    
     return total_length;
-}size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_scope) {
+}
+
+size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_scope) {
     size_t total_length = 0;
     
     // For each argument to print, generate code to load it into RDI and call print_int64
@@ -315,12 +330,13 @@ size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNod
         // Move RAX to RDI (first argument register)
         total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
         
+        // Ensure 16-byte stack alignment before calling C function
+        // Check if RSP is 16-byte aligned (test bottom 4 bits)
+        total_length += emitter.emitBytes({0x48, 0x83, 0xE4, 0xF0}); // and rsp, 0xFFFFFFFFFFFFFFF0 (align to 16 bytes)
+        
         // Call print_int64 function
         uint64_t print_addr = extern_function_addresses["print_int64"];
         total_length += emitter.emitCallAbsolute(print_addr);
-        
-        // ROBUST FUNCTION CALLING: Restore variables after external function call
-        total_length += restoreVariablesFromStack(current_scope);
     }
     
     return total_length;
@@ -332,13 +348,11 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
     // Loop through all variables in this scope
     for (auto& [name, varInfo] : scope->variables) {
         if (varInfo.type == DataType::CLOSURE) {
-            // This is a closure variable - need to create the closure structure
+            // This is a closure variable - store function address directly
             FunctionDeclNode* funcNode = varInfo.funcNode;
             if (!funcNode) continue;
             
-            // Closure structure: [function_address][scope_addr_1][scope_addr_2]...
-            // First, load the function address into RAX using placeholder
-            
+            // Store function address directly at R15 + offset
             // mov rax, <placeholder>
             total_length += emitter.emitBytes({0x48, 0xB8}); // mov rax, imm64 prefix
             
@@ -349,35 +363,6 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
             
             // Store function address at R15 + offset
             total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset);
-            
-            // Now store addresses of needed parent scopes
-            // For each scope in funcNode->allNeeded, we need to store its address
-            for (size_t i = 0; i < funcNode->allNeeded.size(); i++) {
-                int neededDepth = funcNode->allNeeded[i];
-                
-                // Get parameter index for this scope depth
-                auto it = funcNode->scopeDepthToParentParameterIndexMap.find(neededDepth);
-                if (it != funcNode->scopeDepthToParentParameterIndexMap.end()) {
-                    int paramIndex = it->second;
-                    
-                    if (paramIndex == -1) {
-                        // This scope is in R15 (current scope)
-                        // mov rax, r15
-                        total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
-                    } else {
-                        // Load from parameter using System V ABI
-                        total_length += emitter.emitMovRAXFromParam(paramIndex);
-                    }
-                } else {
-                    // Scope not found in parameter map - this is an error
-                    throw std::runtime_error("Scope dependency not found: function '" + 
-                                           funcNode->funcName + "' needs scope at depth " + 
-                                           std::to_string(neededDepth) + " but no parameter mapping exists");
-                }
-                
-                // Store the scope address at closure offset
-                total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset + 8 + (i * 8));
-            }
         }
     }
     
@@ -413,14 +398,36 @@ void Codegen::generateProgram(ASTNode& root) {
     // Cast root to LexicalScopeNode (global scope)
     LexicalScopeNode* global_scope = static_cast<LexicalScopeNode*>(&root);
     
+    // Setup global scope WITHOUT pushing R15 (since there's no parent scope)
     // Allocate memory for global scope
-    allocateScope(global_scope, true);
+    emitter.emitMovRAXImm64(12);       // sys_brk (12)
+    emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
+    emitter.emitSyscall();
     
-    // FIRST PASS: Generate main program flow (skip function definitions)
-    // First, create closures (this generates code that must run)
+    // Save current brk in RBX
+    emitter.emitBytes({0x48, 0x89, 0xC3}); // mov rbx, rax
+    
+    // Set new brk to current + scope size
+    emitter.emitMovRAXImm64(12);       // sys_brk
+    emitter.emitBytes({0x48, 0x89, 0xD9}); // mov rcx, rbx  
+    emitter.emitBytes({0x48, 0x81, 0xC1}); // add rcx, imm32
+    emitter.emitU32(static_cast<uint32_t>(global_scope->totalSize));
+    emitter.emitBytes({0x49, 0x89, 0xCA}); // mov r10, rcx (use R10 instead of RDI)
+    emitter.emitBytes({0x4C, 0x89, 0xD7}); // mov rdi, r10 (move to RDI only for syscall)
+    emitter.emitSyscall();
+    emitter.emitBytes({0x4C, 0x89, 0xD1}); // mov rcx, r10 (restore rcx from r10 for later use)
+    
+    // Use the old brk value as our allocated memory
+    emitter.emitBytes({0x48, 0x89, 0xD8}); // mov rax, rbx
+    
+    // Move allocated memory address to R15 (our lexical scope pointer)
+    emitter.emitMovR15RAX();
+    
+    // Create closures for global scope
     createClosures(global_scope);
     
-    // Then generate other main program code (skip function definitions)
+    // FIRST PASS: Generate main program flow (skip function definitions)
+    // Main program code (skip function definitions)
     for (auto& child : global_scope->ASTNode::children) {
         if (child->type != NodeType::FUNCTION_DECL) {
             generateNode(child.get(), global_scope);
@@ -451,8 +458,7 @@ void Codegen::generateProgram(ASTNode& root) {
     jump_patch[3] = (jump_distance >> 24) & 0xFF;
     
     // PROGRAM CONTINUATION: This is where the main program continues after the function call
-    // Restore previous lexical scope (pop R15)
-    restoreScope();
+    // No need to restore R15 for global scope since we never pushed it
     
     // For now, just exit cleanly
     emitter.emitMovRAXImm64(60);  // sys_exit
@@ -477,13 +483,6 @@ void Codegen::writeProgramToExecutable() {
     // Convert relative addresses to absolute addresses in executable memory
     uint64_t base_address = reinterpret_cast<uint64_t>(exec_mem);
     
-    // Update function addresses to absolute addresses
-    for (const auto& patch : function_patches) {
-        if (!patch.is_string_patch && patch.func) {
-            patch.func->functionAddress = base_address + patch.func->functionAddress;
-        }
-    }
-    
     // Patch all addresses (both function and string addresses) BEFORE copying to executable memory
     for (const auto& patch : function_patches) {
         uint64_t addr_to_patch;
@@ -492,11 +491,12 @@ void Codegen::writeProgramToExecutable() {
             // For string patches, calculate absolute address
             addr_to_patch = base_address + patch.string_offset;
         } else {
-            // For function patches, use the updated absolute function address
+            // For function patches, calculate absolute address in executable memory
             if (patch.func == nullptr) {
                 throw std::runtime_error("ERROR: Function patch has null function pointer at offset " + std::to_string(patch.offset_in_buffer));
             }
-            addr_to_patch = patch.func->functionAddress;
+            // The function address should be base_address + relative offset in buffer
+            addr_to_patch = base_address + patch.func->functionAddress;
         }
         
         // Write the address into the buffer at the exact offset
@@ -522,139 +522,43 @@ void Codegen::writeProgramToExecutable() {
 
 size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, LexicalScopeNode* current_scope, Register target_reg) {
     size_t total_length = 0;
-    auto access = identifier->getVariableAccess(current_scope);
+    auto access = identifier->getVariableAccess();
     int reg_num = static_cast<int>(target_reg);
     
-    // Check if variable is defined in the current scope
-    if (identifier->varRef->definedIn == current_scope) {
-        // Check if this is a function parameter (if we're in a function scope)
-        if (current_scope->type == NodeType::FUNCTION_DECL) {
-            FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(current_scope);
-            
-            // Check if this variable is a parameter
-            auto paramIt = std::find(funcDecl->params.begin(), funcDecl->params.end(), identifier->value);
-            if (paramIt != funcDecl->params.end()) {
-                // This is a parameter - load from stack instead of R15
-                size_t paramIndex = paramIt - funcDecl->params.begin();
-                
-                if (paramIndex < 6) { // Only first 6 params are in registers/stack
-                    // Calculate stack position: parameters are at bottom of stack frame
-                    // Stack layout: [saved_variables...][parameters...]
-                    size_t var_count = funcDecl->variables.size();
-                    int stack_offset = (var_count + paramIndex) * 8;
-                    
-                    // Load parameter from stack into RAX first
-                    if (stack_offset <= 127) {
-                        total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, static_cast<uint8_t>(stack_offset)}); // mov rax, [rsp+offset8]
-                    } else {
-                        total_length += emitter.emitBytes({0x48, 0x8B, 0x84, 0x24}); // mov rax, [rsp+offset32]
-                        total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
-                    }
-                    
-                    // If target register is not RAX, move from RAX to target register
-                    if (reg_num != 0) {
-                        total_length += emitter.emitMovRegFromReg(reg_num, 0);
-                    }
-                } else {
-                    throw std::runtime_error("Parameters beyond index 5 not yet supported");
-                }
-                
-                return total_length;
-            }
-        }
+    // Debug output
+    printf("DEBUG loadVariableIntoRegister: var='%s' paramIndex=%d offset=%d current_scope_depth=%d\n", 
+           identifier->value.c_str(), access.parameterIndex, access.offset, current_scope->depth);
+    if (identifier->varRef && identifier->varRef->definedIn) {
+        printf("DEBUG: var defined in scope depth=%d\n", identifier->varRef->definedIn->depth);
+    }
+    if (identifier->accessedIn) {
+        printf("DEBUG: var accessed in scope depth=%d\n", identifier->accessedIn->depth);
+    }
+    
+    if (access.parameterIndex == -1) {
+        // Variable is in current scope - load from R15+offset
+        printf("DEBUG: Loading from current scope R15+%d\n", access.offset);
         
-        // Regular variable - access via R15 + offset
+        // Load directly from R15 + offset
         total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.offset); // R15 = 15
     } else {
-        // Variable is in a parent scope - need to load scope address from parameter
-        // Get the depth of the scope where the variable is defined
-        int definedDepth = identifier->varRef->definedIn->depth;
+        // Variable is in a parent scope - load scope address from function's hidden parameter area first
+        printf("DEBUG: Loading from parent scope via hidden parameter %d + offset %d\n", access.parameterIndex, access.offset);
+        printf("DEBUG: This should load scope pointer from R15+hidden_param_offset and then access variable\n");
         
-        // Find this depth's index in the current function's allNeeded array
-        FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(current_scope);
-        int neededIndex = -1;
-        for (size_t i = 0; i < currentFunc->allNeeded.size(); i++) {
-            if (currentFunc->allNeeded[i] == definedDepth) {
-                neededIndex = static_cast<int>(i);
-                break;
-            }
-        }
+        // Calculate where the parent scope pointer is stored in the function's parameter area
+        // Hidden parameters start after regular parameters
+        // For now, assume parameter 1 is stored at R15+8 (this is where we stored it)
+        int hidden_param_offset = 8; // This corresponds to parameter index 1
         
-        if (neededIndex == -1) {
-            throw std::runtime_error("Variable '" + identifier->value + "' defined at depth " + 
-                                   std::to_string(definedDepth) + " not found in current function's allNeeded array");
-        }
-        
-        // Calculate actual parameter index: regular params + scope param index
-        int paramIndex = static_cast<int>(currentFunc->params.size()) + neededIndex;
-        
-        // First, load the parent scope address from the appropriate parameter register into target register
-        total_length += emitter.emitMovRegFromParam(reg_num, paramIndex);
+        // Load the parent scope address into target register
+        total_length += emitter.emitMovRegFromMemory(reg_num, 15, hidden_param_offset); // Load parent scope pointer from R15+8
         
         // Now load the variable from [target_reg + offset]
         total_length += emitter.emitMovRegFromMemory(reg_num, reg_num, access.offset);
     }
     
     return total_length;
-}
-
-size_t Codegen::saveVariablesToStack(LexicalScopeNode* scope) {
-    size_t total_length = 0;
-    
-    // Push all variables from this scope to the stack
-    // We iterate through variables in the scope and push their current values
-    for (const auto& var_pair : scope->variables) {
-        const VariableInfo& var = var_pair.second;
-        
-        // Load variable into RAX first
-        total_length += emitter.emitMovRegFromMemory(0, 15, var.offset); // RAX from [R15 + offset]
-        
-        // Push RAX to stack
-        total_length += emitter.emitBytes({0x50}); // push rax
-    }
-    
-    return total_length;
-}
-
-size_t Codegen::restoreVariablesFromStack(LexicalScopeNode* scope) {
-    // After a function call, we need to restore parameters from stack back to registers
-    // This only applies when we're inside a function that has parameters
-    if (scope->type == NodeType::FUNCTION_DECL) {
-        FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(scope);
-        size_t total_length = 0;
-        
-        // Only restore if we have parameters
-        size_t param_count = funcDecl->params.size();
-        if (param_count > 0) {
-            // Calculate stack positions: parameters are at the bottom of our stack frame  
-            // Stack layout (from RSP): [saved_variables...][parameters...]
-            size_t var_count = funcDecl->variables.size();
-            
-            // Restore parameters from stack to registers
-            for (size_t i = 0; i < param_count && i < 6; i++) {
-                // Parameters were pushed in order, so parameter i is at offset:
-                // (total_items - param_count + i) * 8 from RSP
-                int stack_offset = (var_count + param_count - param_count + i) * 8;
-                // Simplified: int stack_offset = (var_count + i) * 8;
-                stack_offset = (var_count + i) * 8;
-                
-                // Load parameter from stack into RAX first
-                if (stack_offset <= 127) {
-                    total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, static_cast<uint8_t>(stack_offset)}); // mov rax, [rsp+offset8]
-                } else {
-                    total_length += emitter.emitBytes({0x48, 0x8B, 0x84, 0x24}); // mov rax, [rsp+offset32]
-                    total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
-                }
-                
-                // Move RAX to the appropriate parameter register
-                total_length += emitter.emitMovParamFromRAX(static_cast<int>(i));
-            }
-        }
-        
-        return total_length;
-    }
-    
-    return 0;
 }
 
 void Codegen::disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address) {

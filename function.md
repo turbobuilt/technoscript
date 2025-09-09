@@ -6,11 +6,13 @@ The first thing that will take place is we will save the value of R15 on the sta
 
 The next step is to create the closures, as they have been "hoisted". So we have the variables map on the lexical scope node, and we go through them to find the Closure variables, and on variableInfo we have their offset.
 
-So at r15+offset, is where the closure goes.
+So at r15+offset of the current scope, is where the closure goes.
 
 That closure is supposed to contain first the address of the function and then addresses to any needed lexical scopes. Since we may not know the address of the function while compiling, we have a global data structure that is like an array where we push the offset and the FunctionDeclNode* pointer. Later we will go through and put the addresses once we know them.
 
-Then in the code, we will access all variables in the current scope as r15+offset.
+Then in the code, we will access all variables in the current scope are accessed as r15+offset.
+
+all function parameters should be stored in the lexical scope FIRST before any local variables. so that has to be computed.
 
 When a function is called, we do proper convention to pass any arguments, and then after that, the lexical scope addresses needed will be later arguments.
 
@@ -58,5 +60,4 @@ we want helpers on ast nodes to:
     - then get that parameter by index into a register
     - the code to access is then the offset of the variable in it's own scope from that register.
 
-we must also push all parameters to the stack in the prologue and pop them (by moving stack pointer) in the epilogue
-after each function call, we will restore the parameters.
+for now we always use closures and hoist, and calling means we put the lexical scopes in the closures after the regular parameters

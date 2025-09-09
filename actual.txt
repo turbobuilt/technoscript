@@ -1,0 +1,71 @@
+=== Testing robust function calling - variables should be preserved ===
+SCOPE(depth=0) [size=24] [vars: test@0(closure:16) x@16(i64)]
+  VAR x
+    LIT 42
+  SCOPE(depth=1) FUNC(test) [parent-deps: 0] [all-needed: 0] [param-map: 0->-1]
+    PRINT
+      ID x -> depth0
+  CALL test
+DEBUG: Function 'test' needs 1 scope parameters
+DEBUG: Passing scope depth 0 as parameter 0
+DEBUG: Passing current scope (R15) for depth 0
+DEBUG loadVariableIntoRegister: var='x' paramIndex=-1 offset=16 current_scope_depth=1
+DEBUG: var defined in scope depth=0
+DEBUG: var accessed in scope depth=1
+DEBUG: Loading from current scope R15+16
+
+=== DISASSEMBLY OF PATCHED CODE ===
+Base address: 0x749bf854c000
+Code size: 193 bytes
+
+0x749bf854c000:	41 57                   	push	r15
+0x749bf854c002:	48 b8 0c 00 00 00 00 00 00 00 	movabs	rax, 0xc
+0x749bf854c00c:	48 31 ff                	xor	rdi, rdi
+0x749bf854c00f:	0f 05                   	syscall	
+0x749bf854c011:	48 89 c3                	mov	rbx, rax
+0x749bf854c014:	48 b8 0c 00 00 00 00 00 00 00 	movabs	rax, 0xc
+0x749bf854c01e:	48 89 df                	mov	rdi, rbx
+0x749bf854c021:	48 81 c7 18 00 00 00    	add	rdi, 0x18
+0x749bf854c028:	0f 05                   	syscall	
+0x749bf854c02a:	48 89 d8                	mov	rax, rbx
+0x749bf854c02d:	49 89 c7                	mov	r15, rax
+0x749bf854c030:	48 b8 62 c0 54 f8 9b 74 00 00 	movabs	rax, 0x749bf854c062
+0x749bf854c03a:	49 89 07                	mov	qword ptr [r15], rax
+0x749bf854c03d:	4c 89 f8                	mov	rax, r15
+0x749bf854c040:	49 89 47 08             	mov	qword ptr [r15 + 8], rax
+0x749bf854c044:	48 b8 2a 00 00 00 00 00 00 00 	movabs	rax, 0x2a
+0x749bf854c04e:	49 89 47 10             	mov	qword ptr [r15 + 0x10], rax
+0x749bf854c052:	4c 89 f8                	mov	rax, r15
+0x749bf854c055:	48 89 c7                	mov	rdi, rax
+0x749bf854c058:	49 8b 07                	mov	rax, qword ptr [r15]
+0x749bf854c05b:	ff d0                   	call	rax
+0x749bf854c05d:	e9 4e 00 00 00          	jmp	0x749bf854c0b0
+0x749bf854c062:	55                      	push	rbp
+0x749bf854c063:	48 89 e5                	mov	rbp, rsp
+0x749bf854c066:	41 57                   	push	r15
+0x749bf854c068:	48 b8 0c 00 00 00 00 00 00 00 	movabs	rax, 0xc
+0x749bf854c072:	48 31 ff                	xor	rdi, rdi
+0x749bf854c075:	0f 05                   	syscall	
+0x749bf854c077:	48 89 c3                	mov	rbx, rax
+0x749bf854c07a:	48 b8 0c 00 00 00 00 00 00 00 	movabs	rax, 0xc
+0x749bf854c084:	48 89 df                	mov	rdi, rbx
+0x749bf854c087:	48 81 c7 00 00 00 00    	add	rdi, 0
+0x749bf854c08e:	0f 05                   	syscall	
+0x749bf854c090:	48 89 d8                	mov	rax, rbx
+0x749bf854c093:	49 89 c7                	mov	r15, rax
+0x749bf854c096:	49 8b 47 10             	mov	rax, qword ptr [r15 + 0x10]
+0x749bf854c09a:	48 89 c7                	mov	rdi, rax
+0x749bf854c09d:	48 b8 71 7f 2f 2f 25 56 00 00 	movabs	rax, 0x56252f2f7f71
+0x749bf854c0a7:	ff d0                   	call	rax
+0x749bf854c0a9:	41 5f                   	pop	r15
+0x749bf854c0ab:	48 89 ec                	mov	rsp, rbp
+0x749bf854c0ae:	5d                      	pop	rbp
+0x749bf854c0af:	c3                      	ret	
+0x749bf854c0b0:	41 5f                   	pop	r15
+0x749bf854c0b2:	48 b8 3c 00 00 00 00 00 00 00 	movabs	rax, 0x3c
+0x749bf854c0bc:	48 31 ff                	xor	rdi, rdi
+0x749bf854c0bf:	0f 05                   	syscall	
+
+=== END DISASSEMBLY ===
+
+0
