@@ -17,6 +17,12 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
         varInfo.type = varDecl->varType;
         varInfo.name = varDecl->varName;
         varInfo.definedIn = scope;
+        // Set size based on type
+        if (varDecl->varType == DataType::INT32) {
+            varInfo.size = 4;
+        } else {
+            varInfo.size = 8; // INT64 and other types
+        }
         scope->variables[varDecl->varName] = varInfo;
     }
     
@@ -29,6 +35,7 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
         closureVar.name = func->funcName;
         closureVar.definedIn = scope;
         closureVar.funcNode = func;
+        closureVar.size = 8; // Temporary size, will be updated after analysis
         scope->variables[func->funcName] = closureVar;
         
         // Add function parameters as variables in the function scope
@@ -37,6 +44,7 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
             paramVar.type = DataType::INT64; // Default type for now (should be improved with actual type analysis)
             paramVar.name = paramName;
             paramVar.definedIn = func;
+            paramVar.size = 8; // Parameters are 8 bytes
             func->variables[paramName] = paramVar;
         }
         
@@ -144,6 +152,14 @@ void Analyzer::addDescendantDep(LexicalScopeNode* scope, int depthIdx) {
 
 void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
     scope->updateAllNeeded();
+    
+    // Update closure sizes now that allNeeded is calculated
+    for (auto& [name, varInfo] : scope->variables) {
+        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
+            // Calculate correct closure size: 8 bytes for function address + 8 bytes per needed scope
+            varInfo.size = 8 + (varInfo.funcNode->allNeeded.size() * 8);
+        }
+    }
     
     // Recursively update for all function scopes
     for (auto& child : scope->ASTNode::children) {

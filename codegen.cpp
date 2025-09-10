@@ -6,7 +6,9 @@
 
 void Codegen::initExternFunctions() {
     // Get addresses of extern C functions for maximum performance
-    extern_function_addresses["print_int64"] = reinterpret_cast<uint64_t>(print_int64);
+    uint64_t print_addr = reinterpret_cast<uint64_t>(print_int64);
+    std::cout << "DEBUG initExternFunctions: storing print_int64 at address 0x" << std::hex << print_addr << std::dec << std::endl;
+    extern_function_addresses["print_int64"] = print_addr;
     extern_function_addresses["print_string"] = reinterpret_cast<uint64_t>(print_string);
 }
 
@@ -84,9 +86,9 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
                 dummy_call.type = NodeType::FUNCTION_CALL;
                 // Copy varRef for function resolution
                 dummy_call.varRef = identifier->varRef;
-                total_length += generateFunctionCall(&dummy_call, current_scope);
+                total_length += generateClosureCall(&dummy_call, current_scope);
             } else {
-                total_length += generateIdentifier(identifier, current_scope);
+                total_length += generateIdentifier(identifier);
             }
             break;
         }
@@ -119,7 +121,7 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
         }
         case NodeType::FUNCTION_CALL: {
             FunctionCallNode* funcCall = static_cast<FunctionCallNode*>(node);
-            total_length += generateFunctionCall(funcCall, current_scope);
+            total_length += generateClosureCall(funcCall, current_scope);
             break;
         }
         case NodeType::GO_STMT:
@@ -145,7 +147,7 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
                     // Treat this as a function call
                     FunctionCallNode dummy_call(identifier->value);
                     dummy_call.type = NodeType::FUNCTION_CALL;
-                    total_length += generateFunctionCall(&dummy_call, current_scope);
+                    total_length += generateClosureCall(&dummy_call, current_scope);
                     break;
                 } else {
                     printf("DEBUG: Identifier does not refer to a closure\n");
@@ -196,12 +198,12 @@ size_t Codegen::generateLiteral(LiteralNode* literal) {
     return emitter.emitMovRAXImm64(static_cast<uint64_t>(value));
 }
 
-size_t Codegen::generateIdentifier(IdentifierNode* identifier, LexicalScopeNode* current_scope) {
+size_t Codegen::generateIdentifier(IdentifierNode* identifier) {
     // Use the flexible helper to load variable into RAX (maintaining backward compatibility)
-    return loadVariableIntoRegister(identifier, current_scope, Register::RAX);
+    return loadVariableIntoRegister(identifier, Register::RAX);
 }
 
-size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNode* current_scope) {
+size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode* current_scope) {
     size_t total_length = 0;
     
     // Get the function being called
@@ -213,47 +215,17 @@ size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNod
         throw std::runtime_error("Cannot call function - no target function found");
     }
     
-    // Load the function address into RBX
-    auto access = funcCall->getVariableAccess();
-    
-    if (access.parameterIndex == -1) {
-        // Function address is in current scope - load directly into RBX
-        total_length += emitter.emitMovRegFromMemory(3, 15, access.offset); // mov rbx, [r15 + offset]
-    } else {
-        // Function address is in parent scope - load scope address from parameter, then access function
-        total_length += emitter.emitMovRAXFromParam(access.parameterIndex);
-        // Now load function address from [rax + offset] into RBX
-        if (access.offset == 0) {
-            total_length += emitter.emitBytes({0x48, 0x8B, 0x18}); // mov rbx, [rax]
-        } else {
-            total_length += emitter.emitBytes({0x48, 0x8B, 0x58, static_cast<uint8_t>(access.offset)}); // mov rbx, [rax + offset]
-        }
-    }
-    
     // NEW CALLING CONVENTION:
-    // 1. Push R15 (save parent scope)
-    total_length += emitter.emitBytes({0x41, 0x57}); // push r15
+    // 1. Load closure address from parent scope FIRST (while R15 is still parent scope)
+    total_length += loadVariableIntoRegister(funcCall, Register::RBX);
     
-    // 2. Save function address (RBX) on stack since we'll need it later
-    total_length += emitter.emitBytes({0x53}); // push rbx
-    
-    // 3. Evaluate all arguments first and save them on stack (before changing R15)
-    std::vector<size_t> arg_stack_positions;
-    for (size_t i = 0; i < funcCall->args.size(); i++) {
-        // Generate code to evaluate the argument (result in RAX)
-        total_length += generateNode(funcCall->args[i].get(), current_scope);
-        // Push argument value onto stack
-        total_length += emitter.emitBytes({0x50}); // push rax
-        arg_stack_positions.push_back(i);
-    }
-    
-    // 4. Allocate scope object for target function
+    // 2. Allocate scope object for target function (keep R15 as current scope for now)
     // Get current brk (program break) - this will be our allocated memory
     total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
     total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
     total_length += emitter.emitSyscall();
     
-    // Save current brk in RCX (instead of RBX to avoid conflict)
+    // Save current brk in RCX
     total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
     
     // Set new brk to current + scope size
@@ -264,56 +236,80 @@ size_t Codegen::generateFunctionCall(FunctionCallNode* funcCall, LexicalScopeNod
     total_length += emitter.emitBytes({0x48, 0x89, 0xD7}); // mov rdi, rdx
     total_length += emitter.emitSyscall();
     
-    // Use the old brk value as our allocated memory
-    total_length += emitter.emitBytes({0x48, 0x89, 0xC8}); // mov rax, rcx
+    // Store the new scope address in R14 (R15 remains current scope for argument evaluation)
+    total_length += emitter.emitBytes({0x49, 0x89, 0xCE}); // mov r14, rcx
     
-    // Move allocated memory address to R15 (our lexical scope pointer)
-    total_length += emitter.emitMovR15RAX();
-    
-    // 5. Copy parameters from stack to R15+offset (in reverse order since stack is LIFO)
-    int param_offset = 0;
-    for (int i = funcCall->args.size() - 1; i >= 0; i--) {
-        total_length += emitter.emitBytes({0x58}); // pop rax
-        // Store parameter at R15+param_offset
-        total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(param_offset);
-        param_offset += 8;
-    }
-    
-    // 6. Add hidden parameters for parent scopes that the function needs
-    for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
-        int neededDepth = targetFunc->allNeeded[i];
-        if (neededDepth != targetFunc->depth) { // Don't pass current scope to itself
-            // Get the parameter index for this scope depth
-            auto it = targetFunc->scopeDepthToParentParameterIndexMap.find(neededDepth);
-            if (it != targetFunc->scopeDepthToParentParameterIndexMap.end()) {
-                int paramIndex = it->second;
-                
-                if (neededDepth == current_scope->depth) {
-                    // This is the current scope - pass R15 (before we changed it)
-                    // We need to get the original R15 from the stack
-                    // The original R15 is at [rsp + 8] (since we pushed rbx after r15)
-                    total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, 0x08}); // mov rax, [rsp + 8]
-                } else {
-                    // This scope should be passed from our parent - not implemented yet
-                    // For now, just pass the current scope
-                    total_length += emitter.emitBytes({0x48, 0x8B, 0x44, 0x24, 0x08}); // mov rax, [rsp + 8]
-                }
-                
-                // Store parent scope pointer at R15+param_offset
-                total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(param_offset);
-                param_offset += 8;
+    // Calculate the starting offset for hidden parameters (after regular parameters)
+    int hidden_param_start_offset = 0;
+    for (const std::string& paramName : targetFunc->params) {
+        auto paramIt = targetFunc->variables.find(paramName);
+        if (paramIt != targetFunc->variables.end()) {
+            int param_end = paramIt->second.offset + paramIt->second.size;
+            if (param_end > hidden_param_start_offset) {
+                hidden_param_start_offset = param_end;
             }
         }
     }
+    // Align to 8 bytes
+    hidden_param_start_offset = (hidden_param_start_offset + 7) & ~7;
     
-    // 7. Restore function address from stack
-    total_length += emitter.emitBytes({0x5B}); // pop rbx
+    // 3. Evaluate arguments and store them directly at their correct offsets in the new scope
+    // R15 = current scope (for evaluating arguments), R14 = new scope (for storing results)
+    for (size_t i = 0; i < funcCall->args.size(); i++) {
+        // Generate code to evaluate the argument (result in RAX) using current scope (R15)
+        total_length += generateNode(funcCall->args[i].get(), current_scope);
+        
+        // Find the parameter name and get its offset from the target function
+        std::string paramName = targetFunc->params[i];
+        auto paramIt = targetFunc->variables.find(paramName);
+        if (paramIt != targetFunc->variables.end()) {
+            int paramOffset = paramIt->second.offset;
+            // Store argument directly at [R14 + paramOffset] (R14 contains new scope address)
+            total_length += emitter.emitBytes({0x49, 0x89, 0x86}); // mov [r14 + offset], rax
+            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+        } else {
+            throw std::runtime_error("Parameter not found in target function: " + paramName);
+        }
+    }
     
-    // 7. Call the function directly (RBX contains the function address)
-    total_length += emitter.emitBytes({0x48, 0x89, 0xD8}); // mov rax, rbx
+    // 4. Copy hidden lexical scope parameters from closure to their proper offsets
+    // IMPORTANT: Do this BEFORE switching R15, while we still have access to parent scope
+    
+    // Load closure address into RCX and keep it there throughout the loop
+    printf("DEBUG: About to call loadVariableDefiningScopeAddressIntoRegister with RCX\n");
+    total_length += loadVariableDefiningScopeAddressIntoRegister(funcCall, Register::RCX);
+    printf("DEBUG: Finished loadVariableDefiningScopeAddressIntoRegister\n");
+    auto variable_offset = funcCall->getVariableAccess().offset;
+    
+    printf("DEBUG: targetFunc->allNeeded.size() = %zu\n", targetFunc->allNeeded.size());
+    // Copy each lexical scope address from closure to new scope
+    for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
+        printf("DEBUG: Processing allNeeded[%zu]\n", i);
+        // Load scope pointer from closure structure at offset 8 + (i * 8)
+        size_t scope_offset_in_closure = 8 + (i * 8);
+        auto total_offset = scope_offset_in_closure + variable_offset;
+        
+        // Load the scope pointer from [rcx + total_offset] into RAX
+        total_length += emitter.emitMovRAXFromRCXPlusOffset(static_cast<uint32_t>(total_offset));
+        
+        // Store in new scope at hidden parameter offset
+        int hidden_param_offset = hidden_param_start_offset + (i * 8);
+        total_length += emitter.emitMovQwordPtrR14PlusOffsetRAX(static_cast<uint32_t>(hidden_param_offset));
+    }
+    
+    // 5. Push R15 (save parent scope) and switch to new scope
+    total_length += emitter.emitBytes({0x41, 0x57}); // push r15
+    total_length += emitter.emitBytes({0x4D, 0x89, 0xF7}); // mov r15, r14
+    
+    // 6. Load function address from closure (now in RCX) and call
+    // Function address is at closure base (offset 0)
+    // RCX contains closure address from loadVariableDefiningScopeAddressIntoRegister call
+    total_length += emitter.emitBytes({0x48, 0x8B, 0x01}); // mov rax, [rcx]
+    
+    // Call the function
     total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
     
-    // 8. Restore R15 (parent scope)
+    // 7. Restore R15 (parent scope)
     total_length += emitter.emitPopR15();
     
     return total_length;
@@ -330,12 +326,12 @@ size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_
         // Move RAX to RDI (first argument register)
         total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
         
-        // Ensure 16-byte stack alignment before calling C function
-        // Check if RSP is 16-byte aligned (test bottom 4 bits)
-        total_length += emitter.emitBytes({0x48, 0x83, 0xE4, 0xF0}); // and rsp, 0xFFFFFFFFFFFFFFF0 (align to 16 bytes)
+        // NOTE: Stack alignment removed - caller should ensure proper alignment
+        // The stack alignment was corrupting the return address in functions
         
         // Call print_int64 function
         uint64_t print_addr = extern_function_addresses["print_int64"];
+        std::cout << "DEBUG generatePrintStatement: retrieved print_int64 address 0x" << std::hex << print_addr << std::dec << std::endl;
         total_length += emitter.emitCallAbsolute(print_addr);
     }
     
@@ -348,11 +344,11 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
     // Loop through all variables in this scope
     for (auto& [name, varInfo] : scope->variables) {
         if (varInfo.type == DataType::CLOSURE) {
-            // This is a closure variable - store function address directly
+            // This is a closure variable - store the closure structure DIRECTLY in the variable slots
             FunctionDeclNode* funcNode = varInfo.funcNode;
             if (!funcNode) continue;
             
-            // Store function address directly at R15 + offset
+            // Store function address directly at R15 + varInfo.offset (first 8 bytes of closure)
             // mov rax, <placeholder>
             total_length += emitter.emitBytes({0x48, 0xB8}); // mov rax, imm64 prefix
             
@@ -361,8 +357,44 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
             total_length += emitter.emitFunctionAddressPlaceholder(patch_offset);
             function_patches.push_back(FunctionPatch(patch_offset, funcNode));
             
-            // Store function address at R15 + offset
+            // Store function address at R15 + varInfo.offset
             total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset);
+            
+            // Now store addresses of needed parent scopes immediately after the function address
+            // For each scope in funcNode->allNeeded, we need to store its address
+            for (size_t i = 0; i < funcNode->allNeeded.size(); i++) {
+                int neededDepth = funcNode->allNeeded[i];
+                
+                // Get parameter index for this scope depth
+                auto it = funcNode->scopeDepthToParentParameterIndexMap.find(neededDepth);
+                if (it != funcNode->scopeDepthToParentParameterIndexMap.end()) {
+                    int absoluteParamIndex = it->second;
+                    
+                    // Load scope address using absolute parameter index directly
+                    // Convert absolute parameter index to byte offset
+                    printf("DEBUG: Creating closure - loading scope for depth %d from absolute param %d (offset %d)\n", neededDepth, absoluteParamIndex);
+                    
+                    if (absoluteParamIndex == -1) {
+                        // Special case: current scope (R15)
+                        total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+                    } else {
+                        // Load from parameter at absolute offset
+                        int param_offset = 8 * absoluteParamIndex;
+                        printf("PARAM OFFSET: %d\n", param_offset);
+                        total_length += emitter.emitMovRAXFromR15Offset(param_offset);
+                    }
+                } else {
+                    // Scope not found in parameter map - this is an error
+                    throw std::runtime_error("Scope dependency not found: function '" + 
+                                           funcNode->funcName + "' needs scope at depth " + 
+                                           std::to_string(neededDepth) + " but no parameter mapping exists");
+                }
+                
+                // Store the scope address immediately after function address
+                // Closure structure: [func_addr at offset][scope1 at offset+8][scope2 at offset+16]...
+                size_t scope_offset = varInfo.offset + 8 + (i * 8);
+                total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(scope_offset);
+            }
         }
     }
     
@@ -457,6 +489,9 @@ void Codegen::generateProgram(ASTNode& root) {
     jump_patch[2] = (jump_distance >> 16) & 0xFF;
     jump_patch[3] = (jump_distance >> 24) & 0xFF;
     
+    // NOW patch all function addresses in the closures
+    patchFunctionAddresses();
+    
     // PROGRAM CONTINUATION: This is where the main program continues after the function call
     // No need to restore R15 for global scope since we never pushed it
     
@@ -520,14 +555,20 @@ void Codegen::writeProgramToExecutable() {
     munmap(exec_mem, emitter.buffer.size());
 }
 
-size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, LexicalScopeNode* current_scope, Register target_reg) {
+size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register target_reg) {
     size_t total_length = 0;
+    
+    // Ensure accessedIn is properly set during analysis
+    if (!identifier->accessedIn) {
+        throw std::runtime_error("Variable access scope not set during analysis: " + identifier->value);
+    }
+    
     auto access = identifier->getVariableAccess();
     int reg_num = static_cast<int>(target_reg);
     
     // Debug output
-    printf("DEBUG loadVariableIntoRegister: var='%s' paramIndex=%d offset=%d current_scope_depth=%d\n", 
-           identifier->value.c_str(), access.parameterIndex, access.offset, current_scope->depth);
+    printf("DEBUG loadVariableIntoRegister: var='%s' paramIndex=%d paramOffset=%d offset=%d\n", 
+           identifier->value.c_str(), access.parameterIndex, access.parameterOffset, access.offset);
     if (identifier->varRef && identifier->varRef->definedIn) {
         printf("DEBUG: var defined in scope depth=%d\n", identifier->varRef->definedIn->depth);
     }
@@ -539,23 +580,67 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, LexicalScop
         // Variable is in current scope - load from R15+offset
         printf("DEBUG: Loading from current scope R15+%d\n", access.offset);
         
-        // Load directly from R15 + offset
+        // Use general method for all registers (simplified and consistent)
         total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.offset); // R15 = 15
     } else {
-        // Variable is in a parent scope - load scope address from function's hidden parameter area first
-        printf("DEBUG: Loading from parent scope via hidden parameter %d + offset %d\n", access.parameterIndex, access.offset);
-        printf("DEBUG: This should load scope pointer from R15+hidden_param_offset and then access variable\n");
+        // Variable is in a parent scope - load scope address from hidden parameter
+        printf("DEBUG: Loading from parent scope via parameter offset %d + variable offset %d\n", access.parameterOffset, access.offset);
         
-        // Calculate where the parent scope pointer is stored in the function's parameter area
-        // Hidden parameters start after regular parameters
-        // For now, assume parameter 1 is stored at R15+8 (this is where we stored it)
-        int hidden_param_offset = 8; // This corresponds to parameter index 1
+        // Use the pre-calculated parameter offset directly (accounts for variable-sized parameters)
+        printf("DEBUG: Using parameter offset: %d\n", access.parameterOffset);
         
-        // Load the parent scope address into target register
-        total_length += emitter.emitMovRegFromMemory(reg_num, 15, hidden_param_offset); // Load parent scope pointer from R15+8
-        
-        // Now load the variable from [target_reg + offset]
+        // Load the parent scope address from parameter, then load the variable
+        // Use general method for all registers (simplified and consistent)
+        total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.parameterOffset);
         total_length += emitter.emitMovRegFromMemory(reg_num, reg_num, access.offset);
+    }
+    
+    return total_length;
+}
+
+size_t Codegen::loadVariableDefiningScopeAddressIntoRegister(IdentifierNode* identifier, Register target_reg) {
+    size_t total_length = 0;
+    
+    // Ensure accessedIn is properly set during analysis
+    if (!identifier->accessedIn) {
+        throw std::runtime_error("Variable access scope not set during analysis: " + identifier->value);
+    }
+    
+    auto access = identifier->getVariableAccess();
+    int reg_num = static_cast<int>(target_reg);
+    
+    // Debug output
+    printf("DEBUG loadVariableDefiningScopeAddressIntoRegister: var='%s' paramIndex=%d paramOffset=%d\n", 
+           identifier->value.c_str(), access.parameterIndex, access.parameterOffset);
+    if (identifier->varRef && identifier->varRef->definedIn) {
+        printf("DEBUG: var defined in scope depth=%d\n", identifier->varRef->definedIn->depth);
+    }
+    if (identifier->accessedIn) {
+        printf("DEBUG: var accessed in scope depth=%d\n", identifier->accessedIn->depth);
+    }
+    
+    if (access.parameterIndex == -1) {
+        // Variable is in current scope - load R15 (current scope address) into target register
+        printf("DEBUG: Loading current scope address from R15\n");
+        printf("DEBUG: target_reg = %d, Register::R15 = %d\n", (int)target_reg, (int)Register::R15);
+        
+        // Move R15 to target register
+        if (target_reg == Register::R15) {
+            // No need to move if target is already R15
+            printf("DEBUG: Target register is already R15, no move needed\n");
+        } else {
+            printf("DEBUG: Target register is NOT R15, calling emitMovRegFromReg\n");
+            total_length += emitter.emitMovRegFromReg(reg_num, 15); // Move R15 to target register
+        }
+    } else {
+        // Variable is in a parent scope - load the parent scope address from hidden parameter
+        printf("DEBUG: Loading parent scope address from parameter offset %d\n", access.parameterOffset);
+        
+        // Use the pre-calculated parameter offset directly (accounts for variable-sized parameters)
+        printf("DEBUG: Using parameter offset: %d\n", access.parameterOffset);
+        
+        // Load the parent scope address from parameter
+        total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.parameterOffset);
     }
     
     return total_length;

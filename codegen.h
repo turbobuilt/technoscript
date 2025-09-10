@@ -71,12 +71,16 @@ private:
     size_t generateVarDecl(VarDeclNode* node, LexicalScopeNode* current_scope);
     size_t generateLiteral(LiteralNode* node);
     size_t generatePrintStatement(ASTNode* node, LexicalScopeNode* current_scope);
-    size_t generateIdentifier(IdentifierNode* node, LexicalScopeNode* current_scope);
-    size_t generateFunctionCall(FunctionCallNode* node, LexicalScopeNode* current_scope);
+    size_t generateIdentifier(IdentifierNode* node);
+    size_t generateClosureCall(FunctionCallNode* node, LexicalScopeNode* current_scope);
     
     // Helper to load any variable into a specified register
     // This provides much more flexibility for register allocation and reduces unnecessary moves
-    size_t loadVariableIntoRegister(IdentifierNode* identifier, LexicalScopeNode* current_scope, Register target_reg);
+    size_t loadVariableIntoRegister(IdentifierNode* identifier, Register target_reg);
+    
+    // Helper to load the defining scope address of a variable into a specified register
+    // If the variable is in current scope (-1), loads r15. Otherwise loads the parent scope address.
+    size_t loadVariableDefiningScopeAddressIntoRegister(IdentifierNode* identifier, Register target_reg);
     
     // Disassembly helper
     void disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address = 0);

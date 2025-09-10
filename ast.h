@@ -24,7 +24,8 @@ class LexicalScopeNode;
 struct VariableInfo {
     DataType type;
     std::string name;
-    int offset = 0;
+    int offset = 0;  // Offset from R15 where this variable/parameter is stored
+    int size = 8;    // Size in bytes: 8 for regular vars, correct closure size for closures
     LexicalScopeNode* definedIn = nullptr;
     FunctionDeclNode* funcNode = nullptr; // For closures: back-reference to function
 };
@@ -83,6 +84,8 @@ public:
     int getParameterIndexInCurrentScope(LexicalScopeNode* activeScope) {
         return activeScope->scopeDepthToParentParameterIndexMap.at(this->depth);
     }
+
+    int getParameterOffset(int index);
     
     void pack();
 
@@ -116,14 +119,15 @@ class IdentifierNode : public ASTNode {
 public:
     struct VariableAccess {
         int parameterIndex; // -1 if in current scope, else index in parent params
-        int offset;
+        int parameterOffset; // Byte offset for variable-sized parameters
+        int offset; // Offset within the scope for the variable
     };
     
     LexicalScopeNode* accessedIn = nullptr; // Set during analysis: the scope where this identifier is accessed
     
     IdentifierNode(const std::string& name) : ASTNode(NodeType::IDENTIFIER, name) {}
     
-    // any time this is accessed it could be in the current scope or in an ancestor scope. Ancestor scopes are passed as "hidden params" after actual params. This function tells us the parameter index of that scope address, and the offset in it we can find this variable at.
+    // any time this is accessed it could be in the current scope or in an ancestor scope. Ancestor scopes are passed as "hidden params" after actual params. This function tells us the absolute parameter index of that scope address, and the offset in it we can find this variable at.
     VariableAccess getVariableAccess() {
         if (!varRef) throw std::runtime_error("Variable not analyzed: " + value);
         if (!varRef->definedIn) throw std::runtime_error("Variable scope not found: " + value);
@@ -132,11 +136,15 @@ public:
         LexicalScopeNode* definingScope = varRef->definedIn;
         
         if (definingScope == accessedIn) {
-            return {-1, varRef->offset};
+            return {-1, 0, varRef->offset};
         } else {
             // Use the access method to get parameter index for the defining scope
             int paramIndex = definingScope->getParameterIndexInCurrentScope(accessedIn);
-            return {paramIndex, varRef->offset};
+            
+            // Use the helper method to calculate parameter offset
+            int paramOffset = accessedIn->getParameterOffset(paramIndex);
+            
+            return {paramIndex, paramOffset, varRef->offset};
         }
     }
 };
@@ -157,10 +165,8 @@ public:
 
 // Implementation of getTypeSize after all classes are defined
 inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
-    if (var.type == DataType::CLOSURE && var.funcNode) {
-        return 8 + (var.funcNode->allNeeded.size() * 8);
-    }
-    return var.type == DataType::INT32 ? 4 : 8;
+    // Use the precomputed size field for fast access
+    return var.size;
 }
 
 // Implementation of buildScopeDepthToParentParameterIndexMap after all classes are defined
@@ -221,18 +227,20 @@ inline void LexicalScopeNode::pack() {
     
     // Sort regular variables by type size (biggest first)
     std::sort(vars.begin(), vars.end(), [](const auto& a, const auto& b) {
-        return getTypeSize(*a.second) > getTypeSize(*b.second);
+        return a.second->size > b.second->size;
     });
     
     int offset = 0;
     
     // For function scopes, first allocate space for parameters
     if (this->type == NodeType::FUNCTION_DECL) {
-        // 1. Pack regular parameters first (8 bytes each)
+        // 1. Pack regular parameters first (using their actual sizes)
         for (auto& [name, var] : params) {
-            offset = (offset + 7) & ~7; // 8-byte align
+            int size = var->size;
+            int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
+            offset = (offset + align - 1) & ~(align - 1); // Align
             var->offset = offset;
-            offset += 8; // Each parameter takes 8 bytes
+            offset += size; // Use actual parameter size
         }
         
         // 2. Space for hidden lexical scope parameters (8 bytes each)
@@ -246,7 +254,7 @@ inline void LexicalScopeNode::pack() {
     
     // Then pack regular variables after parameters
     for (auto& [name, var] : vars) {
-        int size = getTypeSize(*var);
+        int size = var->size; // Use the size field instead of getTypeSize
         int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
         offset = (offset + align - 1) & ~(align - 1); // Align
         var->offset = offset;

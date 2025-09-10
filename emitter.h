@@ -4,9 +4,9 @@
 #include <vector>
 #include <string>
 
-// Simple raw x86_64 machine code emitter (Linux SysV ABI)
-// Provides tiny helpers for emitting individual instructions needed
-// for a minimal "Hello, world" program using write + exit syscalls.
+// Raw x86_64 machine code emitter for custom calling convention
+// Uses R15 as lexical scope pointer where parameters and variables are stored
+// at their VariableInfo->offset (no traditional ABI parameter registers)
 class Emitter {
 public:
     std::vector<uint8_t> buffer;
@@ -64,6 +64,11 @@ public:
         }
     }
     
+    // Memory operations with R14 + offset
+    size_t emitMovQwordPtrR14PlusOffsetRAX(uint32_t offset) {
+        return emitBytes({0x49, 0x89, 0x86}) + emitU32(offset); // mov [r14 + offset], rax
+    }
+    
     // Memory allocation via mmap syscall (sys_mmap = 9)
     size_t emitMovRSIImm64(uint64_t imm) { return emitBytes({0x48, 0xBE}) + emitU64(imm); } // mov rsi, imm64
     size_t emitMovRCXImm64(uint64_t imm) { return emitBytes({0x48, 0xB9}) + emitU64(imm); } // mov rcx, imm64
@@ -71,7 +76,7 @@ public:
     size_t emitMovR9Imm64(uint64_t imm) { return emitBytes({0x49, 0xB9}) + emitU64(imm); }  // mov r9, imm64
     size_t emitXorRDXRDX() { return emitBytes({0x48, 0x31, 0xD2}); } // xor rdx, rdx
     
-    // Move RAX to System V ABI parameter registers
+    // Move RAX to registers for external function calls (C ABI)
     size_t emitMovRDIRAX() { return emitBytes({0x48, 0x89, 0xC7}); } // mov rdi, rax
     size_t emitMovRSIRAX() { return emitBytes({0x48, 0x89, 0xC6}); } // mov rsi, rax
     size_t emitMovRDXRAX() { return emitBytes({0x48, 0x89, 0xC2}); } // mov rdx, rax
@@ -92,42 +97,39 @@ public:
         return emitU64(0); // 8 bytes of zeros as placeholder
     }
     
-    // System V ABI parameter register operations
-    // Parameter registers: RDI, RSI, RDX, RCX, R8, R9 (0-5)
-    size_t emitMovRAXFromParam(int param_index) {
-        switch (param_index) {
-            case 0: return emitBytes({0x48, 0x89, 0xF8}); // mov rax, rdi
-            case 1: return emitBytes({0x48, 0x89, 0xF0}); // mov rax, rsi  
-            case 2: return emitBytes({0x48, 0x89, 0xD0}); // mov rax, rdx
-            case 3: return emitBytes({0x48, 0x89, 0xC8}); // mov rax, rcx
-            case 4: return emitBytes({0x4C, 0x89, 0xC0}); // mov rax, r8
-            case 5: return emitBytes({0x4C, 0x89, 0xC8}); // mov rax, r9
-            default:
-                // Parameter on stack: mov rax, [rsp + 8 + (param_index - 6) * 8]
-                int stack_offset = 8 + (param_index - 6) * 8;
-                if (stack_offset <= 127) {
-                    return emitBytes({0x48, 0x8B, 0x44, 0x24, static_cast<uint8_t>(stack_offset)}); // mov rax, [rsp+offset8]
-                } else {
-                    return emitBytes({0x48, 0x8B, 0x84, 0x24}) + emitU32(static_cast<uint32_t>(stack_offset)); // mov rax, [rsp+offset32]
-                }
+    // R15-based parameter and variable access (new calling convention)
+    // All parameters and variables are now stored in R15 at their VariableInfo->offset
+    
+    // Load from R15+offset into RAX
+    size_t emitMovRAXFromR15Offset(int32_t offset) {
+        if (offset == 0) {
+            return emitBytes({0x49, 0x8B, 0x07}); // mov rax, [r15]
+        } else if (offset >= -128 && offset <= 127) {
+            return emitBytes({0x49, 0x8B, 0x47, static_cast<uint8_t>(offset)}); // mov rax, [r15+offset8]
+        } else {
+            return emitBytes({0x49, 0x8B, 0x87}) + emitU32(static_cast<uint32_t>(offset)); // mov rax, [r15+offset32]
         }
     }
     
-    // Move RAX to System V ABI parameter register by index
-    // Parameter registers: RDI, RSI, RDX, RCX, R8, R9 (0-5)
-    size_t emitMovParamFromRAX(int param_index) {
-        switch (param_index) {
-            case 0: return emitMovRDIRAX(); // mov rdi, rax
-            case 1: return emitMovRSIRAX(); // mov rsi, rax
-            case 2: return emitMovRDXRAX(); // mov rdx, rax
-            case 3: return emitMovRCXRAX(); // mov rcx, rax
-            case 4: return emitMovR8RAX();  // mov r8, rax
-            case 5: return emitMovR9RAX();  // mov r9, rax
-            default:
-                // Push RAX to stack for parameters beyond 6
-                // For now, we'll return 0 - stack parameters will be implemented later
-                return 0;
+    // Store RAX to R15+offset
+    size_t emitMovR15OffsetFromRAX(int32_t offset) {
+        if (offset == 0) {
+            return emitBytes({0x49, 0x89, 0x07}); // mov [r15], rax
+        } else if (offset >= -128 && offset <= 127) {
+            return emitBytes({0x49, 0x89, 0x47, static_cast<uint8_t>(offset)}); // mov [r15+offset8], rax
+        } else {
+            return emitBytes({0x49, 0x89, 0x87}) + emitU32(static_cast<uint32_t>(offset)); // mov [r15+offset32], rax
         }
+    }
+    
+    // Load from [rax + offset] into RAX (useful for closure access)
+    size_t emitMovRAXFromRAXPlusOffset(uint32_t offset) {
+        return emitBytes({0x48, 0x8B, 0x80}) + emitU32(offset); // mov rax, [rax + imm32]
+    }
+    
+    // Load from [rcx + offset] into RAX (useful for closure access)
+    size_t emitMovRAXFromRCXPlusOffset(uint32_t offset) {
+        return emitBytes({0x48, 0x8B, 0x81}) + emitU32(offset); // mov rax, [rcx + imm32]
     }
     
     // --- Flexible register helpers ---
@@ -178,29 +180,14 @@ public:
         return total_length;
     }
     
-    // Generate MOV instruction from parameter register to target register
-    size_t emitMovRegFromParam(int target_reg, int param_index) {
-        // Parameter registers: RDI(7), RSI(6), RDX(2), RCX(1), R8(8), R9(9)
-        int param_regs[] = {7, 6, 2, 1, 8, 9}; // RDI, RSI, RDX, RCX, R8, R9
-        
-        if (param_index < 6) {
-            int src_reg = param_regs[param_index];
-            return emitMovRegFromReg(target_reg, src_reg);
-        } else {
-            // Parameter on stack
-            int stack_offset = 8 + (param_index - 6) * 8;
-            return emitMovRegFromMemory(target_reg, 4, stack_offset); // RSP = 4
-        }
-    }
-    
     // Generate MOV instruction from source register to target register
     size_t emitMovRegFromReg(int target_reg, int src_reg) {
         size_t total_length = 0;
         
         // Determine REX prefix
         uint8_t rex = 0x48; // 64-bit operand size
-        if (target_reg >= 8) rex |= 0x04; // REX.R
-        if (src_reg >= 8) rex |= 0x01;    // REX.B
+        if (src_reg >= 8) rex |= 0x04;    // REX.R (extends reg field = source)
+        if (target_reg >= 8) rex |= 0x01; // REX.B (extends r/m field = destination)
         
         total_length += emitBytes({rex});
         
@@ -219,4 +206,58 @@ public:
 
     // Append raw data (e.g. string literal)
     size_t emitData(const std::string& s) { buffer.insert(buffer.end(), s.begin(), s.end()); return s.size(); }
+    
+    // --- Higher-level closure and parameter helpers ---
+    
+    // Get parent scope address from stack (peek at saved R15) into RAX
+    size_t emitLoadParentScopeFromStack() {
+        return emitBytes({0x48, 0x8B, 0x04, 0x24}); // mov rax, [rsp] (peek at saved R15)
+    }
+    
+    // Load parameter by index from current scope (R15 + index*8) into RAX
+    size_t emitLoadParameterByIndex(int param_index) {
+        int offset = param_index * 8;
+        return emitMovRAXFromR15Offset(offset);
+    }
+    
+    // Load closure address: base_address + variable_offset + scope_offset_in_closure
+    // Assumes base address is already in RAX, adds the offsets
+    size_t emitAddClosureOffsets(int variable_offset, int scope_offset_in_closure) {
+        int total_offset = variable_offset + scope_offset_in_closure;
+        return emitBytes({0x48, 0x05}) + emitU32(static_cast<uint32_t>(total_offset)); // add rax, imm32
+    }
+    
+    // Complete helper: Load closure address for a variable access into RAX
+    // This combines all the logic for getting closure addresses
+    size_t emitLoadClosureAddress(bool is_in_current_scope, int variable_offset, int scope_offset_in_closure, int hidden_param_index = 0) {
+        size_t total_length = 0;
+        
+        if (is_in_current_scope) {
+            // Closure is in current scope (parent R15)
+            total_length += emitLoadParentScopeFromStack();
+            total_length += emitAddClosureOffsets(variable_offset, scope_offset_in_closure);
+        } else {
+            // Closure is in parent scope - need to navigate through parameter chain
+            total_length += emitLoadParentScopeFromStack();
+            // Load the parent scope from hidden parameter
+            int hidden_param_offset = 8 * hidden_param_index;
+            total_length += emitBytes({0x48, 0x8B, 0x40, static_cast<uint8_t>(hidden_param_offset)}); // mov rax, [rax + param_offset]
+            total_length += emitAddClosureOffsets(variable_offset, scope_offset_in_closure);
+        }
+        
+        return total_length;
+    }
+    
+    // Load scope address based on parameter mapping
+    // param_index = -1 means current scope (R15), otherwise load from hidden parameter
+    size_t emitLoadScopeByParameterIndex(int param_index, int regular_param_count = 0) {
+        if (param_index == -1) {
+            // Current scope - mov rax, r15
+            return emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+        } else {
+            // Load from hidden parameter at R15 + offset
+            int hidden_param_offset = 8 * (regular_param_count + param_index);
+            return emitMovRegFromMemory(0, 15, hidden_param_offset); // mov rax, [r15 + offset]
+        }
+    }
 };
