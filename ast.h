@@ -19,7 +19,16 @@ enum class DataType { INT32, INT64, CLOSURE };
 class FunctionDeclNode;
 class LexicalScopeNode;
 
-
+// New structure for unified parameter information
+struct ParameterInfo {
+    int depth;                    // Scope depth  
+    int offset;                   // Byte offset in parameter area
+    LexicalScopeNode* scope;      // Pointer to the actual scope
+    bool isHiddenParam;           // true for lexical scopes, false for regular params
+    
+    ParameterInfo(int d = 0, int o = 0, LexicalScopeNode* s = nullptr, bool hidden = false)
+        : depth(d), offset(o), scope(s), isHiddenParam(hidden) {}
+};
 
 struct VariableInfo {
     DataType type;
@@ -85,7 +94,7 @@ public:
         return activeScope->scopeDepthToParentParameterIndexMap.at(this->depth);
     }
 
-    int getParameterOffset(int index);
+    int getParameterOffset(int index); // Declaration only, implementation after FunctionDeclNode
     
     void pack();
 
@@ -108,11 +117,21 @@ public:
     std::vector<std::string> params;
     uint64_t functionAddress = 0;  // Set during codegen, used for patching closures
     
+    // NEW: Unified parameter information - single source of truth for all parameter layout
+    std::vector<VariableInfo> paramsInfo;        // Regular parameters with calculated offsets
+    std::vector<ParameterInfo> hiddenParamsInfo; // Hidden scope parameters with calculated offsets
+    
     FunctionDeclNode(const std::string& name, LexicalScopeNode* p = nullptr) 
         : LexicalScopeNode(p), funcName(name) {
         type = NodeType::FUNCTION_DECL;
         value = name;
     }
+    
+    // Helper methods for accessing unified parameter information
+    int getParameterOffset(int index) const;
+    ParameterInfo* findHiddenParam(int depth);
+    const ParameterInfo* findHiddenParam(int depth) const;
+    int getTotalRegularParamsSize() const;
 };
 
 class IdentifierNode : public ASTNode {
@@ -180,7 +199,7 @@ inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
     
     // Get the current function's parameter count
     FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
-    int currentParamCount = currentFunc->params.size();
+    int currentParamCount = currentFunc->paramsInfo.size(); // Use unified parameter info
     
     // Build map based on what this scope needs and what parent provides
     for (int i = 0; i < (int)allNeeded.size(); i++) {
@@ -203,6 +222,10 @@ inline void LexicalScopeNode::pack() {
     // For function scopes, separate parameters from regular variables
     if (this->type == NodeType::FUNCTION_DECL) {
         FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(this);
+        
+        // Clear the unified parameter info arrays
+        funcDecl->paramsInfo.clear();
+        funcDecl->hiddenParamsInfo.clear();
         
         // Separate parameters from regular variables
         for (auto& [name, var] : variables) {
@@ -234,19 +257,33 @@ inline void LexicalScopeNode::pack() {
     
     // For function scopes, first allocate space for parameters
     if (this->type == NodeType::FUNCTION_DECL) {
-        // 1. Pack regular parameters first (using their actual sizes)
+        FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(this);
+        
+        // 1. Pack regular parameters first and populate paramsInfo
         for (auto& [name, var] : params) {
             int size = var->size;
             int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
             offset = (offset + align - 1) & ~(align - 1); // Align
             var->offset = offset;
+            
+            // Store in paramsInfo for unified access
+            funcDecl->paramsInfo.push_back(*var);
+            
             offset += size; // Use actual parameter size
         }
         
-        // 2. Space for hidden lexical scope parameters (8 bytes each)
+        // 2. Pack hidden lexical scope parameters and populate hiddenParamsInfo
         for (int neededDepth : allNeeded) {
             if (neededDepth != this->depth) { // Don't count current scope
                 offset = (offset + 7) & ~7; // 8-byte align
+                
+                // Find the corresponding scope for this depth
+                LexicalScopeNode* correspondingScope = nullptr;
+                // We'll need to find this scope - for now we'll store null and fix in analysis
+                
+                ParameterInfo hiddenParam(neededDepth, offset, correspondingScope, true);
+                funcDecl->hiddenParamsInfo.push_back(hiddenParam);
+                
                 offset += 8; // Each scope pointer takes 8 bytes
             }
         }
@@ -263,4 +300,62 @@ inline void LexicalScopeNode::pack() {
     
     // Ensure total size is 8-byte aligned
     totalSize = (offset + 7) & ~7;
+}
+
+// Implementation of FunctionDeclNode helper methods
+inline int FunctionDeclNode::getParameterOffset(int index) const {
+    if (index < 0) {
+        throw std::runtime_error("Invalid parameter index: " + std::to_string(index));
+    }
+    
+    if (index < (int)paramsInfo.size()) {
+        // Regular parameter - use pre-calculated offset from paramsInfo
+        return paramsInfo[index].offset;
+    } else {
+        // Hidden parameter - use pre-calculated offset from hiddenParamsInfo
+        int hiddenIndex = index - (int)paramsInfo.size();
+        if (hiddenIndex < (int)hiddenParamsInfo.size()) {
+            return hiddenParamsInfo[hiddenIndex].offset;
+        } else {
+            throw std::runtime_error("Parameter index out of range: " + std::to_string(index));
+        }
+    }
+}
+
+inline ParameterInfo* FunctionDeclNode::findHiddenParam(int depth) {
+    for (auto& param : hiddenParamsInfo) {
+        if (param.depth == depth) {
+            return &param;
+        }
+    }
+    return nullptr;
+}
+
+inline const ParameterInfo* FunctionDeclNode::findHiddenParam(int depth) const {
+    for (const auto& param : hiddenParamsInfo) {
+        if (param.depth == depth) {
+            return &param;
+        }
+    }
+    return nullptr;
+}
+
+inline int FunctionDeclNode::getTotalRegularParamsSize() const {
+    if (paramsInfo.empty()) {
+        return 0;
+    }
+    
+    // Return the end offset of the last parameter
+    const auto& lastParam = paramsInfo.back();
+    return lastParam.offset + lastParam.size;
+}
+
+// Implementation of LexicalScopeNode::getParameterOffset after FunctionDeclNode is defined
+inline int LexicalScopeNode::getParameterOffset(int index) {
+    // Delegate to FunctionDeclNode's unified parameter offset calculation
+    if (this->type == NodeType::FUNCTION_DECL) {
+        return static_cast<FunctionDeclNode*>(this)->getParameterOffset(index);
+    } else {
+        throw std::runtime_error("getParameterOffset called on non-function scope");
+    }
 }

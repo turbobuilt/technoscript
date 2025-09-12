@@ -99,6 +99,9 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
         case NodeType::FUNCTION_DECL: {
             FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(node);
             
+            printf("DEBUG: === STARTING code generation for function '%s' at depth=%d ===\n", 
+                   funcDecl->funcName.c_str(), funcDecl->depth);
+            
             // Set the function address to current position in buffer
             funcDecl->functionAddress = emitter.buffer.size();
             
@@ -111,6 +114,9 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             for (auto& child : funcDecl->ASTNode::children) {
                 total_length += generateNode(child.get(), funcDecl);
             }
+            
+            printf("DEBUG: === FINISHED code generation for function '%s' at depth=%d ===\n", 
+                   funcDecl->funcName.c_str(), funcDecl->depth);
             
             // Simplified epilogue - caller handles R15 restoration
             total_length += emitter.emitBytes({0x48, 0x89, 0xEC}); // mov rsp, rbp
@@ -286,14 +292,20 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
     for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
         printf("DEBUG: Processing allNeeded[%zu]\n", i);
         // Load scope pointer from closure structure at offset 8 + (i * 8)
+        // The closure structure starts at variable_offset within the scope, 
+        // and scope addresses are stored at offsets 8, 16, 24, etc. within the closure
         size_t scope_offset_in_closure = 8 + (i * 8);
         auto total_offset = scope_offset_in_closure + variable_offset;
         
         // Load the scope pointer from [rcx + total_offset] into RAX
+        printf("DEBUG: Loading scope address from [rcx + %zu] where rcx is scope base, variable_offset=%zu, scope_offset_in_closure=%zu\n", 
+               total_offset, variable_offset, scope_offset_in_closure);
         total_length += emitter.emitMovRAXFromRCXPlusOffset(static_cast<uint32_t>(total_offset));
         
         // Store in new scope at hidden parameter offset
         int hidden_param_offset = hidden_param_start_offset + (i * 8);
+        printf("DEBUG generateClosureCall: storing scope at hidden_param_offset=%d (start=%d + i=%zu * 8)\n", 
+               hidden_param_offset, hidden_param_start_offset, i);
         total_length += emitter.emitMovQwordPtrR14PlusOffsetRAX(static_cast<uint32_t>(hidden_param_offset));
     }
     
@@ -302,9 +314,9 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
     total_length += emitter.emitBytes({0x4D, 0x89, 0xF7}); // mov r15, r14
     
     // 6. Load function address from closure (now in RCX) and call
-    // Function address is at closure base (offset 0)
-    // RCX contains closure address from loadVariableDefiningScopeAddressIntoRegister call
-    total_length += emitter.emitBytes({0x48, 0x8B, 0x01}); // mov rax, [rcx]
+    // Function address is at closure base + variable_offset (where the closure is stored)
+    // RCX contains scope address from loadVariableDefiningScopeAddressIntoRegister call
+    total_length += emitter.emitMovRAXFromRCXPlusOffset(static_cast<uint32_t>(variable_offset)); // mov rax, [rcx + variable_offset]
     
     // Call the function
     total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
@@ -370,18 +382,57 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                 if (it != funcNode->scopeDepthToParentParameterIndexMap.end()) {
                     int absoluteParamIndex = it->second;
                     
-                    // Load scope address using absolute parameter index directly
-                    // Convert absolute parameter index to byte offset
-                    printf("DEBUG: Creating closure - loading scope for depth %d from absolute param %d (offset %d)\n", neededDepth, absoluteParamIndex);
+                    // Load scope address using proper parameter offset calculation
+                    printf("DEBUG: Creating closure - loading scope for depth %d from absolute param %d\n", neededDepth, absoluteParamIndex);
                     
                     if (absoluteParamIndex == -1) {
                         // Special case: current scope (R15)
                         total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
                     } else {
-                        // Load from parameter at absolute offset
-                        int param_offset = 8 * absoluteParamIndex;
-                        printf("PARAM OFFSET: %d\n", param_offset);
-                        total_length += emitter.emitMovRAXFromR15Offset(param_offset);
+                        // During closure creation, we need to get the scope from the current context
+                        // The parameter mapping tells us where the target function will expect the scope,
+                        // but we need to get it from where it currently is
+                        
+                        if (neededDepth == scope->depth) {
+                            // If the needed scope is the current scope, use R15
+                            printf("DEBUG: Storing current scope (R15) for depth %d\n", neededDepth);
+                            total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+                        } else {
+                            // For parent scopes, we need to load from the current function's parameters
+                            // Find the current function scope
+                            LexicalScopeNode* currentFunc = scope;
+                            while (currentFunc && currentFunc->type != NodeType::FUNCTION_DECL) {
+                                currentFunc = currentFunc->parentFunctionScope;
+                            }
+                            
+                            if (currentFunc && currentFunc->type == NodeType::FUNCTION_DECL) {
+                                // Get the parameter index for this scope in the current function's context
+                                auto it = currentFunc->scopeDepthToParentParameterIndexMap.find(neededDepth);
+                                if (it != currentFunc->scopeDepthToParentParameterIndexMap.end()) {
+                                    int currentFuncParamIndex = it->second;
+                                    if (currentFuncParamIndex == -1) {
+                                        printf("DEBUG: Storing current scope (R15) for depth %d via param index -1\n", neededDepth);
+                                        total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+                                    } else {
+                                        int param_offset = currentFunc->getParameterOffset(currentFuncParamIndex);
+                                        printf("DEBUG: Loading scope for depth %d from param offset %d\n", neededDepth, param_offset);
+                                        total_length += emitter.emitMovRAXFromR15Offset(param_offset);
+                                    }
+                                } else {
+                                    // This should not happen - throw an error instead of using fallback
+                                    throw std::runtime_error("Closure creation error: scope depth " + 
+                                                           std::to_string(neededDepth) + " not found in current function's parameter map");
+                                }
+                            } else {
+                                // BUG FIX: This should be an error, not a fallback to R15
+                                // If we reach here, it means we're trying to access a scope that's not available
+                                // in the current context, which indicates a bug in scope dependency analysis
+                                throw std::runtime_error("Closure creation error: cannot access scope at depth " + 
+                                                       std::to_string(neededDepth) + " from global scope. " +
+                                                       "This indicates a bug in scope dependency analysis for function '" + 
+                                                       funcNode->funcName + "'");
+                            }
+                        }
                     }
                 } else {
                     // Scope not found in parameter map - this is an error
@@ -566,9 +617,25 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register ta
     auto access = identifier->getVariableAccess();
     int reg_num = static_cast<int>(target_reg);
     
-    // Debug output
-    printf("DEBUG loadVariableIntoRegister: var='%s' paramIndex=%d paramOffset=%d offset=%d\n", 
-           identifier->value.c_str(), access.parameterIndex, access.parameterOffset, access.offset);
+    // Debug output with call stack info
+    printf("DEBUG loadVariableIntoRegister: var='%s' paramIndex=%d\n", 
+           identifier->value.c_str(), access.parameterIndex);
+    
+    // Additional debug for parameter index calculation
+    if (identifier->varRef && identifier->varRef->definedIn && identifier->accessedIn) {
+        LexicalScopeNode* definingScope = identifier->varRef->definedIn;
+        LexicalScopeNode* accessingScope = identifier->accessedIn;
+        printf("DEBUG: node=%p, definingScope=%p (depth=%d), accessingScope=%p (depth=%d)\n", 
+               identifier, definingScope, definingScope->depth, accessingScope, accessingScope->depth);
+        if (definingScope != accessingScope) {
+            printf("DEBUG: Should use parent scope access - checking parameter index map\n");
+            auto& paramMap = accessingScope->scopeDepthToParentParameterIndexMap;
+            printf("DEBUG: Parameter map size: %zu\n", paramMap.size());
+            for (auto& pair : paramMap) {
+                printf("DEBUG: depth %d -> param index %d\n", pair.first, pair.second);
+            }
+        }
+    }
     if (identifier->varRef && identifier->varRef->definedIn) {
         printf("DEBUG: var defined in scope depth=%d\n", identifier->varRef->definedIn->depth);
     }
@@ -591,7 +658,9 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register ta
         
         // Load the parent scope address from parameter, then load the variable
         // Use general method for all registers (simplified and consistent)
+        printf("DEBUG: About to load scope address from R15+%d\n", access.parameterOffset);
         total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.parameterOffset);
+        printf("DEBUG: About to load variable from scope+%d\n", access.offset);
         total_length += emitter.emitMovRegFromMemory(reg_num, reg_num, access.offset);
     }
     

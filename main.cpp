@@ -38,14 +38,6 @@ function outer(param_x) {
 outer(global_a)
     )";
 
-    std::string code_simple = R"(
-var x: int64 = 10;
-print(x)
-function test(a) {
- print(a)
-}
-test(x)
-)";
     
     Parser parser;
     Analyzer analyzer;
@@ -53,7 +45,7 @@ test(x)
     
     
     std::cout << "=== Testing complex nested closures with multiple scope levels ===\n";
-    auto ast5 = parser.parse(code_simple);
+    auto ast5 = parser.parse(code);
     analyzer.analyze(ast5.get());
     printAST(ast5.get());
     
