@@ -2,6 +2,7 @@
 #include "ast.h"
 #include "emitter.h"
 #include "library.h"
+#include "debugger.h"
 #include <unordered_map>
 #include <sys/mman.h>
 #include <capstone/capstone.h>
@@ -88,6 +89,7 @@ private:
 public:
     void generateProgram(ASTNode& root);
     void writeProgramToExecutable();
+    void runWithUnicornDebugger();
     
     // Get the raw machine code
     const std::vector<uint8_t>& getCode() const { return emitter.buffer; }

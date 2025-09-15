@@ -97,9 +97,9 @@ outer(global_a)
     codeGen.generateProgram(*ast);
     std::cout << "DEBUG: Code generation completed successfully" << std::endl;
     
-    std::cout << "DEBUG: Writing program to executable..." << std::endl;
-    codeGen.writeProgramToExecutable();
-    std::cout << "DEBUG: Program written successfully" << std::endl;
+    std::cout << "DEBUG: Starting Unicorn Engine debugging..." << std::endl;
+    codeGen.runWithUnicornDebugger();
+    std::cout << "DEBUG: Unicorn debugging completed" << std::endl;
     
     return 0;
 }

@@ -990,3 +990,77 @@ void Codegen::disassembleCode(const std::vector<uint8_t>& code, uint64_t base_ad
     cs_close(&handle);
     printf("\n===========================\n\n");
 }
+
+void Codegen::runWithUnicornDebugger() {
+    std::cout << "UNICORN: Starting Unicorn Engine debugging session" << std::endl;
+    
+    UnicornDebugger debugger;
+    if (!debugger.initialize()) {
+        std::cerr << "Failed to initialize Unicorn debugger: " << debugger.getLastError() << std::endl;
+        return;
+    }
+    
+    // Allocate memory regions
+    uint64_t code_base = 0x400000;  // Code at 4MB
+    uint64_t heap_base = 0x800000;  // Heap at 8MB  
+    uint64_t heap_size = 0x100000;  // 1MB heap
+    uint64_t stack_base = 0x700000; // Stack at 7MB
+    uint64_t stack_size = 0x10000;  // 64KB stack
+    
+    // Set up memory layout
+    if (!debugger.setupMemory(heap_base, heap_size, stack_base, stack_size)) {
+        std::cerr << "Failed to setup memory: " << debugger.getLastError() << std::endl;
+        return;
+    }
+    
+    // Patch function addresses for Unicorn execution
+    for (const auto& patch : function_patches) {
+        uint64_t addr_to_patch;
+        
+        if (patch.is_string_patch) {
+            // For string patches, calculate absolute address
+            addr_to_patch = code_base + patch.string_offset;
+        } else {
+            // For function patches, calculate absolute address
+            if (patch.func == nullptr) {
+                throw std::runtime_error("ERROR: Function patch has null function pointer at offset " + std::to_string(patch.offset_in_buffer));
+            }
+            addr_to_patch = code_base + patch.func->functionAddress;
+        }
+        
+        // Write the address into the buffer at the exact offset
+        for (int i = 0; i < 8; i++) {
+            emitter.buffer[patch.offset_in_buffer + i] = static_cast<uint8_t>((addr_to_patch >> (i * 8)) & 0xFF);
+        }
+    }
+    
+    // Load code into emulator
+    if (!debugger.loadCode(emitter.buffer.data(), emitter.buffer.size(), code_base)) {
+        std::cerr << "Failed to load code: " << debugger.getLastError() << std::endl;
+        return;
+    }
+    
+    // Register external function handlers
+    uint64_t print_int64_addr = reinterpret_cast<uint64_t>(print_int64);
+    debugger.registerExternalFunction(print_int64_addr, "print_int64");
+    
+    // Disassemble the code for reference
+    disassembleCode(emitter.buffer, code_base);
+    
+    // Run the program
+    std::cout << "UNICORN: Starting execution..." << std::endl;
+    if (!debugger.run(code_base)) {
+        std::cerr << "UNICORN: Execution failed: " << debugger.getLastError() << std::endl;
+        
+        // Show where we failed
+        uint64_t pc = debugger.getRegister(UC_X86_REG_RIP);
+        std::cout << "UNICORN: Program counter at failure: 0x" << std::hex << pc << std::dec << std::endl;
+        
+        // Dump memory around the problematic address if it's a memory access issue
+        debugger.dumpMemory(pc - 16, 32);
+        
+        return;
+    }
+    
+    std::cout << "UNICORN: Execution completed successfully!" << std::endl;
+}
