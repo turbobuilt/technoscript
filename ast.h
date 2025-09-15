@@ -55,7 +55,6 @@ public:
 class LexicalScopeNode : public ASTNode {
 public:
     std::map<std::string, VariableInfo> variables;
-    std::vector<LexicalScopeNode*> children;
     LexicalScopeNode* parentFunctionScope;
     int depth;
     
@@ -69,7 +68,7 @@ public:
     std::map<int, int> scopeDepthToParentParameterIndexMap;
     
     LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(NodeType::LEXICAL_SCOPE), parentFunctionScope(p), depth(d) {
-        if (parentFunctionScope) parentFunctionScope->children.push_back(this);
+        // Parent pointers are set later by setupParentPointers() in analyzer
     }
     
     void updateAllNeeded() {
@@ -201,16 +200,31 @@ inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
     FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
     int currentParamCount = currentFunc->paramsInfo.size(); // Use unified parameter info
     
-    // Build map based on what this scope needs and what parent provides
-    for (int i = 0; i < (int)allNeeded.size(); i++) {
-        int neededDepth = allNeeded[i];
+    printf("DEBUG buildScopeDepthToParentParameterIndexMap: Function '%s' has %d regular params, needs %zu scopes\n", 
+           currentFunc->funcName.c_str(), currentParamCount, allNeeded.size());
+    
+    // Build map based on what this scope needs
+    // CRITICAL FIX: We need to filter out the current scope from allNeeded when assigning parameter indices
+    int hiddenParamIndex = 0; // Counter for hidden parameters (excludes current scope)
+    
+    for (int neededDepth : allNeeded) {
         if (neededDepth == this->depth) {
             // This is the current scope - access via R15
+            printf("DEBUG buildScopeDepthToParentParameterIndexMap: depth %d (current) -> param index -1\n", neededDepth);
             scopeDepthToParentParameterIndexMap[neededDepth] = -1;
         } else {
             // Scope parameters start after regular parameters
-            scopeDepthToParentParameterIndexMap[neededDepth] = currentParamCount + i;
+            int paramIndex = currentParamCount + hiddenParamIndex;
+            printf("DEBUG buildScopeDepthToParentParameterIndexMap: depth %d -> param index %d (regular params=%d + hidden offset=%d)\n", 
+                   neededDepth, paramIndex, currentParamCount, hiddenParamIndex);
+            scopeDepthToParentParameterIndexMap[neededDepth] = paramIndex;
+            hiddenParamIndex++; // Only increment for actual hidden parameters
         }
+    }
+    
+    printf("DEBUG buildScopeDepthToParentParameterIndexMap: Final map for function '%s':\n", currentFunc->funcName.c_str());
+    for (const auto& [depth, paramIdx] : scopeDepthToParentParameterIndexMap) {
+        printf("DEBUG:   depth %d -> param index %d\n", depth, paramIdx);
     }
 }
 
@@ -265,6 +279,7 @@ inline void LexicalScopeNode::pack() {
             int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
             offset = (offset + align - 1) & ~(align - 1); // Align
             var->offset = offset;
+            printf("DEBUG pack: Parameter '%s' assigned offset %d (size=%d)\n", name.c_str(), offset, size);
             
             // Store in paramsInfo for unified access
             funcDecl->paramsInfo.push_back(*var);
@@ -274,8 +289,9 @@ inline void LexicalScopeNode::pack() {
         
         // 2. Pack hidden lexical scope parameters and populate hiddenParamsInfo
         for (int neededDepth : allNeeded) {
-            if (neededDepth != this->depth) { // Don't count current scope
+            if (neededDepth != this->depth) { // Don't count current scope as hidden parameter
                 offset = (offset + 7) & ~7; // 8-byte align
+                printf("DEBUG pack: Hidden parameter for depth %d assigned offset %d\n", neededDepth, offset);
                 
                 // Find the corresponding scope for this depth
                 LexicalScopeNode* correspondingScope = nullptr;
@@ -295,6 +311,7 @@ inline void LexicalScopeNode::pack() {
         int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
         offset = (offset + align - 1) & ~(align - 1); // Align
         var->offset = offset;
+        printf("DEBUG pack: Variable '%s' assigned offset %d (size=%d)\n", name.c_str(), offset, size);
         offset += size;
     }
     

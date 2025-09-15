@@ -104,13 +104,169 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             
             // Set the function address to current position in buffer
             funcDecl->functionAddress = emitter.buffer.size();
+            printf("DEBUG: Function '%s' assigned address offset 0x%lx\n", funcDecl->funcName.c_str(), funcDecl->functionAddress);
             
-            // Simplified prologue - caller already set up R15 with parameters
+            printf("DEBUG: === STARTING function prologue for '%s' ===\n", funcDecl->funcName.c_str());
+            printf("DEBUG: Function has %zu regular params and %zu hidden params\n", 
+                   funcDecl->params.size(), funcDecl->hiddenParamsInfo.size());
+            
+            // NEW STANDARD ABI CALLING CONVENTION PROLOGUE:
+            // 1. Standard function prologue
             total_length += emitter.emitBytes({0x55}); // push rbp
             total_length += emitter.emitBytes({0x48, 0x89, 0xE5}); // mov rbp, rsp
             
-            // Generate function body (children of this node)
-            // Parameters are already in R15+offset, no need to copy from registers
+            // 2. First, save all parameter registers to the stack before we allocate scope
+            // This prevents them from being corrupted during heap allocation
+            printf("DEBUG: Saving parameter registers before heap allocation\n");
+            total_length += emitter.emitBytes({0x57}); // push rdi
+            total_length += emitter.emitBytes({0x56}); // push rsi  
+            total_length += emitter.emitBytes({0x52}); // push rdx
+            total_length += emitter.emitBytes({0x51}); // push rcx
+            total_length += emitter.emitBytes({0x41, 0x50}); // push r8
+            total_length += emitter.emitBytes({0x41, 0x51}); // push r9
+            
+            // 3. Allocate lexical scope for this function (now safe to use registers)
+            printf("DEBUG: Allocating heap memory for function scope (size=%d)\n", funcDecl->totalSize);
+            total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
+            total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
+            total_length += emitter.emitSyscall();
+            
+            // Save current brk in RBX (non-parameter register)
+            total_length += emitter.emitBytes({0x48, 0x89, 0xC3}); // mov rbx, rax
+            
+            // Set new brk to current + scope size
+            total_length += emitter.emitMovRAXImm64(12);       // sys_brk
+            total_length += emitter.emitBytes({0x48, 0x89, 0xDA}); // mov rdx, rbx  
+            total_length += emitter.emitBytes({0x48, 0x81, 0xC2}); // add rdx, imm32
+            total_length += emitter.emitU32(static_cast<uint32_t>(funcDecl->totalSize));
+            total_length += emitter.emitBytes({0x48, 0x89, 0xD7}); // mov rdi, rdx
+            total_length += emitter.emitSyscall();
+            
+            // Set R15 to allocated scope (old brk value in RBX)
+            total_length += emitter.emitBytes({0x49, 0x89, 0xDF}); // mov r15, rbx
+            
+            // 4. Now restore parameter registers from stack and copy to lexical scope
+            // Restore in reverse order
+            total_length += emitter.emitBytes({0x41, 0x59}); // pop r9
+            total_length += emitter.emitBytes({0x41, 0x58}); // pop r8
+            total_length += emitter.emitBytes({0x59}); // pop rcx
+            total_length += emitter.emitBytes({0x5A}); // pop rdx
+            total_length += emitter.emitBytes({0x5E}); // pop rsi
+            total_length += emitter.emitBytes({0x5F}); // pop rdi
+            
+            // 3. Copy parameters from standard calling convention to lexical scope
+            // Standard x86-64 calling convention registers: RDI, RSI, RDX, RCX, R8, R9
+            
+            size_t total_params = funcDecl->params.size() + funcDecl->hiddenParamsInfo.size();
+            
+            // Copy regular parameters first
+            for (size_t i = 0; i < funcDecl->params.size(); i++) {
+                const std::string& paramName = funcDecl->params[i];
+                auto paramIt = funcDecl->variables.find(paramName);
+                if (paramIt == funcDecl->variables.end()) {
+                    throw std::runtime_error("Parameter not found in function variables: " + paramName);
+                }
+                int paramOffset = paramIt->second.offset;
+                
+                printf("DEBUG: Copying parameter %zu ('%s') to offset %d\n", i, paramName.c_str(), paramOffset);
+                
+                if (i < 6) { // First 6 parameters come in registers
+                    // Copy parameter from register to R15+offset
+                    switch(i) {
+                        case 0: // RDI
+                            printf("DEBUG: Copying from RDI to R15+%d\n", paramOffset);
+                            total_length += emitter.emitBytes({0x49, 0x89, 0xBF}); // mov [r15 + disp32], rdi
+                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            break;
+                        case 1: // RSI  
+                            printf("DEBUG: Copying from RSI to R15+%d\n", paramOffset);
+                            total_length += emitter.emitBytes({0x49, 0x89, 0xB7}); // mov [r15 + disp32], rsi
+                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            break;
+                        case 2: // RDX
+                            total_length += emitter.emitBytes({0x49, 0x89, 0x97}); // mov [r15 + disp32], rdx
+                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            break;
+                        case 3: // RCX
+                            total_length += emitter.emitBytes({0x49, 0x89, 0x8F}); // mov [r15 + disp32], rcx
+                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            break;
+                        case 4: // R8
+                            total_length += emitter.emitBytes({0x4D, 0x89, 0x87}); // mov [r15 + disp32], r8
+                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            break;
+                        case 5: // R9
+                            total_length += emitter.emitBytes({0x4D, 0x89, 0x8F}); // mov [r15 + disp32], r9
+                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            break;
+                    }
+                } else {
+                    // Parameter came on stack - load from stack and store to lexical scope
+                    size_t stack_offset = 16 + ((i - 6) * 8); // Skip saved rbp + return addr
+                    // mov rax, [rbp + stack_offset]
+                    total_length += emitter.emitBytes({0x48, 0x8B, 0x85}); // mov rax, [rbp + offset]
+                    total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
+                    // mov [r15 + paramOffset], rax
+                    total_length += emitter.emitBytes({0x49, 0x89, 0x87}); // mov [r15 + offset], rax
+                    total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                }
+            }
+            
+            // Copy hidden scope parameters
+            for (size_t i = 0; i < funcDecl->hiddenParamsInfo.size(); i++) {
+                size_t param_index = funcDecl->params.size() + i;
+                int scopeOffset = funcDecl->hiddenParamsInfo[i].offset;
+                
+                printf("DEBUG: Copying hidden parameter %zu (total param index %zu) to offset %d\n", 
+                       i, param_index, scopeOffset);
+                
+                if (param_index < 6) { // First 6 total parameters come in registers
+                    // Scope address came in register - copy to lexical scope
+                    switch(param_index) {
+                        case 0: // RDI
+                            printf("DEBUG: Copying scope from RDI to R15+%d\n", scopeOffset);
+                            total_length += emitter.emitBytes({0x49, 0x89, 0xBF}); // mov [r15 + disp32], rdi
+                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            break;
+                        case 1: // RSI  
+                            total_length += emitter.emitBytes({0x49, 0x89, 0xB7}); // mov [r15 + disp32], rsi
+                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            break;
+                        case 2: // RDX
+                            total_length += emitter.emitBytes({0x49, 0x89, 0x97}); // mov [r15 + disp32], rdx
+                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            break;
+                        case 3: // RCX
+                            total_length += emitter.emitBytes({0x49, 0x89, 0x8F}); // mov [r15 + disp32], rcx
+                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            break;
+                        case 4: // R8
+                            total_length += emitter.emitBytes({0x4D, 0x89, 0x87}); // mov [r15 + disp32], r8
+                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            break;
+                        case 5: // R9
+                            total_length += emitter.emitBytes({0x4D, 0x89, 0x8F}); // mov [r15 + disp32], r9
+                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            break;
+                    }
+                } else {
+                    // Scope address came on stack
+                    size_t stack_offset = 16 + ((param_index - 6) * 8);
+                    // mov rax, [rbp + stack_offset]
+                    total_length += emitter.emitBytes({0x48, 0x8B, 0x85}); // mov rax, [rbp + offset]
+                    total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
+                    // mov [r15 + scopeOffset], rax
+                    total_length += emitter.emitBytes({0x49, 0x89, 0x87}); // mov [r15 + offset], rax
+                    total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                }
+            }
+            
+            // 4. Create closures for functions defined in this scope (hoisting)
+            printf("DEBUG: Creating closures for function '%s' scope\n", funcDecl->funcName.c_str());
+            total_length += createClosures(funcDecl);
+            
+            // 5. Generate function body (children of this node)
+            // Parameters are now in R15+offset lexical scope
             for (auto& child : funcDecl->ASTNode::children) {
                 total_length += generateNode(child.get(), funcDecl);
             }
@@ -118,7 +274,7 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             printf("DEBUG: === FINISHED code generation for function '%s' at depth=%d ===\n", 
                    funcDecl->funcName.c_str(), funcDecl->depth);
             
-            // Simplified epilogue - caller handles R15 restoration
+            // 6. Standard epilogue (no R15 restoration needed)
             total_length += emitter.emitBytes({0x48, 0x89, 0xEC}); // mov rsp, rbp
             total_length += emitter.emitBytes({0x5D}); // pop rbp
             total_length += emitter.emitBytes({0xC3}); // ret
@@ -201,6 +357,7 @@ size_t Codegen::generateVarDecl(VarDeclNode* varDecl, LexicalScopeNode* current_
 size_t Codegen::generateLiteral(LiteralNode* literal) {
     // Convert literal value to integer and load into RAX
     int64_t value = std::stoll(literal->value);
+    printf("DEBUG generateLiteral: Loading literal value %ld into RAX\n", value);
     return emitter.emitMovRAXImm64(static_cast<uint64_t>(value));
 }
 
@@ -221,108 +378,122 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
         throw std::runtime_error("Cannot call function - no target function found");
     }
     
-    // NEW CALLING CONVENTION:
-    // 1. Load closure address from parent scope FIRST (while R15 is still parent scope)
-    total_length += loadVariableIntoRegister(funcCall, Register::RBX);
+    printf("DEBUG: generateClosureCall - calling function '%s' with %zu args, %zu hidden params\n", 
+           targetFunc->funcName.c_str(), funcCall->args.size(), targetFunc->hiddenParamsInfo.size());
     
-    // 2. Allocate scope object for target function (keep R15 as current scope for now)
-    // Get current brk (program break) - this will be our allocated memory
-    total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
-    total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
-    total_length += emitter.emitSyscall();
+    // NEW STANDARD ABI CALLING CONVENTION:
+    // Place parameters in registers: RDI, RSI, RDX, RCX, R8, R9, then stack
+    // Order: regular parameters first, then hidden scope parameters
     
-    // Save current brk in RCX
-    total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
+    size_t total_params = funcCall->args.size() + targetFunc->hiddenParamsInfo.size();
+    std::vector<size_t> stack_params; // For parameters beyond 6
     
-    // Set new brk to current + scope size
-    total_length += emitter.emitMovRAXImm64(12);       // sys_brk
-    total_length += emitter.emitBytes({0x48, 0x89, 0xCA}); // mov rdx, rcx  
-    total_length += emitter.emitBytes({0x48, 0x81, 0xC2}); // add rdx, imm32
-    total_length += emitter.emitU32(static_cast<uint32_t>(targetFunc->totalSize));
-    total_length += emitter.emitBytes({0x48, 0x89, 0xD7}); // mov rdi, rdx
-    total_length += emitter.emitSyscall();
-    
-    // Store the new scope address in R14 (R15 remains current scope for argument evaluation)
-    total_length += emitter.emitBytes({0x49, 0x89, 0xCE}); // mov r14, rcx
-    
-    // Calculate the starting offset for hidden parameters (after regular parameters)
-    int hidden_param_start_offset = 0;
-    for (const std::string& paramName : targetFunc->params) {
-        auto paramIt = targetFunc->variables.find(paramName);
-        if (paramIt != targetFunc->variables.end()) {
-            int param_end = paramIt->second.offset + paramIt->second.size;
-            if (param_end > hidden_param_start_offset) {
-                hidden_param_start_offset = param_end;
-            }
-        }
-    }
-    // Align to 8 bytes
-    hidden_param_start_offset = (hidden_param_start_offset + 7) & ~7;
-    
-    // 3. Evaluate arguments and store them directly at their correct offsets in the new scope
-    // R15 = current scope (for evaluating arguments), R14 = new scope (for storing results)
+    // Generate all regular parameter values and place them in registers/stack
     for (size_t i = 0; i < funcCall->args.size(); i++) {
-        // Generate code to evaluate the argument (result in RAX) using current scope (R15)
+        printf("DEBUG: Processing regular parameter %zu\n", i);
+        // Generate code to evaluate the argument (result in RAX)
         total_length += generateNode(funcCall->args[i].get(), current_scope);
         
-        // Find the parameter name and get its offset from the target function
-        std::string paramName = targetFunc->params[i];
-        auto paramIt = targetFunc->variables.find(paramName);
-        if (paramIt != targetFunc->variables.end()) {
-            int paramOffset = paramIt->second.offset;
-            // Store argument directly at [R14 + paramOffset] (R14 contains new scope address)
-            total_length += emitter.emitBytes({0x49, 0x89, 0x86}); // mov [r14 + offset], rax
-            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+        if (i < 6) { // First 6 parameters go in registers
+            switch(i) {
+                case 0: // RDI
+                    printf("DEBUG: Moving parameter %zu from RAX to RDI\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
+                    break;
+                case 1: // RSI
+                    printf("DEBUG: Moving parameter %zu from RAX to RSI\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC6}); // mov rsi, rax
+                    break;
+                case 2: // RDX
+                    printf("DEBUG: Moving parameter %zu from RAX to RDX\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC2}); // mov rdx, rax
+                    break;
+                case 3: // RCX
+                    printf("DEBUG: Moving parameter %zu from RAX to RCX\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
+                    break;
+                case 4: // R8
+                    printf("DEBUG: Moving parameter %zu from RAX to R8\n", i);
+                    total_length += emitter.emitBytes({0x49, 0x89, 0xC0}); // mov r8, rax
+                    break;
+                case 5: // R9
+                    printf("DEBUG: Moving parameter %zu from RAX to R9\n", i);
+                    total_length += emitter.emitBytes({0x49, 0x89, 0xC1}); // mov r9, rax
+                    break;
+            }
         } else {
-            throw std::runtime_error("Parameter not found in target function: " + paramName);
+            // Push onto stack for later (we'll push in reverse order)
+            printf("DEBUG: Parameter %zu will go on stack\n", i);
+            stack_params.push_back(i);
         }
     }
     
-    // 4. Copy hidden lexical scope parameters from closure to their proper offsets
-    // IMPORTANT: Do this BEFORE switching R15, while we still have access to parent scope
-    
-    // Load closure address into RCX and keep it there throughout the loop
-    printf("DEBUG: About to call loadVariableDefiningScopeAddressIntoRegister with RCX\n");
-    total_length += loadVariableDefiningScopeAddressIntoRegister(funcCall, Register::RCX);
-    printf("DEBUG: Finished loadVariableDefiningScopeAddressIntoRegister\n");
+    // Now handle hidden scope parameters (they come after regular parameters)
+    // Load closure defining scope address first
+    total_length += loadVariableDefiningScopeAddressIntoRegister(funcCall, Register::R10);
     auto variable_offset = funcCall->getVariableAccess().offset;
     
-    printf("DEBUG: targetFunc->allNeeded.size() = %zu\n", targetFunc->allNeeded.size());
-    // Copy each lexical scope address from closure to new scope
-    for (size_t i = 0; i < targetFunc->allNeeded.size(); i++) {
-        printf("DEBUG: Processing allNeeded[%zu]\n", i);
-        // Load scope pointer from closure structure at offset 8 + (i * 8)
-        // The closure structure starts at variable_offset within the scope, 
-        // and scope addresses are stored at offsets 8, 16, 24, etc. within the closure
-        size_t scope_offset_in_closure = 8 + (i * 8);
+    for (size_t i = 0; i < targetFunc->hiddenParamsInfo.size(); i++) {
+        size_t param_index = funcCall->args.size() + i;
+        printf("DEBUG: Processing hidden parameter %zu (total param index %zu)\n", i, param_index);
+        
+        // Load scope address from closure structure
+        size_t scope_offset_in_closure = 8 + (i * 8); // Function addr at 0, scopes at 8, 16, 24...
         auto total_offset = scope_offset_in_closure + variable_offset;
         
-        // Load the scope pointer from [rcx + total_offset] into RAX
-        printf("DEBUG: Loading scope address from [rcx + %zu] where rcx is scope base, variable_offset=%zu, scope_offset_in_closure=%zu\n", 
-               total_offset, variable_offset, scope_offset_in_closure);
-        total_length += emitter.emitMovRAXFromRCXPlusOffset(static_cast<uint32_t>(total_offset));
+        printf("DEBUG: Loading hidden param %zu: closure offset=%zu, variable_offset=%zu, total_offset=%zu\n", 
+               i, scope_offset_in_closure, variable_offset, total_offset);
         
-        // Store in new scope at hidden parameter offset
-        int hidden_param_offset = hidden_param_start_offset + (i * 8);
-        printf("DEBUG generateClosureCall: storing scope at hidden_param_offset=%d (start=%d + i=%zu * 8)\n", 
-               hidden_param_offset, hidden_param_start_offset, i);
-        total_length += emitter.emitMovQwordPtrR14PlusOffsetRAX(static_cast<uint32_t>(hidden_param_offset));
+        // Load scope address into RAX
+        total_length += emitter.emitMovRAXFromR10PlusOffset(static_cast<uint32_t>(total_offset));
+        
+        if (param_index < 6) { // First 6 total parameters go in registers
+            switch(param_index) {
+                case 0: // RDI
+                    printf("DEBUG: Moving hidden param %zu from RAX to RDI\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
+                    break;
+                case 1: // RSI
+                    printf("DEBUG: Moving hidden param %zu from RAX to RSI\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC6}); // mov rsi, rax
+                    break;
+                case 2: // RDX
+                    printf("DEBUG: Moving hidden param %zu from RAX to RDX\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC2}); // mov rdx, rax
+                    break;
+                case 3: // RCX
+                    printf("DEBUG: Moving hidden param %zu from RAX to RCX\n", i);
+                    total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
+                    break;
+                case 4: // R8
+                    printf("DEBUG: Moving hidden param %zu from RAX to R8\n", i);
+                    total_length += emitter.emitBytes({0x49, 0x89, 0xC0}); // mov r8, rax
+                    break;
+                case 5: // R9
+                    printf("DEBUG: Moving hidden param %zu from RAX to R9\n", i);
+                    total_length += emitter.emitBytes({0x49, 0x89, 0xC1}); // mov r9, rax
+                    break;
+            }
+        } else {
+            // Push onto stack (will be handled below)
+            printf("DEBUG: Hidden parameter %zu will go on stack\n", i);
+            // We'll need to save this for stack pushing - for now, push immediately
+            total_length += emitter.emitBytes({0x50}); // push rax
+        }
     }
     
-    // 5. Push R15 (save parent scope) and switch to new scope
-    total_length += emitter.emitBytes({0x41, 0x57}); // push r15
-    total_length += emitter.emitBytes({0x4D, 0x89, 0xF7}); // mov r15, r14
+    // TODO: Handle stack parameters (for functions with more than 6 total parameters)
+    // For now, we'll assume all functions have <= 6 parameters
     
-    // 6. Load function address from closure (now in RCX) and call
-    // Function address is at closure base + variable_offset (where the closure is stored)
-    // RCX contains scope address from loadVariableDefiningScopeAddressIntoRegister call
-    total_length += emitter.emitMovRAXFromRCXPlusOffset(static_cast<uint32_t>(variable_offset)); // mov rax, [rcx + variable_offset]
+    // Load function address from closure and call
+    // Use the closure address already loaded in R10
+    total_length += emitter.emitMovRAXFromR10PlusOffset(static_cast<uint32_t>(variable_offset)); // Function address at closure base
     
-    // Call the function
+    printf("DEBUG: About to call function\n");
+    // Call the function 
     total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
     
-    // 7. Restore R15 (parent scope)
-    total_length += emitter.emitPopR15();
+    // TODO: Clean up stack if we used it (not needed for <= 6 params)
     
     return total_length;
 }
@@ -353,12 +524,24 @@ size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_
 size_t Codegen::createClosures(LexicalScopeNode* scope) {
     size_t total_length = 0;
     
+    printf("DEBUG createClosures: Starting for scope at depth %d, type=%d\n", scope->depth, (int)scope->type);
+    printf("DEBUG createClosures: Scope has %zu variables\n", scope->variables.size());
+    
     // Loop through all variables in this scope
     for (auto& [name, varInfo] : scope->variables) {
+        printf("DEBUG createClosures: Processing variable '%s', type=%d\n", name.c_str(), (int)varInfo.type);
+        
         if (varInfo.type == DataType::CLOSURE) {
+            printf("DEBUG createClosures: Creating closure for function '%s'\n", name.c_str());
+            
             // This is a closure variable - store the closure structure DIRECTLY in the variable slots
             FunctionDeclNode* funcNode = varInfo.funcNode;
-            if (!funcNode) continue;
+            if (!funcNode) {
+                printf("ERROR createClosures: Closure variable '%s' has no function node\n", name.c_str());
+                continue;
+            }
+            
+            printf("DEBUG createClosures: Function '%s' needs %zu parent scopes\n", funcNode->funcName.c_str(), funcNode->allNeeded.size());
             
             // Store function address directly at R15 + varInfo.offset (first 8 bytes of closure)
             // mov rax, <placeholder>
@@ -374,19 +557,26 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
             
             // Now store addresses of needed parent scopes immediately after the function address
             // For each scope in funcNode->allNeeded, we need to store its address
+            printf("DEBUG createClosures: Storing %zu parent scope addresses for function '%s'\n", funcNode->allNeeded.size(), funcNode->funcName.c_str());
+            
             for (size_t i = 0; i < funcNode->allNeeded.size(); i++) {
                 int neededDepth = funcNode->allNeeded[i];
+                
+                printf("DEBUG createClosures: Processing scope dependency %zu/%zu: depth=%d\n", i+1, funcNode->allNeeded.size(), neededDepth);
                 
                 // Get parameter index for this scope depth
                 auto it = funcNode->scopeDepthToParentParameterIndexMap.find(neededDepth);
                 if (it != funcNode->scopeDepthToParentParameterIndexMap.end()) {
                     int absoluteParamIndex = it->second;
                     
+                    printf("DEBUG createClosures: Found parameter mapping: depth %d -> absolute param index %d\n", neededDepth, absoluteParamIndex);
+                    
                     // Load scope address using proper parameter offset calculation
-                    printf("DEBUG: Creating closure - loading scope for depth %d from absolute param %d\n", neededDepth, absoluteParamIndex);
+                    printf("DEBUG createClosures: Creating closure - loading scope for depth %d from absolute param %d\n", neededDepth, absoluteParamIndex);
                     
                     if (absoluteParamIndex == -1) {
                         // Special case: current scope (R15)
+                        printf("DEBUG createClosures: Using current scope (R15) for depth %d\n", neededDepth);
                         total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
                     } else {
                         // During closure creation, we need to get the scope from the current context
@@ -399,11 +589,47 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                             total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
                         } else {
                             // For parent scopes, we need to load from the current function's parameters
-                            // Find the current function scope
+                            // Find the current function scope with cycle detection
+                            printf("DEBUG createClosures: Looking for parent function scope from depth %d\n", scope->depth);
                             LexicalScopeNode* currentFunc = scope;
+                            std::set<LexicalScopeNode*> visited;
+                            int traversal_count = 0;
+                            printf("DEBUG createClosures: Starting scope traversal from depth %d to find parent function\n", scope->depth);
+                            
                             while (currentFunc && currentFunc->type != NodeType::FUNCTION_DECL) {
+                                traversal_count++;
+                                printf("DEBUG createClosures: Traversal step %d - checking scope at %p, depth=%d, type=%d\n", 
+                                       traversal_count, currentFunc, currentFunc->depth, (int)currentFunc->type);
+                                
+                                // Cycle detection
+                                if (visited.find(currentFunc) != visited.end()) {
+                                    printf("ERROR createClosures: CYCLE DETECTED! Scope %p already visited\n", currentFunc);
+                                    throw std::runtime_error("Closure creation error: cycle detected in scope hierarchy while looking for parent function from scope at depth " + 
+                                                           std::to_string(scope->depth));
+                                }
+                                visited.insert(currentFunc);
+                                
+                                printf("DEBUG createClosures: Traversing from scope depth %d to parent at %p\n", currentFunc->depth, currentFunc->parentFunctionScope);
+                                
+                                if (!currentFunc->parentFunctionScope) {
+                                    printf("WARNING createClosures: No parent function scope found - reached end of chain\n");
+                                    break;
+                                }
+                                
                                 currentFunc = currentFunc->parentFunctionScope;
+                                
+                                // Additional safety check - prevent excessive traversal
+                                if (traversal_count > 20) {
+                                    printf("ERROR createClosures: Excessive traversal (>20) detected - possible infinite loop\n");
+                                    throw std::runtime_error("Closure creation error: excessive scope traversal (>20 levels) - possible infinite loop from scope at depth " + 
+                                                           std::to_string(scope->depth));
+                                }
                             }
+                            
+                            printf("DEBUG createClosures: Traversal completed after %d steps\n", traversal_count);
+                            printf("DEBUG createClosures: Found function scope at depth %d (type=%d)\n", 
+                                   currentFunc ? currentFunc->depth : -1, 
+                                   currentFunc ? (int)currentFunc->type : -1);
                             
                             if (currentFunc && currentFunc->type == NodeType::FUNCTION_DECL) {
                                 // Get the parameter index for this scope in the current function's context
@@ -417,6 +643,8 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                                         int param_offset = currentFunc->getParameterOffset(currentFuncParamIndex);
                                         printf("DEBUG: Loading scope for depth %d from param offset %d\n", neededDepth, param_offset);
                                         total_length += emitter.emitMovRAXFromR15Offset(param_offset);
+                                        // Add debug to print the loaded address
+                                        printf("DEBUG: About to store scope address for depth %d in closure\n", neededDepth);
                                     }
                                 } else {
                                     // This should not happen - throw an error instead of using fallback
@@ -427,8 +655,19 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                                 // BUG FIX: This should be an error, not a fallback to R15
                                 // If we reach here, it means we're trying to access a scope that's not available
                                 // in the current context, which indicates a bug in scope dependency analysis
+                                printf("ERROR: Cannot find parent function scope for closure creation\n");
+                                printf("ERROR: Current scope depth=%d, type=%d\n", scope->depth, (int)scope->type);
+                                printf("ERROR: Looking for needed depth=%d\n", neededDepth);
+                                printf("ERROR: Visited scopes during traversal:\n");
+                                for (auto* visitedScope : visited) {
+                                    printf("ERROR:   - Scope at %p, depth=%d, type=%d\n", visitedScope, visitedScope->depth, (int)visitedScope->type);
+                                }
+                                
                                 throw std::runtime_error("Closure creation error: cannot access scope at depth " + 
-                                                       std::to_string(neededDepth) + " from global scope. " +
+                                                       std::to_string(neededDepth) + " from scope at depth " + 
+                                                       std::to_string(scope->depth) + ". " +
+                                                       "No parent function scope found after traversing " + 
+                                                       std::to_string(visited.size()) + " scopes. " +
                                                        "This indicates a bug in scope dependency analysis for function '" + 
                                                        funcNode->funcName + "'");
                             }
@@ -444,6 +683,7 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                 // Store the scope address immediately after function address
                 // Closure structure: [func_addr at offset][scope1 at offset+8][scope2 at offset+16]...
                 size_t scope_offset = varInfo.offset + 8 + (i * 8);
+                printf("DEBUG createClosures: Storing scope for depth %d at closure offset %zu\n", neededDepth, scope_offset);
                 total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(scope_offset);
             }
         }
@@ -453,6 +693,8 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
 }
 
 void Codegen::patchFunctionAddresses() {
+    printf("DEBUG patchFunctionAddresses: Patching %zu function addresses\n", function_patches.size());
+    
     // Patch all function addresses in the machine code buffer
     for (const auto& patch : function_patches) {
         uint64_t addr_to_patch;
@@ -461,9 +703,12 @@ void Codegen::patchFunctionAddresses() {
             // For string patches, we need to calculate absolute address in executable memory
             // This will be done in writeProgramToExecutable after we know the base address
             addr_to_patch = patch.string_offset; // Store offset for now
+            printf("DEBUG patchFunctionAddresses: String patch at offset %zu\n", patch.offset_in_buffer);
         } else {
             // For function patches, use the function address
             addr_to_patch = patch.func->functionAddress;
+            printf("DEBUG patchFunctionAddresses: Function patch for '%s' at offset %zu, address 0x%lx\n", 
+                   patch.func->funcName.c_str(), patch.offset_in_buffer, addr_to_patch);
         }
         
         // Write the address into the buffer at the exact offset
@@ -716,49 +961,32 @@ size_t Codegen::loadVariableDefiningScopeAddressIntoRegister(IdentifierNode* ide
 }
 
 void Codegen::disassembleCode(const std::vector<uint8_t>& code, uint64_t base_address) {
+    printf("\n=== ASSEMBLY DISASSEMBLY ===\n");
+    printf("Base address: 0x%016lx\n", base_address);
+    printf("Code size: %zu bytes\n\n", code.size());
+    
     csh handle;
     cs_insn *insn;
     size_t count;
     
-    // Initialize capstone for x86-64
+    // Initialize Capstone for x86-64
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
-        std::cerr << "Failed to initialize Capstone disassembler" << std::endl;
+        printf("ERROR: Failed to initialize Capstone disassembler\n");
         return;
     }
     
     // Disassemble the code
     count = cs_disasm(handle, code.data(), code.size(), base_address, 0, &insn);
-    
     if (count > 0) {
-        std::cout << "\n=== DISASSEMBLY OF PATCHED CODE ===\n";
-        std::cout << "Base address: 0x" << std::hex << base_address << std::dec << "\n";
-        std::cout << "Code size: " << code.size() << " bytes\n\n";
-        
-        for (size_t j = 0; j < count; j++) {
-            std::cout << "0x" << std::hex << insn[j].address << std::dec << ":\t";
-            
-            // Print hex bytes
-            std::cout << std::hex;
-            for (size_t k = 0; k < insn[j].size; k++) {
-                std::cout << std::setfill('0') << std::setw(2) << (int)insn[j].bytes[k] << " ";
-            }
-            
-            // Pad with spaces for alignment
-            for (size_t k = insn[j].size; k < 8; k++) {
-                std::cout << "   ";
-            }
-            
-            std::cout << std::dec << "\t" << insn[j].mnemonic << "\t" << insn[j].op_str << std::endl;
+        for (size_t i = 0; i < count; i++) {
+            printf("0x%016lx: %-10s %s\n", insn[i].address, insn[i].mnemonic, insn[i].op_str);
         }
-        
-        std::cout << "\n=== END DISASSEMBLY ===\n\n";
-        
-        // Free memory allocated by cs_disasm()
         cs_free(insn, count);
     } else {
-        std::cerr << "Failed to disassemble code" << std::endl;
+        printf("ERROR: Failed to disassemble code\n");
     }
     
-    // Close capstone handle
+    // Clean up
     cs_close(&handle);
+    printf("\n===========================\n\n");
 }

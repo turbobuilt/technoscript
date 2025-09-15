@@ -1,0 +1,269 @@
+DEBUG: Program started
+DEBUG: About to process command line arguments
+DEBUG: Reading from file: two_level_test.ts
+=== Testing from file: two_level_test.ts ===
+DEBUG: Starting parsing...
+DEBUG: Parsing completed successfully
+DEBUG: Starting analysis...
+DEBUG Analyzer: Starting collectVariables...
+DEBUG Analyzer: collectVariables completed
+DEBUG Analyzer: Starting setupParentPointers...
+DEBUG Analyzer: setupParentPointers completed
+DEBUG Analyzer: Starting analyzeScope...
+DEBUG findVariable: Looking for 'param_y' from scope depth 2
+DEBUG findVariable: Starting parent traversal from scope depth 2
+DEBUG findVariable: Checking scope depth 1 (traversal #1)
+DEBUG findVariable: Checking scope depth 0 (traversal #2)
+DEBUG findVariable: Checking current scope for 'param_y'
+DEBUG findVariable: Found 'param_y' in current scope
+DEBUG findVariable: Looking for 'param_x' from scope depth 2
+DEBUG findVariable: Starting parent traversal from scope depth 2
+DEBUG findVariable: Checking scope depth 1 (traversal #1)
+DEBUG findVariable: Found 'param_x' in scope depth 1
+DEBUG findVariable: Adding dependencies for 'param_x'
+DEBUG findVariable: Dependencies added successfully for 'param_x'
+DEBUG findVariable: Looking for 'outer_var' from scope depth 2
+DEBUG findVariable: Starting parent traversal from scope depth 2
+DEBUG findVariable: Checking scope depth 1 (traversal #1)
+DEBUG findVariable: Found 'outer_var' in scope depth 1
+DEBUG findVariable: Adding dependencies for 'outer_var'
+DEBUG findVariable: Dependencies added successfully for 'outer_var'
+DEBUG findVariable: Looking for 'global_var' from scope depth 2
+DEBUG findVariable: Starting parent traversal from scope depth 2
+DEBUG findVariable: Checking scope depth 1 (traversal #1)
+DEBUG findVariable: Checking scope depth 0 (traversal #2)
+DEBUG findVariable: Found 'global_var' in scope depth 0
+DEBUG findVariable: Adding dependencies for 'global_var'
+DEBUG findVariable: Adding descendant dep to scope depth 1 (dep traversal #1)
+DEBUG findVariable: Dependencies added successfully for 'global_var'
+DEBUG findVariable: Looking for 'inner' from scope depth 1
+DEBUG findVariable: Starting parent traversal from scope depth 1
+DEBUG findVariable: Checking scope depth 0 (traversal #1)
+DEBUG findVariable: Checking current scope for 'inner'
+DEBUG findVariable: Found 'inner' in current scope
+DEBUG findVariable: Looking for 'outer_var' from scope depth 1
+DEBUG findVariable: Starting parent traversal from scope depth 1
+DEBUG findVariable: Checking scope depth 0 (traversal #1)
+DEBUG findVariable: Checking current scope for 'outer_var'
+DEBUG findVariable: Found 'outer_var' in current scope
+DEBUG findVariable: Looking for 'param_x' from scope depth 1
+DEBUG findVariable: Starting parent traversal from scope depth 1
+DEBUG findVariable: Checking scope depth 0 (traversal #1)
+DEBUG findVariable: Checking current scope for 'param_x'
+DEBUG findVariable: Found 'param_x' in current scope
+DEBUG findVariable: Looking for 'outer' from scope depth 0
+DEBUG findVariable: Starting parent traversal from scope depth 0
+DEBUG findVariable: Checking current scope for 'outer'
+DEBUG findVariable: Found 'outer' in current scope
+DEBUG findVariable: Looking for 'global_var' from scope depth 0
+DEBUG findVariable: Starting parent traversal from scope depth 0
+DEBUG findVariable: Checking current scope for 'global_var'
+DEBUG findVariable: Found 'global_var' in current scope
+DEBUG Analyzer: analyzeScope completed
+DEBUG Analyzer: Starting updateAllNeededArrays...
+DEBUG Analyzer: updateAllNeededArrays completed
+DEBUG Analyzer: Starting packScopes...
+DEBUG pack: Variable 'global_var' assigned offset 0 (size=8)
+DEBUG pack: Variable 'outer' assigned offset 8 (size=8)
+DEBUG pack: Parameter 'param_x' assigned offset 0 (size=8)
+DEBUG pack: Hidden parameter for depth 0 assigned offset 8
+DEBUG pack: Variable 'inner' assigned offset 16 (size=8)
+DEBUG pack: Variable 'outer_var' assigned offset 24 (size=8)
+DEBUG pack: Parameter 'param_y' assigned offset 0 (size=8)
+DEBUG pack: Hidden parameter for depth 0 assigned offset 8
+DEBUG pack: Hidden parameter for depth 1 assigned offset 16
+DEBUG Analyzer: packScopes completed
+DEBUG Analyzer: Starting buildAllScopeDepthToParentParameterIndexMaps...
+DEBUG buildScopeDepthToParentParameterIndexMap: Function 'outer' has 1 regular params, needs 1 scopes
+DEBUG buildScopeDepthToParentParameterIndexMap: depth 0 -> param index 1 (regular params=1 + hidden offset=0)
+DEBUG buildScopeDepthToParentParameterIndexMap: Final map for function 'outer':
+DEBUG:   depth 0 -> param index 1
+DEBUG buildScopeDepthToParentParameterIndexMap: Function 'inner' has 1 regular params, needs 2 scopes
+DEBUG buildScopeDepthToParentParameterIndexMap: depth 0 -> param index 1 (regular params=1 + hidden offset=0)
+DEBUG buildScopeDepthToParentParameterIndexMap: depth 1 -> param index 2 (regular params=1 + hidden offset=1)
+DEBUG buildScopeDepthToParentParameterIndexMap: Final map for function 'inner':
+DEBUG:   depth 0 -> param index 1
+DEBUG:   depth 1 -> param index 2
+DEBUG Analyzer: buildAllScopeDepthToParentParameterIndexMaps completed
+DEBUG: Analysis completed successfully
+DEBUG: Actual print_int64 address: 0x60be2102ebed
+DEBUG: Starting code generation...
+DEBUG initExternFunctions: storing print_int64 at address 0x60be2102ebed
+DEBUG createClosures: Starting for scope at depth 0, type=1
+DEBUG createClosures: Scope has 2 variables
+DEBUG createClosures: Processing variable 'global_var', type=1
+DEBUG createClosures: Processing variable 'outer', type=2
+DEBUG createClosures: Creating closure for function 'outer'
+DEBUG createClosures: Function 'outer' needs 1 parent scopes
+DEBUG createClosures: Storing 1 parent scope addresses for function 'outer'
+DEBUG createClosures: Processing scope dependency 1/1: depth=0
+DEBUG createClosures: Found parameter mapping: depth 0 -> absolute param index 1
+DEBUG createClosures: Creating closure - loading scope for depth 0 from absolute param 1
+DEBUG: Storing current scope (R15) for depth 0
+DEBUG: generateClosureCall - calling function 'outer' with 1 args, 1 hidden params
+DEBUG: Processing regular parameter 0
+DEBUG loadVariableIntoRegister: var='global_var' paramIndex=-1
+DEBUG: node=0x60be43e34110, definingScope=0x60be43e325e0 (depth=0), accessingScope=0x60be43e325e0 (depth=0)
+DEBUG: var defined in scope depth=0
+DEBUG: var accessed in scope depth=0
+DEBUG: Loading from current scope R15+0
+DEBUG: Moving parameter 0 from RAX to RDI
+DEBUG loadVariableDefiningScopeAddressIntoRegister: var='outer' paramIndex=-1 paramOffset=0
+DEBUG: var defined in scope depth=0
+DEBUG: var accessed in scope depth=0
+DEBUG: Loading current scope address from R15
+DEBUG: target_reg = 10, Register::R15 = 15
+DEBUG: Target register is NOT R15, calling emitMovRegFromReg
+DEBUG: Processing hidden parameter 0 (total param index 1)
+DEBUG: Moving hidden param 0 from RAX to RSI
+DEBUG loadVariableDefiningScopeAddressIntoRegister: var='outer' paramIndex=-1 paramOffset=0
+DEBUG: var defined in scope depth=0
+DEBUG: var accessed in scope depth=0
+DEBUG: Loading current scope address from R15
+DEBUG: target_reg = 11, Register::R15 = 15
+DEBUG: Target register is NOT R15, calling emitMovRegFromReg
+DEBUG: About to call function
+DEBUG: === STARTING code generation for function 'outer' at depth=1 ===
+DEBUG: Function 'outer' assigned address offset 0x7d
+DEBUG: === STARTING function prologue for 'outer' ===
+DEBUG: Function has 1 regular params and 1 hidden params
+DEBUG: Saving parameter registers before heap allocation
+DEBUG: Allocating heap memory for function scope (size=32)
+DEBUG: Copying parameter 0 ('param_x') to offset 0
+DEBUG: Copying from RDI to R15+0
+DEBUG: Copying hidden parameter 0 (total param index 1) to offset 8
+DEBUG: Creating closures for function 'outer' scope
+DEBUG createClosures: Starting for scope at depth 1, type=3
+DEBUG createClosures: Scope has 3 variables
+DEBUG createClosures: Processing variable 'inner', type=2
+DEBUG createClosures: Creating closure for function 'inner'
+DEBUG createClosures: Function 'inner' needs 2 parent scopes
+DEBUG createClosures: Storing 2 parent scope addresses for function 'inner'
+DEBUG createClosures: Processing scope dependency 1/2: depth=0
+DEBUG createClosures: Found parameter mapping: depth 0 -> absolute param index 1
+DEBUG createClosures: Creating closure - loading scope for depth 0 from absolute param 1
+DEBUG createClosures: Looking for parent function scope from depth 1
+DEBUG createClosures: Starting scope traversal from depth 1 to find parent function
+DEBUG createClosures: Traversal completed after 0 steps
+DEBUG createClosures: Found function scope at depth 1 (type=3)
+DEBUG: Loading scope for depth 0 from param offset 8
+DEBUG createClosures: Processing scope dependency 2/2: depth=1
+DEBUG createClosures: Found parameter mapping: depth 1 -> absolute param index 2
+DEBUG createClosures: Creating closure - loading scope for depth 1 from absolute param 2
+DEBUG: Storing current scope (R15) for depth 1
+DEBUG createClosures: Processing variable 'outer_var', type=1
+DEBUG createClosures: Processing variable 'param_x', type=1
+DEBUG: === STARTING code generation for function 'inner' at depth=2 ===
+DEBUG: Function 'inner' assigned address offset 0xf8
+DEBUG: === STARTING function prologue for 'inner' ===
+DEBUG: Function has 1 regular params and 2 hidden params
+DEBUG: Saving parameter registers before heap allocation
+DEBUG: Allocating heap memory for function scope (size=24)
+DEBUG: Copying parameter 0 ('param_y') to offset 0
+DEBUG: Copying from RDI to R15+0
+DEBUG: Copying hidden parameter 0 (total param index 1) to offset 8
+DEBUG: Copying hidden parameter 1 (total param index 2) to offset 16
+DEBUG: Creating closures for function 'inner' scope
+DEBUG createClosures: Starting for scope at depth 2, type=3
+DEBUG createClosures: Scope has 1 variables
+DEBUG createClosures: Processing variable 'param_y', type=1
+DEBUG loadVariableIntoRegister: var='param_y' paramIndex=-1
+DEBUG: node=0x60be43e33b30, definingScope=0x60be43e338e0 (depth=2), accessingScope=0x60be43e338e0 (depth=2)
+DEBUG: var defined in scope depth=2
+DEBUG: var accessed in scope depth=2
+DEBUG: Loading from current scope R15+0
+DEBUG generatePrintStatement: retrieved print_int64 address 0x60be2102ebed
+DEBUG loadVariableIntoRegister: var='param_x' paramIndex=2
+DEBUG: node=0x60be43e33c30, definingScope=0x60be43e32a80 (depth=1), accessingScope=0x60be43e338e0 (depth=2)
+DEBUG: Should use parent scope access - checking parameter index map
+DEBUG: Parameter map size: 2
+DEBUG: depth 0 -> param index 1
+DEBUG: depth 1 -> param index 2
+DEBUG: var defined in scope depth=1
+DEBUG: var accessed in scope depth=2
+DEBUG: Loading from parent scope via parameter offset 16 + variable offset 0
+DEBUG: Using parameter offset: 16
+DEBUG: About to load scope address from R15+16
+DEBUG: About to load variable from scope+0
+DEBUG generatePrintStatement: retrieved print_int64 address 0x60be2102ebed
+DEBUG loadVariableIntoRegister: var='outer_var' paramIndex=2
+DEBUG: node=0x60be43e33d30, definingScope=0x60be43e32a80 (depth=1), accessingScope=0x60be43e338e0 (depth=2)
+DEBUG: Should use parent scope access - checking parameter index map
+DEBUG: Parameter map size: 2
+DEBUG: depth 0 -> param index 1
+DEBUG: depth 1 -> param index 2
+DEBUG: var defined in scope depth=1
+DEBUG: var accessed in scope depth=2
+DEBUG: Loading from parent scope via parameter offset 16 + variable offset 24
+DEBUG: Using parameter offset: 16
+DEBUG: About to load scope address from R15+16
+DEBUG: About to load variable from scope+24
+DEBUG generatePrintStatement: retrieved print_int64 address 0x60be2102ebed
+DEBUG loadVariableIntoRegister: var='global_var' paramIndex=1
+DEBUG: node=0x60be43e33e20, definingScope=0x60be43e325e0 (depth=0), accessingScope=0x60be43e338e0 (depth=2)
+DEBUG: Should use parent scope access - checking parameter index map
+DEBUG: Parameter map size: 2
+DEBUG: depth 0 -> param index 1
+DEBUG: depth 1 -> param index 2
+DEBUG: var defined in scope depth=0
+DEBUG: var accessed in scope depth=2
+DEBUG: Loading from parent scope via parameter offset 8 + variable offset 0
+DEBUG: Using parameter offset: 8
+DEBUG: About to load scope address from R15+8
+DEBUG: About to load variable from scope+0
+DEBUG generatePrintStatement: retrieved print_int64 address 0x60be2102ebed
+DEBUG: === FINISHED code generation for function 'inner' at depth=2 ===
+DEBUG: generateClosureCall - calling function 'inner' with 1 args, 2 hidden params
+DEBUG: Processing regular parameter 0
+DEBUG loadVariableIntoRegister: var='outer_var' paramIndex=-1
+DEBUG: node=0x60be43e33f20, definingScope=0x60be43e32a80 (depth=1), accessingScope=0x60be43e32a80 (depth=1)
+DEBUG: var defined in scope depth=1
+DEBUG: var accessed in scope depth=1
+DEBUG: Loading from current scope R15+24
+DEBUG: Moving parameter 0 from RAX to RDI
+DEBUG loadVariableDefiningScopeAddressIntoRegister: var='inner' paramIndex=-1 paramOffset=0
+DEBUG: var defined in scope depth=1
+DEBUG: var accessed in scope depth=1
+DEBUG: Loading current scope address from R15
+DEBUG: target_reg = 10, Register::R15 = 15
+DEBUG: Target register is NOT R15, calling emitMovRegFromReg
+DEBUG: Processing hidden parameter 0 (total param index 1)
+DEBUG: Moving hidden param 0 from RAX to RSI
+DEBUG: Processing hidden parameter 1 (total param index 2)
+DEBUG: Moving hidden param 1 from RAX to RDX
+DEBUG loadVariableDefiningScopeAddressIntoRegister: var='inner' paramIndex=-1 paramOffset=0
+DEBUG: var defined in scope depth=1
+DEBUG: var accessed in scope depth=1
+DEBUG: Loading current scope address from R15
+DEBUG: target_reg = 11, Register::R15 = 15
+DEBUG: Target register is NOT R15, calling emitMovRegFromReg
+DEBUG: About to call function
+DEBUG loadVariableIntoRegister: var='param_x' paramIndex=-1
+DEBUG: node=0x60be43e34010, definingScope=0x60be43e32a80 (depth=1), accessingScope=0x60be43e32a80 (depth=1)
+DEBUG: var defined in scope depth=1
+DEBUG: var accessed in scope depth=1
+DEBUG: Loading from current scope R15+0
+DEBUG generatePrintStatement: retrieved print_int64 address 0x60be2102ebed
+DEBUG: === FINISHED code generation for function 'outer' at depth=1 ===
+DEBUG patchFunctionAddresses: Patching 2 function addresses
+DEBUG patchFunctionAddresses: Function patch for 'outer' at offset 57, address 0x7d
+DEBUG patchFunctionAddresses: Function patch for 'inner' at offset 207, address 0xf8
+DEBUG: Code generation completed successfully
+DEBUG: Writing program to executable...
+DEBUG: print_int64 ENTRY - called with value=100
+DEBUG: About to print to stdout...
+100
+DEBUG: print_int64 SUCCESS - finished printing
+DEBUG: print_int64 ENTRY - called with value=-8554560826696527801
+DEBUG: About to print to stdout...
+-8554560826696527801
+DEBUG: print_int64 SUCCESS - finished printing
+DEBUG: print_int64 ENTRY - called with value=5244311233436010504
+DEBUG: About to print to stdout...
+5244311233436010504
+DEBUG: print_int64 SUCCESS - finished printing
+DEBUG: print_int64 ENTRY - called with value=100
+DEBUG: About to print to stdout...
+100
+DEBUG: print_int64 SUCCESS - finished printing
+timeout: the monitored command dumped core

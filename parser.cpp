@@ -50,6 +50,7 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
                 case '}': result.emplace_back(TokenType::RBRACE); break;
                 case ':': result.emplace_back(TokenType::COLON); break;
                 case ',': result.emplace_back(TokenType::COMMA); break;
+                case '.': result.emplace_back(TokenType::DOT); break;
             }
         }
     }
@@ -76,8 +77,38 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
     if (match(TokenType::PRINT)) return parsePrintStmt();
     if (match(TokenType::GO)) return parseGoStmt();
     if (match(TokenType::IDENTIFIER)) {
+        // Check for console.log pattern
+        if (current().value == "console" && 
+            pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::DOT &&
+            pos + 2 < tokens.size() && tokens[pos + 2].type == TokenType::IDENTIFIER && 
+            tokens[pos + 2].value == "log") {
+            // Skip "console", ".", "log" tokens
+            advance(); // skip "console"
+            advance(); // skip "."
+            advance(); // skip "log"
+            
+            // Parse as print statement
+            expect(TokenType::LPAREN);
+            
+            auto print = std::make_unique<ASTNode>(NodeType::PRINT_STMT);
+            while (!match(TokenType::RPAREN)) {
+                if (match(TokenType::STRING)) {
+                    print->children.push_back(std::make_unique<LiteralNode>(current().value));
+                    advance();
+                } else if (match(TokenType::LITERAL)) {
+                    print->children.push_back(std::make_unique<LiteralNode>(current().value));
+                    advance();
+                } else if (match(TokenType::IDENTIFIER)) {
+                    print->children.push_back(std::make_unique<IdentifierNode>(current().value));
+                    advance();
+                }
+                if (match(TokenType::COMMA)) advance();
+            }
+            expect(TokenType::RPAREN);
+            return print;
+        }
         // Look ahead to see if this is a function call
-        if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN) {
+        else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN) {
             return parseFunctionCall();
         } else {
             // Just return an identifier node

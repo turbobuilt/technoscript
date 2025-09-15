@@ -2,12 +2,29 @@
 #include <iostream>
 
 void Analyzer::analyze(LexicalScopeNode* root) {
+    std::cout << "DEBUG Analyzer: Starting collectVariables..." << std::endl;
     collectVariables(root, root);
+    std::cout << "DEBUG Analyzer: collectVariables completed" << std::endl;
+    
+    std::cout << "DEBUG Analyzer: Starting setupParentPointers..." << std::endl;
     setupParentPointers(root, nullptr, 0);
+    std::cout << "DEBUG Analyzer: setupParentPointers completed" << std::endl;
+    
+    std::cout << "DEBUG Analyzer: Starting analyzeScope..." << std::endl;
     analyzeScope(root);
+    std::cout << "DEBUG Analyzer: analyzeScope completed" << std::endl;
+    
+    std::cout << "DEBUG Analyzer: Starting updateAllNeededArrays..." << std::endl;
     updateAllNeededArrays(root);
-    buildAllScopeDepthToParentParameterIndexMaps(root);
+    std::cout << "DEBUG Analyzer: updateAllNeededArrays completed" << std::endl;
+    
+    std::cout << "DEBUG Analyzer: Starting packScopes..." << std::endl;
     packScopes(root);
+    std::cout << "DEBUG Analyzer: packScopes completed" << std::endl;
+    
+    std::cout << "DEBUG Analyzer: Starting buildAllScopeDepthToParentParameterIndexMaps..." << std::endl;
+    buildAllScopeDepthToParentParameterIndexMaps(root);
+    std::cout << "DEBUG Analyzer: buildAllScopeDepthToParentParameterIndexMaps completed" << std::endl;
 }
 
 void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
@@ -61,15 +78,11 @@ void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
 }
 
 void Analyzer::analyzeScope(LexicalScopeNode* scope) {
-    // Analyze the AST children (stored as unique_ptr)
+    // Analyze all AST children - this includes function declarations which will recursively analyze their scopes
     for (auto& child : scope->ASTNode::children) {
         analyzeNode(child.get(), scope);
     }
-    
-    // Also analyze the LexicalScopeNode children (raw pointers to other scopes)
-    for (auto* child : scope->children) {
-        analyzeScope(child);
-    }
+    // No need for separate scope children traversal - function declarations are handled above
 }
 
 void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
@@ -106,13 +119,27 @@ void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
 }
 
 VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* scope) {
+    std::cout << "DEBUG findVariable: Looking for '" << name << "' from scope depth " << scope->depth << std::endl;
+    
     LexicalScopeNode* current = scope->parentFunctionScope;
     LexicalScopeNode* defScope = nullptr;
+    int traversal_count = 0;
+    
+    std::cout << "DEBUG findVariable: Starting parent traversal from scope depth " << scope->depth << std::endl;
     
     // Find where variable is defined
     while (current) {
+        traversal_count++;
+        std::cout << "DEBUG findVariable: Checking scope depth " << current->depth << " (traversal #" << traversal_count << ")" << std::endl;
+        
+        if (traversal_count > 20) {
+            std::cout << "ERROR findVariable: Excessive traversal (>20) for variable '" << name << "' - possible infinite loop" << std::endl;
+            throw std::runtime_error("Infinite loop detected in findVariable for variable: " + name);
+        }
+        
         auto it = current->variables.find(name);
         if (it != current->variables.end()) {
+            std::cout << "DEBUG findVariable: Found '" << name << "' in scope depth " << current->depth << std::endl;
             defScope = current;
             break;
         }
@@ -120,25 +147,39 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
     }
     
     if (defScope) {
+        std::cout << "DEBUG findVariable: Adding dependencies for '" << name << "'" << std::endl;
         // Add dependency to current scope
         addParentDep(scope, defScope->depth);
         
         // Add descendant dependencies to all parents up to definition
         LexicalScopeNode* parent = scope->parentFunctionScope;
+        int dep_traversal_count = 0;
         while (parent && parent != defScope) {
+            dep_traversal_count++;
+            std::cout << "DEBUG findVariable: Adding descendant dep to scope depth " << parent->depth << " (dep traversal #" << dep_traversal_count << ")" << std::endl;
+            
+            if (dep_traversal_count > 20) {
+                std::cout << "ERROR findVariable: Excessive dependency traversal (>20) for variable '" << name << "' - possible infinite loop" << std::endl;
+                throw std::runtime_error("Infinite loop detected in findVariable dependency traversal for variable: " + name);
+            }
+            
             addDescendantDep(parent, defScope->depth);
             parent = parent->parentFunctionScope;
         }
         
+        std::cout << "DEBUG findVariable: Dependencies added successfully for '" << name << "'" << std::endl;
         return &defScope->variables[name];
     }
     
     // Check current scope
+    std::cout << "DEBUG findVariable: Checking current scope for '" << name << "'" << std::endl;
     auto it = scope->variables.find(name);
     if (it != scope->variables.end()) {
+        std::cout << "DEBUG findVariable: Found '" << name << "' in current scope" << std::endl;
         return &it->second;
     }
     
+    std::cout << "DEBUG findVariable: Variable '" << name << "' not found" << std::endl;
     return nullptr;
 }
 
@@ -151,17 +192,9 @@ void Analyzer::addDescendantDep(LexicalScopeNode* scope, int depthIdx) {
 }
 
 void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
-    scope->updateAllNeeded();
+    printf("DEBUG updateAllNeededArrays: Processing scope at depth %d, type=%d\n", scope->depth, (int)scope->type);
     
-    // Update closure sizes now that allNeeded is calculated
-    for (auto& [name, varInfo] : scope->variables) {
-        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
-            // Calculate correct closure size: 8 bytes for function address + 8 bytes per needed scope
-            varInfo.size = 8 + (varInfo.funcNode->allNeeded.size() * 8);
-        }
-    }
-    
-    // Recursively update for all function scopes
+    // First, recursively process all child function scopes
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
@@ -169,9 +202,23 @@ void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
         }
     }
     
-    // Also update for LexicalScopeNode children
-    for (auto* child : scope->children) {
-        updateAllNeededArrays(child);
+    // Then update this scope's allNeeded
+    scope->updateAllNeeded();
+    
+    printf("DEBUG updateAllNeededArrays: Scope depth %d has %zu parent deps, %zu descendant deps, %zu total needed\n", 
+           scope->depth, scope->parentDeps.size(), scope->descendantDeps.size(), scope->allNeeded.size());
+    
+    // Update closure sizes now that allNeeded is calculated
+    for (auto& [name, varInfo] : scope->variables) {
+        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
+            // Calculate correct closure size: 8 bytes for function address + 8 bytes per needed scope
+            size_t old_size = varInfo.size;
+            printf("DEBUG updateAllNeededArrays: Closure '%s' funcNode=%p, funcNode->allNeeded.size()=%zu\n", 
+                   name.c_str(), varInfo.funcNode, varInfo.funcNode->allNeeded.size());
+            varInfo.size = 8 + (varInfo.funcNode->allNeeded.size() * 8);
+            printf("DEBUG updateAllNeededArrays: Updated closure '%s' size from %zu to %d (needs %zu scopes)\n", 
+                   name.c_str(), old_size, varInfo.size, varInfo.funcNode->allNeeded.size());
+        }
     }
 }
 
@@ -204,16 +251,12 @@ void Analyzer::setupParentPointers(ASTNode* node, LexicalScopeNode* parent, int 
 void Analyzer::packScopes(LexicalScopeNode* scope) {
     scope->pack();
     
-    // Recursively pack all function scopes
+    // Recursively pack all function scopes (they're in AST children)
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
             packScopes(func);
         }
     }
-    
-    // Also pack LexicalScopeNode children
-    for (auto* child : scope->children) {
-        packScopes(child);
-    }
+    // No need for separate scope children traversal - covered above
 }

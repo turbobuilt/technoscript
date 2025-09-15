@@ -132,6 +132,16 @@ public:
         return emitBytes({0x48, 0x8B, 0x81}) + emitU32(offset); // mov rax, [rcx + imm32]
     }
     
+    // Load from [r10 + offset] into RAX (useful for closure access)
+    size_t emitMovRAXFromR10PlusOffset(uint32_t offset) {
+        return emitBytes({0x49, 0x8B, 0x82}) + emitU32(offset); // mov rax, [r10 + imm32]
+    }
+    
+    // Load from [r11 + offset] into RAX (useful for closure access)
+    size_t emitMovRAXFromR11PlusOffset(uint32_t offset) {
+        return emitBytes({0x49, 0x8B, 0x83}) + emitU32(offset); // mov rax, [r11 + imm32]
+    }
+    
     // --- Flexible register helpers ---
     
     // Get register encoding for ModR/M byte (REX prefix handled separately)
