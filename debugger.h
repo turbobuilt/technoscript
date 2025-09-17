@@ -47,6 +47,13 @@ public:
     // Error handling
     std::string getLastError() const { return last_error; }
     
+    // Scope and closure debugging
+    void enableScopeTracing() { trace_scope_operations = true; }
+    void trackScopeAllocation(uint64_t address, const std::string& scope_name);
+    void trackClosureWrite(uint64_t address, uint64_t value, const std::string& context);
+    void dumpClosureContent(uint64_t closure_address, size_t closure_size);
+    void dumpScopeContent(uint64_t scope_address, size_t scope_size, const std::string& scope_name);
+    
 private:
     uc_engine* uc;
     csh capstone_handle;
@@ -67,15 +74,23 @@ private:
     // Memory allocation tracking for syscalls
     uint64_t next_alloc_address;
     
+    // Scope and closure tracking
+    std::map<uint64_t, std::string> scope_addresses;  // Track allocated scope addresses
+    std::map<uint64_t, std::string> closure_addresses; // Track closure objects
+    bool trace_scope_operations;
+    
     // Callbacks
     static void hookCode(uc_engine* uc, uint64_t address, uint32_t size, void* user_data);
     static void hookMemoryInvalid(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
     static bool hookMemoryUnmapped(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
+    static void hookMemoryWrite(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
+    static void hookMemoryRead(uc_engine* uc, uc_mem_type type, uint64_t address, int size, void* user_data);
     static void hookInterrupt(uc_engine* uc, uint32_t intno, void* user_data);
     
     // Helper methods
     void printInstruction(uint64_t address, const uint8_t* code, size_t size);
     void handleExternalCall(uint64_t address);
+    void handleSyscall(uc_engine* uc);  // Unified syscall handler
     
     // Register names for debugging
     std::string getRegisterName(uc_x86_reg reg);

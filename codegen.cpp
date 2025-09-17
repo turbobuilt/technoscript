@@ -86,12 +86,19 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             
             // Check if this identifier refers to a closure (function)
             if (identifier->varRef && identifier->varRef->type == DataType::CLOSURE) {
-                // Treat this as a function call
-                FunctionCallNode dummy_call(identifier->value);
-                dummy_call.type = ASTNodeType::FUNCTION_CALL;
-                // Copy varRef for function resolution
-                dummy_call.varRef = identifier->varRef;
-                total_length += generateClosureCall(&dummy_call, current_scope);
+                // Only treat this as a function call if we're not in closure creation mode
+                if (!in_closure_creation) {
+                    // Treat this as a function call
+                    FunctionCallNode dummy_call(identifier->value);
+                    dummy_call.type = ASTNodeType::FUNCTION_CALL;
+                    // Copy varRef for function resolution
+                    dummy_call.varRef = identifier->varRef;
+                    total_length += generateClosureCall(&dummy_call, current_scope);
+                } else {
+                    // During closure creation, just load the identifier address without calling
+                    printf("DEBUG generateNode: In closure creation mode - loading identifier '%s' address only (not calling)\n", identifier->value.c_str());
+                    total_length += generateIdentifier(identifier);
+                }
             } else {
                 total_length += generateIdentifier(identifier);
             }
@@ -421,7 +428,7 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
     // Now handle hidden scope parameters (they come after regular parameters)
     // Load closure defining scope address first
     total_length += loadVariableDefiningScopeAddressIntoRegister(funcCall, Register::R10);
-    auto variable_offset = funcCall->getVariableAccess().offset;
+    auto closure_start_offset = funcCall->getVariableAccess().offset;
     
     for (size_t i = 0; i < targetFunc->hiddenParamsInfo.size(); i++) {
         size_t param_index = funcCall->args.size() + i;
@@ -429,10 +436,10 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
         
         // Load scope address from closure structure
         size_t scope_offset_in_closure = 8 + (i * 8); // Function addr at 0, scopes at 8, 16, 24...
-        auto total_offset = scope_offset_in_closure + variable_offset;
-        
-        printf("DEBUG: Loading hidden param %zu: closure offset=%zu, variable_offset=%zu, total_offset=%zu\n", 
-               i, scope_offset_in_closure, static_cast<size_t>(variable_offset), total_offset);
+        auto total_offset = closure_start_offset + scope_offset_in_closure;
+
+        printf("DEBUG: Loading hidden param %zu: closure offset=%zu, closure_start_offset=%zu, total_offset=%zu\n",
+               i, scope_offset_in_closure, static_cast<size_t>(closure_start_offset), total_offset);
         
         // Load scope address into RAX
         a.mov(x86::rax, x86::qword_ptr(x86::r10, static_cast<int32_t>(total_offset)));
@@ -477,7 +484,7 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
     
     // Load function address from closure and call
     // Use the closure address already loaded in R10
-    a.mov(x86::rax, x86::qword_ptr(x86::r10, static_cast<int32_t>(variable_offset))); // Function address at closure base
+    a.mov(x86::rax, x86::qword_ptr(x86::r10, static_cast<int32_t>(closure_start_offset))); // Function address at closure base
     
     printf("DEBUG: About to call function\n");
     // Call the function 
@@ -519,6 +526,10 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
     
     printf("DEBUG createClosures: Starting for scope at depth %d, type=%d\n", scope->depth, (int)scope->type);
     printf("DEBUG createClosures: Scope has %zu variables\n", scope->variables.size());
+    
+    // Set flag to prevent function calls during closure creation
+    bool old_in_closure_creation = in_closure_creation;
+    in_closure_creation = true;
     
     // Loop through all variables in this scope
     for (auto& [name, varInfo] : scope->variables) {
@@ -686,6 +697,9 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
             }
         }
     }
+    
+    // Restore the previous closure creation flag
+    in_closure_creation = old_in_closure_creation;
     
     return total_length;
 }

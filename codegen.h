@@ -52,6 +52,7 @@ private:
     std::unordered_map<std::string, uint64_t> extern_function_addresses;
     std::vector<FunctionPatch> function_patches; // Patches to apply later
     std::unordered_map<FunctionDeclNode*, asmjit::Label> function_labels; // Map functions to labels
+    bool in_closure_creation = false; // Flag to track when we're creating closures (prevents function calls)
     
     // Initialize external function addresses
     void initExternFunctions();

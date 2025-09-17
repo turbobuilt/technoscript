@@ -43,6 +43,12 @@ bool UnicornDebugger::initialize() {
     // Hook unmapped memory access  
     uc_hook_add(uc, &hook, UC_HOOK_MEM_UNMAPPED, (void*)hookMemoryUnmapped, this, 1, 0);
     
+    // Hook memory writes to trace closure creation
+    uc_hook_add(uc, &hook, UC_HOOK_MEM_WRITE, (void*)hookMemoryWrite, this, 1, 0);
+    
+    // Hook memory reads to trace closure access  
+    uc_hook_add(uc, &hook, UC_HOOK_MEM_READ, (void*)hookMemoryRead, this, 1, 0);
+    
     // Hook interrupts (syscalls)
     uc_hook_add(uc, &hook, UC_HOOK_INTR, (void*)hookInterrupt, this, 1, 0);
     
@@ -56,8 +62,9 @@ bool UnicornDebugger::setupMemory(uint64_t heap_start, uint64_t heap_size_param,
     this->stack_base = stack_start;
     this->stack_size = stack_size_param;
     
-    // Set up allocation tracking - start allocations after heap
-    this->next_alloc_address = heap_start + heap_size_param;
+    // Set up allocation tracking - start allocations after heap and alloc region
+    uint64_t alloc_region_size_const = 0x100000; // 1MB allocation region (matches setupMemory)
+    this->next_alloc_address = heap_start + heap_size_param + alloc_region_size_const;
     
     // Ensure sizes are page-aligned (4KB)
     size_t aligned_heap_size = (heap_size_param + 4095) & ~4095;
@@ -308,49 +315,8 @@ void UnicornDebugger::hookCode(uc_engine* uc, uint64_t address, uint32_t size, v
     if (size >= 2 && code[0] == 0x0f && code[1] == 0x05) {
         std::cout << "UNICORN: Syscall detected at 0x" << std::hex << address << std::dec << std::endl;
         
-        uint64_t rax, rdi, rsi, rdx;
-        uc_reg_read(uc, UC_X86_REG_RAX, &rax);
-        uc_reg_read(uc, UC_X86_REG_RDI, &rdi);
-        uc_reg_read(uc, UC_X86_REG_RSI, &rsi);
-        uc_reg_read(uc, UC_X86_REG_RDX, &rdx);
-        
-        std::cout << "UNICORN: Syscall intercepted - rax=" << rax << ", rdi=" << rdi << ", rsi=" << rsi << ", rdx=" << rdx << std::endl;
-        
-        if (rax == 12) { // brk/mmap syscall
-            // This appears to be mmap - allocate memory
-            uint64_t size = rdi;  // Size might be in different register based on calling convention
-            if (size == 0) {
-                // If size is 0, this might be asking for current break
-                uc_reg_write(uc, UC_X86_REG_RAX, &debugger->next_alloc_address);
-            } else {
-                // Allocate memory by returning a valid address
-                uint64_t allocated_addr = debugger->next_alloc_address;
-                size_t aligned_size = (size + 4095) & ~4095; // Align to page boundary
-                
-                // Map the memory region in Unicorn
-                uc_err err = uc_mem_map(uc, allocated_addr, aligned_size, UC_PROT_READ | UC_PROT_WRITE);
-                if (err != UC_ERR_OK) {
-                    std::cout << "UNICORN: Failed to map allocated memory: " << uc_strerror(err) << std::endl;
-                    uint64_t error_result = 0;
-                    uc_reg_write(uc, UC_X86_REG_RAX, &error_result);
-                } else {
-                    debugger->next_alloc_address += aligned_size;
-                    std::cout << "UNICORN: Allocated and mapped " << size << " bytes at 0x" << std::hex << allocated_addr << std::dec << std::endl;
-                    uc_reg_write(uc, UC_X86_REG_RAX, &allocated_addr);
-                }
-            }
-        } else if (rax == 60) { // exit syscall
-            std::cout << "UNICORN: Program exit requested with code " << rdi << std::endl;
-            // Stop execution by setting RIP to end
-            uint64_t end_addr = debugger->code_base + debugger->code_size;
-            uc_reg_write(uc, UC_X86_REG_RIP, &end_addr);
-            return;
-        } else {
-            std::cout << "UNICORN: Unknown syscall " << rax << std::endl;
-            // Return 0 for unknown syscalls
-            uint64_t result = 0;
-            uc_reg_write(uc, UC_X86_REG_RAX, &result);
-        }
+        // Handle the syscall using unified logic
+        debugger->handleSyscall(uc);
         
         // Skip the syscall instruction
         uint64_t next_addr = address + 2;
@@ -404,50 +370,120 @@ bool UnicornDebugger::hookMemoryUnmapped(uc_engine* uc, uc_mem_type type, uint64
     return false; // Don't continue execution
 }
 
+void UnicornDebugger::hookMemoryWrite(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data) {
+    UnicornDebugger* debugger = static_cast<UnicornDebugger*>(user_data);
+    
+    // Only log 8-byte writes (likely scope addresses) to allocated scope regions
+    if (size == 8) {
+        uint64_t rip = debugger->getRegister(UC_X86_REG_RIP);
+        uint64_t r15 = debugger->getRegister(UC_X86_REG_R15);
+        
+        // Check if this is writing to a recently allocated scope region
+        // We can identify this by checking if the address is in our allocation range
+        if (address >= 0xa00000) { // Our allocation range starts here
+            std::cout << "UNICORN: *** MEMORY WRITE *** addr=0x" << std::hex << address 
+                     << " value=0x" << value << " size=" << std::dec << size 
+                     << " from RIP=0x" << std::hex << rip << " R15=0x" << r15 << std::dec << std::endl;
+        }
+    }
+}
+
+void UnicornDebugger::hookMemoryRead(uc_engine* uc, uc_mem_type type, uint64_t address, int size, void* user_data) {
+    UnicornDebugger* debugger = static_cast<UnicornDebugger*>(user_data);
+    
+    // Only log specific closure reads - be very selective
+    if (size == 8 && (address == 0x1401018 || address == 0x1401020 || address == 0x1401028)) {
+        uint64_t rip = debugger->getRegister(UC_X86_REG_RIP);
+        
+        // Read the actual value to see what's being loaded
+        uint64_t value = 0;
+        uc_mem_read(uc, address, &value, 8);
+        
+        std::cout << "UNICORN: *** CLOSURE READ *** addr=0x" << std::hex << address 
+                 << " value=0x" << value << " from RIP=0x" << rip << std::dec << std::endl;
+    }
+}
+
 void UnicornDebugger::hookInterrupt(uc_engine* uc, uint32_t intno, void* user_data) {
     UnicornDebugger* debugger = static_cast<UnicornDebugger*>(user_data);
     
     if (intno == 0x80) { // Syscall interrupt
-        uint64_t rax, rdi, rsi, rdx;
-        uc_reg_read(uc, UC_X86_REG_RAX, &rax);
-        uc_reg_read(uc, UC_X86_REG_RDI, &rdi);
-        uc_reg_read(uc, UC_X86_REG_RSI, &rsi);
-        uc_reg_read(uc, UC_X86_REG_RDX, &rdx);
+        std::cout << "UNICORN: Syscall interrupt detected" << std::endl;
         
-        std::cout << "UNICORN: Syscall intercepted - rax=" << rax << ", rdi=" << rdi << ", rsi=" << rsi << ", rdx=" << rdx << std::endl;
+        // Handle the syscall using unified logic
+        debugger->handleSyscall(uc);
         
-        if (rax == 12) { // brk/mmap syscall
-            // This appears to be mmap - allocate memory
-            uint64_t size = rdi;  // Size might be in different register based on calling convention
-            if (size == 0) {
-                // If size is 0, this might be asking for current break
-                uc_reg_write(uc, UC_X86_REG_RAX, &debugger->next_alloc_address);
-            } else {
-                // Allocate memory by returning a valid address
-                uint64_t allocated_addr = debugger->next_alloc_address;
-                size_t aligned_size = (size + 4095) & ~4095; // Align to page boundary
-                
-                // Map the memory region in Unicorn
-                uc_err err = uc_mem_map(uc, allocated_addr, aligned_size, UC_PROT_READ | UC_PROT_WRITE);
-                if (err != UC_ERR_OK) {
-                    std::cout << "UNICORN: Failed to map allocated memory: " << uc_strerror(err) << std::endl;
-                    uint64_t error_result = 0;
-                    uc_reg_write(uc, UC_X86_REG_RAX, &error_result);
-                } else {
-                    debugger->next_alloc_address += aligned_size;
-                    std::cout << "UNICORN: Allocated and mapped " << size << " bytes at 0x" << std::hex << allocated_addr << std::dec << std::endl;
-                    uc_reg_write(uc, UC_X86_REG_RAX, &allocated_addr);
-                }
-            }
-        } else if (rax == 60) { // exit syscall
-            std::cout << "UNICORN: Program exit requested with code " << rdi << std::endl;
-            // Stop execution by returning
-            return;
+        // For int 0x80, the instruction is already executed, no need to advance RIP
+    }
+}
+
+void UnicornDebugger::handleSyscall(uc_engine* uc) {
+    uint64_t rax, rdi, rsi, rdx, rip, r15;
+    uc_reg_read(uc, UC_X86_REG_RAX, &rax);
+    uc_reg_read(uc, UC_X86_REG_RDI, &rdi);
+    uc_reg_read(uc, UC_X86_REG_RSI, &rsi);
+    uc_reg_read(uc, UC_X86_REG_RDX, &rdx);
+    uc_reg_read(uc, UC_X86_REG_RIP, &rip);
+    uc_reg_read(uc, UC_X86_REG_R15, &r15);
+    
+    std::cout << "UNICORN: Syscall intercepted at RIP=0x" << std::hex << rip << ", R15=0x" << r15 << std::dec 
+              << " - rax=" << rax << ", rdi=" << rdi << ", rsi=" << rsi << ", rdx=" << rdx << std::endl;
+    
+    if (rax == 12) { // brk/mmap syscall
+        uint64_t size = rdi;
+        if (size == 0) {
+            // If size is 0, return current break address
+            uc_reg_write(uc, UC_X86_REG_RAX, &next_alloc_address);
+            std::cout << "UNICORN: Returning current break address: 0x" << std::hex << next_alloc_address << std::dec << std::endl;
         } else {
-            std::cout << "UNICORN: Unknown syscall " << rax << std::endl;
-            // Return 0 for unknown syscalls
-            uint64_t result = 0;
-            uc_reg_write(uc, UC_X86_REG_RAX, &result);
+            // Allocate memory by returning a valid address
+            uint64_t allocated_addr = next_alloc_address;
+            size_t aligned_size = (size + 4095) & ~4095; // Align to page boundary
+            
+            // Check if this region would overlap with existing mapped regions
+            // Check against heap, stack, and code regions
+            bool overlaps = false;
+            if ((allocated_addr < heap_base + heap_size && allocated_addr + aligned_size > heap_base) ||
+                (allocated_addr < stack_base + stack_size && allocated_addr + aligned_size > stack_base) ||
+                (allocated_addr < code_base + code_size && allocated_addr + aligned_size > code_base)) {
+                overlaps = true;
+            }
+            
+            if (overlaps) {
+                std::cout << "UNICORN: Memory region would overlap, advancing allocation address" << std::endl;
+                // Find a non-overlapping region
+                next_alloc_address = std::max({heap_base + heap_size, stack_base + stack_size, code_base + code_size});
+                next_alloc_address = (next_alloc_address + 4095) & ~4095; // Align
+                allocated_addr = next_alloc_address;
+            }
+            
+            // Map the memory region in Unicorn
+            uc_err err = uc_mem_map(uc, allocated_addr, aligned_size, UC_PROT_READ | UC_PROT_WRITE);
+            if (err != UC_ERR_OK) {
+                std::cout << "UNICORN: Failed to map allocated memory at 0x" << std::hex << allocated_addr 
+                         << " size 0x" << aligned_size << ": " << uc_strerror(err) << std::dec << std::endl;
+                
+                // Instead of returning 0 and causing crashes, terminate the program immediately
+                std::cout << "UNICORN: FATAL: Memory allocation failed - terminating execution" << std::endl;
+                uint64_t end_addr = code_base + code_size;
+                uc_reg_write(uc, UC_X86_REG_RIP, &end_addr);
+                return;
+            } else {
+                next_alloc_address += aligned_size;
+                std::cout << "UNICORN: *** SCOPE ALLOCATION *** " << size << " bytes at 0x" << std::hex << allocated_addr 
+                         << " (aligned size: 0x" << aligned_size << ") from RIP=0x" << rip << ", current R15=0x" << r15 << std::dec << std::endl;
+                uc_reg_write(uc, UC_X86_REG_RAX, &allocated_addr);
+            }
         }
+    } else if (rax == 60) { // exit syscall
+        std::cout << "UNICORN: Program exit requested with code " << rdi << std::endl;
+        // Stop execution by setting RIP to end
+        uint64_t end_addr = code_base + code_size;
+        uc_reg_write(uc, UC_X86_REG_RIP, &end_addr);
+    } else {
+        std::cout << "UNICORN: Unknown syscall " << rax << std::endl;
+        // Return 0 for unknown syscalls
+        uint64_t result = 0;
+        uc_reg_write(uc, UC_X86_REG_RAX, &result);
     }
 }
