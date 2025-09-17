@@ -1,11 +1,11 @@
 #pragma once
 #include "ast.h"
-#include "emitter.h"
 #include "library.h"
 #include "debugger.h"
 #include <unordered_map>
 #include <sys/mman.h>
 #include <capstone/capstone.h>
+#include <asmjit/asmjit.h>
 
 // Enum for commonly used registers
 enum class Register {
@@ -29,25 +29,29 @@ enum class Register {
 
 // Structure to track function address patches
 struct FunctionPatch {
-    size_t offset_in_buffer;     // Exact offset in machine code where 8-byte address needs to be patched
-    FunctionDeclNode* func;      // Function node to get address from later (nullptr for string patches)
+    asmjit::Label label;         // AsmJit label for the function
+    FunctionDeclNode* func;      // Function node to bind the label to
     size_t string_offset;        // For string patches: offset of string in buffer
     bool is_string_patch;        // True if this is a string address patch, false for function patch
     
     // Constructor for function patches
-    FunctionPatch(size_t offset, FunctionDeclNode* f) 
-        : offset_in_buffer(offset), func(f), string_offset(0), is_string_patch(false) {}
+    FunctionPatch(asmjit::Label lbl, FunctionDeclNode* f) 
+        : label(lbl), func(f), string_offset(0), is_string_patch(false) {}
     
     // Constructor for string patches  
-    FunctionPatch(size_t offset, FunctionDeclNode* f, size_t str_offset, bool is_str)
-        : offset_in_buffer(offset), func(f), string_offset(str_offset), is_string_patch(is_str) {}
+    FunctionPatch(asmjit::Label lbl, FunctionDeclNode* f, size_t str_offset, bool is_str)
+        : label(lbl), func(f), string_offset(str_offset), is_string_patch(is_str) {}
 };
 
 class Codegen {
 private:
-    Emitter emitter;
+    asmjit::JitRuntime rt;
+    asmjit::CodeHolder code;
+    asmjit::x86::Assembler a;
+    std::vector<uint8_t> buffer;
     std::unordered_map<std::string, uint64_t> extern_function_addresses;
     std::vector<FunctionPatch> function_patches; // Patches to apply later
+    std::unordered_map<FunctionDeclNode*, asmjit::Label> function_labels; // Map functions to labels
     
     // Initialize external function addresses
     void initExternFunctions();
@@ -92,5 +96,5 @@ public:
     void runWithUnicornDebugger();
     
     // Get the raw machine code
-    const std::vector<uint8_t>& getCode() const { return emitter.buffer; }
+    const std::vector<uint8_t>& getCode() const { return buffer; }
 };

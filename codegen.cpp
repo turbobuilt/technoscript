@@ -4,6 +4,11 @@
 #include <cstring>
 #include <iomanip>
 
+using namespace asmjit;
+
+// Resolve NodeType ambiguity by using our AST NodeType explicitly
+using ASTNodeType = ::NodeType;
+
 void Codegen::initExternFunctions() {
     // Get addresses of extern C functions for maximum performance
     uint64_t print_addr = reinterpret_cast<uint64_t>(print_int64);
@@ -13,41 +18,41 @@ void Codegen::initExternFunctions() {
 }
 
 size_t Codegen::allocateScope(LexicalScopeNode* scope, bool is_global) {
-    size_t total_length = 0;
+    size_t start_pos = buffer.size();
     
     // Save R15 (current lexical scope pointer) on stack
-    total_length += emitter.emitBytes({0x41, 0x57}); // push r15
+    a.push(x86::r15);
     
     // Get current brk (program break) - this will be our allocated memory
-    total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
-    total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
-    total_length += emitter.emitSyscall();
+    a.mov(x86::rax, 12);                  // sys_brk (12)
+    a.xor_(x86::rdi, x86::rdi);           // xor rdi, rdi (0)
+    a.syscall();
     
     // Save current brk in RBX
-    total_length += emitter.emitBytes({0x48, 0x89, 0xC3}); // mov rbx, rax
+    a.mov(x86::rbx, x86::rax);
     
     // Set new brk to current + scope size
-    total_length += emitter.emitMovRAXImm64(12);       // sys_brk
-    total_length += emitter.emitBytes({0x48, 0x89, 0xD9}); // mov rcx, rbx  
-    total_length += emitter.emitBytes({0x48, 0x81, 0xC1}); // add rcx, imm32
-    total_length += emitter.emitU32(static_cast<uint32_t>(scope->totalSize));
-    total_length += emitter.emitBytes({0x49, 0x89, 0xCA}); // mov r10, rcx (use R10 instead of RDI)
-    total_length += emitter.emitBytes({0x4C, 0x89, 0xD7}); // mov rdi, r10 (move to RDI only for syscall)
-    total_length += emitter.emitSyscall();
-    total_length += emitter.emitBytes({0x4C, 0x89, 0xD1}); // mov rcx, r10 (restore rcx from r10 for later use)
+    a.mov(x86::rax, 12);                  // sys_brk
+    a.mov(x86::rcx, x86::rbx);
+    a.add(x86::rcx, static_cast<uint32_t>(scope->totalSize));
+    a.mov(x86::r10, x86::rcx);            // use R10 instead of RDI
+    a.mov(x86::rdi, x86::r10);            // move to RDI only for syscall
+    a.syscall();
+    a.mov(x86::rcx, x86::r10);            // restore rcx from r10 for later use
     
     // Use the old brk value as our allocated memory
-    total_length += emitter.emitBytes({0x48, 0x89, 0xD8}); // mov rax, rbx
+    a.mov(x86::rax, x86::rbx);
     
     // Move allocated memory address to R15 (our lexical scope pointer)
-    total_length += emitter.emitMovR15RAX();
+    a.mov(x86::r15, x86::rax);
     
-    return total_length;
+    return buffer.size() - start_pos;
 }
 
 size_t Codegen::restoreScope() {
     // Restore previous R15 value from stack
-    return emitter.emitPopR15();
+    a.pop(x86::r15);
+    return 2; // pop r15 is 2 bytes
 }
 
 size_t Codegen::setupScope(LexicalScopeNode* scope, bool is_global) {
@@ -66,24 +71,24 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
     size_t total_length = 0;
     
     switch (node->type) {
-        case NodeType::VAR_DECL: {
+        case ASTNodeType::VAR_DECL: {
             VarDeclNode* varDecl = static_cast<VarDeclNode*>(node);
             total_length += generateVarDecl(varDecl, current_scope);
             break;
         }
-        case NodeType::LITERAL: {
+        case ASTNodeType::LITERAL: {
             LiteralNode* literal = static_cast<LiteralNode*>(node);
             total_length += generateLiteral(literal);
             break;
         }
-        case NodeType::IDENTIFIER: {
+        case ASTNodeType::IDENTIFIER: {
             IdentifierNode* identifier = static_cast<IdentifierNode*>(node);
             
             // Check if this identifier refers to a closure (function)
             if (identifier->varRef && identifier->varRef->type == DataType::CLOSURE) {
                 // Treat this as a function call
                 FunctionCallNode dummy_call(identifier->value);
-                dummy_call.type = NodeType::FUNCTION_CALL;
+                dummy_call.type = ASTNodeType::FUNCTION_CALL;
                 // Copy varRef for function resolution
                 dummy_call.varRef = identifier->varRef;
                 total_length += generateClosureCall(&dummy_call, current_scope);
@@ -92,18 +97,25 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             }
             break;
         }
-        case NodeType::PRINT_STMT: {
+        case ASTNodeType::PRINT_STMT: {
             total_length += generatePrintStatement(node, current_scope);
             break;
         }
-        case NodeType::FUNCTION_DECL: {
+        case ASTNodeType::FUNCTION_DECL: {
             FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(node);
             
             printf("DEBUG: === STARTING code generation for function '%s' at depth=%d ===\n", 
                    funcDecl->funcName.c_str(), funcDecl->depth);
             
-            // Set the function address to current position in buffer
-            funcDecl->functionAddress = emitter.buffer.size();
+            // Bind the label for this function if it exists
+            auto labelIt = function_labels.find(funcDecl);
+            if (labelIt != function_labels.end()) {
+                a.bind(labelIt->second);
+                printf("DEBUG: Bound label for function '%s'\n", funcDecl->funcName.c_str());
+            }
+            
+            // Set the function address to current position in buffer (for legacy compatibility)
+            funcDecl->functionAddress = a.offset();
             printf("DEBUG: Function '%s' assigned address offset 0x%lx\n", funcDecl->funcName.c_str(), funcDecl->functionAddress);
             
             printf("DEBUG: === STARTING function prologue for '%s' ===\n", funcDecl->funcName.c_str());
@@ -112,52 +124,49 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
             
             // NEW STANDARD ABI CALLING CONVENTION PROLOGUE:
             // 1. Standard function prologue
-            total_length += emitter.emitBytes({0x55}); // push rbp
-            total_length += emitter.emitBytes({0x48, 0x89, 0xE5}); // mov rbp, rsp
+            a.push(x86::rbp);         // push rbp
+            a.mov(x86::rbp, x86::rsp); // mov rbp, rsp
             
             // 2. First, save all parameter registers to the stack before we allocate scope
             // This prevents them from being corrupted during heap allocation
             printf("DEBUG: Saving parameter registers before heap allocation\n");
-            total_length += emitter.emitBytes({0x57}); // push rdi
-            total_length += emitter.emitBytes({0x56}); // push rsi  
-            total_length += emitter.emitBytes({0x52}); // push rdx
-            total_length += emitter.emitBytes({0x51}); // push rcx
-            total_length += emitter.emitBytes({0x41, 0x50}); // push r8
-            total_length += emitter.emitBytes({0x41, 0x51}); // push r9
+            a.push(x86::rdi);  // push rdi
+            a.push(x86::rsi);  // push rsi  
+            a.push(x86::rdx);  // push rdx
+            a.push(x86::rcx);  // push rcx
+            a.push(x86::r8);   // push r8
+            a.push(x86::r9);   // push r9
             
             // 3. Allocate lexical scope for this function (now safe to use registers)
             printf("DEBUG: Allocating heap memory for function scope (size=%d)\n", funcDecl->totalSize);
-            total_length += emitter.emitMovRAXImm64(12);       // sys_brk (12)
-            total_length += emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
-            total_length += emitter.emitSyscall();
+            a.mov(x86::rax, 12);        // sys_brk (12)
+            a.xor_(x86::rdi, x86::rdi); // xor rdi, rdi (0)
+            a.syscall();
             
             // Save current brk in RBX (non-parameter register)
-            total_length += emitter.emitBytes({0x48, 0x89, 0xC3}); // mov rbx, rax
+            a.mov(x86::rbx, x86::rax);  // mov rbx, rax
             
             // Set new brk to current + scope size
-            total_length += emitter.emitMovRAXImm64(12);       // sys_brk
-            total_length += emitter.emitBytes({0x48, 0x89, 0xDA}); // mov rdx, rbx  
-            total_length += emitter.emitBytes({0x48, 0x81, 0xC2}); // add rdx, imm32
-            total_length += emitter.emitU32(static_cast<uint32_t>(funcDecl->totalSize));
-            total_length += emitter.emitBytes({0x48, 0x89, 0xD7}); // mov rdi, rdx
-            total_length += emitter.emitSyscall();
+            a.mov(x86::rax, 12);        // sys_brk
+            a.mov(x86::rdx, x86::rbx);  // mov rdx, rbx  
+            a.add(x86::rdx, static_cast<uint32_t>(funcDecl->totalSize)); // add rdx, imm32
+            a.mov(x86::rdi, x86::rdx);  // mov rdi, rdx
+            a.syscall();
             
             // Set R15 to allocated scope (old brk value in RBX)
-            total_length += emitter.emitBytes({0x49, 0x89, 0xDF}); // mov r15, rbx
+            a.mov(x86::r15, x86::rbx);  // mov r15, rbx
             
             // 4. Now restore parameter registers from stack and copy to lexical scope
             // Restore in reverse order
-            total_length += emitter.emitBytes({0x41, 0x59}); // pop r9
-            total_length += emitter.emitBytes({0x41, 0x58}); // pop r8
-            total_length += emitter.emitBytes({0x59}); // pop rcx
-            total_length += emitter.emitBytes({0x5A}); // pop rdx
-            total_length += emitter.emitBytes({0x5E}); // pop rsi
-            total_length += emitter.emitBytes({0x5F}); // pop rdi
+            a.pop(x86::r9);    // pop r9
+            a.pop(x86::r8);    // pop r8
+            a.pop(x86::rcx);   // pop rcx
+            a.pop(x86::rdx);   // pop rdx
+            a.pop(x86::rsi);   // pop rsi
+            a.pop(x86::rdi);   // pop rdi
             
             // 3. Copy parameters from standard calling convention to lexical scope
             // Standard x86-64 calling convention registers: RDI, RSI, RDX, RCX, R8, R9
-            
-            size_t total_params = funcDecl->params.size() + funcDecl->hiddenParamsInfo.size();
             
             // Copy regular parameters first
             for (size_t i = 0; i < funcDecl->params.size(); i++) {
@@ -175,40 +184,30 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
                     switch(i) {
                         case 0: // RDI
                             printf("DEBUG: Copying from RDI to R15+%d\n", paramOffset);
-                            total_length += emitter.emitBytes({0x49, 0x89, 0xBF}); // mov [r15 + disp32], rdi
-                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::rdi);
                             break;
                         case 1: // RSI  
                             printf("DEBUG: Copying from RSI to R15+%d\n", paramOffset);
-                            total_length += emitter.emitBytes({0x49, 0x89, 0xB7}); // mov [r15 + disp32], rsi
-                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::rsi);
                             break;
                         case 2: // RDX
-                            total_length += emitter.emitBytes({0x49, 0x89, 0x97}); // mov [r15 + disp32], rdx
-                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::rdx);
                             break;
                         case 3: // RCX
-                            total_length += emitter.emitBytes({0x49, 0x89, 0x8F}); // mov [r15 + disp32], rcx
-                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::rcx);
                             break;
                         case 4: // R8
-                            total_length += emitter.emitBytes({0x4D, 0x89, 0x87}); // mov [r15 + disp32], r8
-                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::r8);
                             break;
                         case 5: // R9
-                            total_length += emitter.emitBytes({0x4D, 0x89, 0x8F}); // mov [r15 + disp32], r9
-                            total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                            a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::r9);
                             break;
                     }
                 } else {
                     // Parameter came on stack - load from stack and store to lexical scope
                     size_t stack_offset = 16 + ((i - 6) * 8); // Skip saved rbp + return addr
-                    // mov rax, [rbp + stack_offset]
-                    total_length += emitter.emitBytes({0x48, 0x8B, 0x85}); // mov rax, [rbp + offset]
-                    total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
-                    // mov [r15 + paramOffset], rax
-                    total_length += emitter.emitBytes({0x49, 0x89, 0x87}); // mov [r15 + offset], rax
-                    total_length += emitter.emitU32(static_cast<uint32_t>(paramOffset));
+                    a.mov(x86::rax, x86::qword_ptr(x86::rbp, stack_offset));
+                    a.mov(x86::qword_ptr(x86::r15, paramOffset), x86::rax);
                 }
             }
             
@@ -225,39 +224,29 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
                     switch(param_index) {
                         case 0: // RDI
                             printf("DEBUG: Copying scope from RDI to R15+%d\n", scopeOffset);
-                            total_length += emitter.emitBytes({0x49, 0x89, 0xBF}); // mov [r15 + disp32], rdi
-                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::rdi);
                             break;
                         case 1: // RSI  
-                            total_length += emitter.emitBytes({0x49, 0x89, 0xB7}); // mov [r15 + disp32], rsi
-                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::rsi);
                             break;
                         case 2: // RDX
-                            total_length += emitter.emitBytes({0x49, 0x89, 0x97}); // mov [r15 + disp32], rdx
-                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::rdx);
                             break;
                         case 3: // RCX
-                            total_length += emitter.emitBytes({0x49, 0x89, 0x8F}); // mov [r15 + disp32], rcx
-                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::rcx);
                             break;
                         case 4: // R8
-                            total_length += emitter.emitBytes({0x4D, 0x89, 0x87}); // mov [r15 + disp32], r8
-                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::r8);
                             break;
                         case 5: // R9
-                            total_length += emitter.emitBytes({0x4D, 0x89, 0x8F}); // mov [r15 + disp32], r9
-                            total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                            a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::r9);
                             break;
                     }
                 } else {
                     // Scope address came on stack
                     size_t stack_offset = 16 + ((param_index - 6) * 8);
-                    // mov rax, [rbp + stack_offset]
-                    total_length += emitter.emitBytes({0x48, 0x8B, 0x85}); // mov rax, [rbp + offset]
-                    total_length += emitter.emitU32(static_cast<uint32_t>(stack_offset));
-                    // mov [r15 + scopeOffset], rax
-                    total_length += emitter.emitBytes({0x49, 0x89, 0x87}); // mov [r15 + offset], rax
-                    total_length += emitter.emitU32(static_cast<uint32_t>(scopeOffset));
+                    a.mov(x86::rax, x86::qword_ptr(x86::rbp, stack_offset));
+                    a.mov(x86::qword_ptr(x86::r15, scopeOffset), x86::rax);
                 }
             }
             
@@ -275,25 +264,25 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
                    funcDecl->funcName.c_str(), funcDecl->depth);
             
             // 6. Standard epilogue (no R15 restoration needed)
-            total_length += emitter.emitBytes({0x48, 0x89, 0xEC}); // mov rsp, rbp
-            total_length += emitter.emitBytes({0x5D}); // pop rbp
-            total_length += emitter.emitBytes({0xC3}); // ret
+            a.mov(x86::rsp, x86::rbp);  // mov rsp, rbp
+            a.pop(x86::rbp);            // pop rbp
+            a.ret();                    // ret
             
             break;
         }
-        case NodeType::FUNCTION_CALL: {
+        case ASTNodeType::FUNCTION_CALL: {
             FunctionCallNode* funcCall = static_cast<FunctionCallNode*>(node);
             total_length += generateClosureCall(funcCall, current_scope);
             break;
         }
-        case NodeType::GO_STMT:
+        case ASTNodeType::GO_STMT:
             // TODO: Implement these later
             break;
         default:
             printf("DEBUG: Unhandled node type: %d\n", (int)node->type);
             
             // Special handling for identifiers that might be function calls
-            if (node->type == NodeType::IDENTIFIER) {
+            if (node->type == ASTNodeType::IDENTIFIER) {
                 IdentifierNode* identifier = static_cast<IdentifierNode*>(node);
                 printf("DEBUG: Processing identifier: %s\n", identifier->value.c_str());
                 printf("DEBUG: varRef = %p\n", identifier->varRef);
@@ -308,7 +297,7 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
                     
                     // Treat this as a function call
                     FunctionCallNode dummy_call(identifier->value);
-                    dummy_call.type = NodeType::FUNCTION_CALL;
+                    dummy_call.type = ASTNodeType::FUNCTION_CALL;
                     total_length += generateClosureCall(&dummy_call, current_scope);
                     break;
                 } else {
@@ -327,7 +316,7 @@ size_t Codegen::generateNode(ASTNode* node, LexicalScopeNode* current_scope) {
 }
 
 size_t Codegen::generateVarDecl(VarDeclNode* varDecl, LexicalScopeNode* current_scope) {
-    size_t total_length = 0;
+    size_t start_pos = buffer.size();
     
     // Find the variable info in the current scope
     auto it = current_scope->variables.find(varDecl->varName);
@@ -341,24 +330,26 @@ size_t Codegen::generateVarDecl(VarDeclNode* varDecl, LexicalScopeNode* current_
     // Generate code for the initializer (if any)
     if (!varDecl->children.empty()) {
         // Assuming first child is the initializer
-        total_length += generateNode(varDecl->children[0].get(), current_scope);
+        generateNode(varDecl->children[0].get(), current_scope);
         
         // Store the value (currently in RAX) to R15 + offset
         if (varInfo.type == DataType::INT32) {
-            total_length += emitter.emitMovDwordPtrR15PlusOffsetEAX(varInfo.offset);
+            a.mov(x86::dword_ptr(x86::r15, varInfo.offset), x86::eax);
         } else if (varInfo.type == DataType::INT64) {
-            total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset);
+            a.mov(x86::qword_ptr(x86::r15, varInfo.offset), x86::rax);
         }
     }
     
-    return total_length;
+    return buffer.size() - start_pos;
 }
 
 size_t Codegen::generateLiteral(LiteralNode* literal) {
+    size_t start_pos = buffer.size();
     // Convert literal value to integer and load into RAX
     int64_t value = std::stoll(literal->value);
     printf("DEBUG generateLiteral: Loading literal value %ld into RAX\n", value);
-    return emitter.emitMovRAXImm64(static_cast<uint64_t>(value));
+    a.mov(x86::rax, value);
+    return buffer.size() - start_pos;
 }
 
 size_t Codegen::generateIdentifier(IdentifierNode* identifier) {
@@ -385,7 +376,6 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
     // Place parameters in registers: RDI, RSI, RDX, RCX, R8, R9, then stack
     // Order: regular parameters first, then hidden scope parameters
     
-    size_t total_params = funcCall->args.size() + targetFunc->hiddenParamsInfo.size();
     std::vector<size_t> stack_params; // For parameters beyond 6
     
     // Generate all regular parameter values and place them in registers/stack
@@ -398,27 +388,27 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
             switch(i) {
                 case 0: // RDI
                     printf("DEBUG: Moving parameter %zu from RAX to RDI\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
+                    a.mov(x86::rdi, x86::rax);
                     break;
                 case 1: // RSI
                     printf("DEBUG: Moving parameter %zu from RAX to RSI\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC6}); // mov rsi, rax
+                    a.mov(x86::rsi, x86::rax);
                     break;
                 case 2: // RDX
                     printf("DEBUG: Moving parameter %zu from RAX to RDX\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC2}); // mov rdx, rax
+                    a.mov(x86::rdx, x86::rax);
                     break;
                 case 3: // RCX
                     printf("DEBUG: Moving parameter %zu from RAX to RCX\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
+                    a.mov(x86::rcx, x86::rax);
                     break;
                 case 4: // R8
                     printf("DEBUG: Moving parameter %zu from RAX to R8\n", i);
-                    total_length += emitter.emitBytes({0x49, 0x89, 0xC0}); // mov r8, rax
+                    a.mov(x86::r8, x86::rax);
                     break;
                 case 5: // R9
                     printf("DEBUG: Moving parameter %zu from RAX to R9\n", i);
-                    total_length += emitter.emitBytes({0x49, 0x89, 0xC1}); // mov r9, rax
+                    a.mov(x86::r9, x86::rax);
                     break;
             }
         } else {
@@ -442,43 +432,43 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
         auto total_offset = scope_offset_in_closure + variable_offset;
         
         printf("DEBUG: Loading hidden param %zu: closure offset=%zu, variable_offset=%zu, total_offset=%zu\n", 
-               i, scope_offset_in_closure, variable_offset, total_offset);
+               i, scope_offset_in_closure, static_cast<size_t>(variable_offset), total_offset);
         
         // Load scope address into RAX
-        total_length += emitter.emitMovRAXFromR10PlusOffset(static_cast<uint32_t>(total_offset));
+        a.mov(x86::rax, x86::qword_ptr(x86::r10, static_cast<int32_t>(total_offset)));
         
         if (param_index < 6) { // First 6 total parameters go in registers
             switch(param_index) {
                 case 0: // RDI
                     printf("DEBUG: Moving hidden param %zu from RAX to RDI\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
+                    a.mov(x86::rdi, x86::rax);
                     break;
                 case 1: // RSI
                     printf("DEBUG: Moving hidden param %zu from RAX to RSI\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC6}); // mov rsi, rax
+                    a.mov(x86::rsi, x86::rax);
                     break;
                 case 2: // RDX
                     printf("DEBUG: Moving hidden param %zu from RAX to RDX\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC2}); // mov rdx, rax
+                    a.mov(x86::rdx, x86::rax);
                     break;
                 case 3: // RCX
                     printf("DEBUG: Moving hidden param %zu from RAX to RCX\n", i);
-                    total_length += emitter.emitBytes({0x48, 0x89, 0xC1}); // mov rcx, rax
+                    a.mov(x86::rcx, x86::rax);
                     break;
                 case 4: // R8
                     printf("DEBUG: Moving hidden param %zu from RAX to R8\n", i);
-                    total_length += emitter.emitBytes({0x49, 0x89, 0xC0}); // mov r8, rax
+                    a.mov(x86::r8, x86::rax);
                     break;
                 case 5: // R9
                     printf("DEBUG: Moving hidden param %zu from RAX to R9\n", i);
-                    total_length += emitter.emitBytes({0x49, 0x89, 0xC1}); // mov r9, rax
+                    a.mov(x86::r9, x86::rax);
                     break;
             }
         } else {
             // Push onto stack (will be handled below)
             printf("DEBUG: Hidden parameter %zu will go on stack\n", i);
             // We'll need to save this for stack pushing - for now, push immediately
-            total_length += emitter.emitBytes({0x50}); // push rax
+            a.push(x86::rax);
         }
     }
     
@@ -487,15 +477,15 @@ size_t Codegen::generateClosureCall(FunctionCallNode* funcCall, LexicalScopeNode
     
     // Load function address from closure and call
     // Use the closure address already loaded in R10
-    total_length += emitter.emitMovRAXFromR10PlusOffset(static_cast<uint32_t>(variable_offset)); // Function address at closure base
+    a.mov(x86::rax, x86::qword_ptr(x86::r10, static_cast<int32_t>(variable_offset))); // Function address at closure base
     
     printf("DEBUG: About to call function\n");
     // Call the function 
-    total_length += emitter.emitBytes({0xFF, 0xD0}); // call rax
+    a.call(x86::rax);
     
     // TODO: Clean up stack if we used it (not needed for <= 6 params)
     
-    return total_length;
+    return buffer.size() - total_length;
 }
 
 size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_scope) {
@@ -507,7 +497,7 @@ size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_
         total_length += generateNode(child.get(), current_scope);
         
         // Move RAX to RDI (first argument register)
-        total_length += emitter.emitBytes({0x48, 0x89, 0xC7}); // mov rdi, rax
+        a.mov(x86::rdi, x86::rax);
         
         // NOTE: Stack alignment removed - caller should ensure proper alignment
         // The stack alignment was corrupting the return address in functions
@@ -515,10 +505,13 @@ size_t Codegen::generatePrintStatement(ASTNode* node, LexicalScopeNode* current_
         // Call print_int64 function
         uint64_t print_addr = extern_function_addresses["print_int64"];
         std::cout << "DEBUG generatePrintStatement: retrieved print_int64 address 0x" << std::hex << print_addr << std::dec << std::endl;
-        total_length += emitter.emitCallAbsolute(print_addr);
+        
+        // Use AsmJit to call absolute address
+        a.mov(x86::rax, print_addr);
+        a.call(x86::rax);
     }
     
-    return total_length;
+    return buffer.size() - total_length;
 }
 
 size_t Codegen::createClosures(LexicalScopeNode* scope) {
@@ -544,16 +537,21 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
             printf("DEBUG createClosures: Function '%s' needs %zu parent scopes\n", funcNode->funcName.c_str(), funcNode->allNeeded.size());
             
             // Store function address directly at R15 + varInfo.offset (first 8 bytes of closure)
-            // mov rax, <placeholder>
-            total_length += emitter.emitBytes({0x48, 0xB8}); // mov rax, imm64 prefix
+            // Create or get a label for this function
+            asmjit::Label funcLabel;
+            auto labelIt = function_labels.find(funcNode);
+            if (labelIt != function_labels.end()) {
+                funcLabel = labelIt->second;
+            } else {
+                funcLabel = a.newLabel();
+                function_labels[funcNode] = funcLabel;
+            }
             
-            // Create patch entry with exact offset
-            size_t patch_offset;
-            total_length += emitter.emitFunctionAddressPlaceholder(patch_offset);
-            function_patches.push_back(FunctionPatch(patch_offset, funcNode));
+            // Use AsmJit's proper label system - this will automatically be resolved
+            a.lea(x86::rax, x86::ptr(funcLabel));
             
             // Store function address at R15 + varInfo.offset
-            total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(varInfo.offset);
+            a.mov(x86::qword_ptr(x86::r15, varInfo.offset), x86::rax);
             
             // Now store addresses of needed parent scopes immediately after the function address
             // For each scope in funcNode->allNeeded, we need to store its address
@@ -577,7 +575,7 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                     if (absoluteParamIndex == -1) {
                         // Special case: current scope (R15)
                         printf("DEBUG createClosures: Using current scope (R15) for depth %d\n", neededDepth);
-                        total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+                        a.mov(x86::rax, x86::r15);
                     } else {
                         // During closure creation, we need to get the scope from the current context
                         // The parameter mapping tells us where the target function will expect the scope,
@@ -586,7 +584,7 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                         if (neededDepth == scope->depth) {
                             // If the needed scope is the current scope, use R15
                             printf("DEBUG: Storing current scope (R15) for depth %d\n", neededDepth);
-                            total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+                            a.mov(x86::rax, x86::r15);
                         } else {
                             // For parent scopes, we need to load from the current function's parameters
                             // Find the current function scope with cycle detection
@@ -596,7 +594,7 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                             int traversal_count = 0;
                             printf("DEBUG createClosures: Starting scope traversal from depth %d to find parent function\n", scope->depth);
                             
-                            while (currentFunc && currentFunc->type != NodeType::FUNCTION_DECL) {
+                            while (currentFunc && currentFunc->type != ASTNodeType::FUNCTION_DECL) {
                                 traversal_count++;
                                 printf("DEBUG createClosures: Traversal step %d - checking scope at %p, depth=%d, type=%d\n", 
                                        traversal_count, currentFunc, currentFunc->depth, (int)currentFunc->type);
@@ -631,18 +629,18 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                                    currentFunc ? currentFunc->depth : -1, 
                                    currentFunc ? (int)currentFunc->type : -1);
                             
-                            if (currentFunc && currentFunc->type == NodeType::FUNCTION_DECL) {
+                            if (currentFunc && currentFunc->type == ASTNodeType::FUNCTION_DECL) {
                                 // Get the parameter index for this scope in the current function's context
                                 auto it = currentFunc->scopeDepthToParentParameterIndexMap.find(neededDepth);
                                 if (it != currentFunc->scopeDepthToParentParameterIndexMap.end()) {
                                     int currentFuncParamIndex = it->second;
                                     if (currentFuncParamIndex == -1) {
                                         printf("DEBUG: Storing current scope (R15) for depth %d via param index -1\n", neededDepth);
-                                        total_length += emitter.emitBytes({0x4C, 0x89, 0xF8}); // mov rax, r15
+                                        a.mov(x86::rax, x86::r15);
                                     } else {
                                         int param_offset = currentFunc->getParameterOffset(currentFuncParamIndex);
                                         printf("DEBUG: Loading scope for depth %d from param offset %d\n", neededDepth, param_offset);
-                                        total_length += emitter.emitMovRAXFromR15Offset(param_offset);
+                                        a.mov(x86::rax, x86::qword_ptr(x86::r15, param_offset));
                                         // Add debug to print the loaded address
                                         printf("DEBUG: About to store scope address for depth %d in closure\n", neededDepth);
                                     }
@@ -684,7 +682,7 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
                 // Closure structure: [func_addr at offset][scope1 at offset+8][scope2 at offset+16]...
                 size_t scope_offset = varInfo.offset + 8 + (i * 8);
                 printf("DEBUG createClosures: Storing scope for depth %d at closure offset %zu\n", neededDepth, scope_offset);
-                total_length += emitter.emitMovQwordPtrR15PlusOffsetRAX(scope_offset);
+                a.mov(x86::qword_ptr(x86::r15, scope_offset), x86::rax);
             }
         }
     }
@@ -692,64 +690,41 @@ size_t Codegen::createClosures(LexicalScopeNode* scope) {
     return total_length;
 }
 
-void Codegen::patchFunctionAddresses() {
-    printf("DEBUG patchFunctionAddresses: Patching %zu function addresses\n", function_patches.size());
-    
-    // Patch all function addresses in the machine code buffer
-    for (const auto& patch : function_patches) {
-        uint64_t addr_to_patch;
-        
-        if (patch.is_string_patch) {
-            // For string patches, we need to calculate absolute address in executable memory
-            // This will be done in writeProgramToExecutable after we know the base address
-            addr_to_patch = patch.string_offset; // Store offset for now
-            printf("DEBUG patchFunctionAddresses: String patch at offset %zu\n", patch.offset_in_buffer);
-        } else {
-            // For function patches, use the function address
-            addr_to_patch = patch.func->functionAddress;
-            printf("DEBUG patchFunctionAddresses: Function patch for '%s' at offset %zu, address 0x%lx\n", 
-                   patch.func->funcName.c_str(), patch.offset_in_buffer, addr_to_patch);
-        }
-        
-        // Write the address into the buffer at the exact offset
-        for (int i = 0; i < 8; i++) {
-            emitter.buffer[patch.offset_in_buffer + i] = static_cast<uint8_t>((addr_to_patch >> (i * 8)) & 0xFF);
-        }
-    }
-}
-
 void Codegen::generateProgram(ASTNode& root) {
-    emitter.clear();
+    buffer.clear();
+    function_labels.clear();
+    code.init(rt.environment());
+    a.~Assembler();  // Destroy the existing assembler
+    new (&a) asmjit::x86::Assembler(&code);  // Construct new assembler in place
+    
     initExternFunctions();
-    function_patches.clear();
     
     // Cast root to LexicalScopeNode (global scope)
     LexicalScopeNode* global_scope = static_cast<LexicalScopeNode*>(&root);
     
     // Setup global scope WITHOUT pushing R15 (since there's no parent scope)
     // Allocate memory for global scope
-    emitter.emitMovRAXImm64(12);       // sys_brk (12)
-    emitter.emitBytes({0x48, 0x31, 0xFF}); // xor rdi, rdi (0)
-    emitter.emitSyscall();
+    a.mov(x86::rax, 12);       // sys_brk (12)
+    a.xor_(x86::rdi, x86::rdi); // xor rdi, rdi (0)
+    a.syscall();
     
     // Save current brk in RBX
-    emitter.emitBytes({0x48, 0x89, 0xC3}); // mov rbx, rax
+    a.mov(x86::rbx, x86::rax); // mov rbx, rax
     
     // Set new brk to current + scope size
-    emitter.emitMovRAXImm64(12);       // sys_brk
-    emitter.emitBytes({0x48, 0x89, 0xD9}); // mov rcx, rbx  
-    emitter.emitBytes({0x48, 0x81, 0xC1}); // add rcx, imm32
-    emitter.emitU32(static_cast<uint32_t>(global_scope->totalSize));
-    emitter.emitBytes({0x49, 0x89, 0xCA}); // mov r10, rcx (use R10 instead of RDI)
-    emitter.emitBytes({0x4C, 0x89, 0xD7}); // mov rdi, r10 (move to RDI only for syscall)
-    emitter.emitSyscall();
-    emitter.emitBytes({0x4C, 0x89, 0xD1}); // mov rcx, r10 (restore rcx from r10 for later use)
+    a.mov(x86::rax, 12);       // sys_brk
+    a.mov(x86::rcx, x86::rbx);  // mov rcx, rbx  
+    a.add(x86::rcx, static_cast<uint32_t>(global_scope->totalSize));
+    a.mov(x86::r10, x86::rcx); // mov r10, rcx (use R10 instead of RDI)
+    a.mov(x86::rdi, x86::r10); // mov rdi, r10 (move to RDI only for syscall)
+    a.syscall();
+    a.mov(x86::rcx, x86::r10); // mov rcx, r10 (restore rcx from r10 for later use)
     
     // Use the old brk value as our allocated memory
-    emitter.emitBytes({0x48, 0x89, 0xD8}); // mov rax, rbx
+    a.mov(x86::rax, x86::rbx); // mov rax, rbx
     
     // Move allocated memory address to R15 (our lexical scope pointer)
-    emitter.emitMovR15RAX();
+    a.mov(x86::r15, x86::rax);
     
     // Create closures for global scope
     createClosures(global_scope);
@@ -757,52 +732,42 @@ void Codegen::generateProgram(ASTNode& root) {
     // FIRST PASS: Generate main program flow (skip function definitions)
     // Main program code (skip function definitions)
     for (auto& child : global_scope->ASTNode::children) {
-        if (child->type != NodeType::FUNCTION_DECL) {
+        if (child->type != ASTNodeType::FUNCTION_DECL) {
             generateNode(child.get(), global_scope);
         }
     }
     
-    // Add a jump to skip over function definitions
-    size_t jump_over_functions = emitter.buffer.size();
-    emitter.emitBytes({0xE9, 0x00, 0x00, 0x00, 0x00}); // jmp rel32 (placeholder)
+    // Create a label for jumping over function definitions
+    asmjit::Label after_functions = a.newLabel();
+    a.jmp(after_functions);
     
     // SECOND PASS: Generate function definitions
-    size_t functions_start = emitter.buffer.size();
     for (auto& child : global_scope->ASTNode::children) {
-        if (child->type == NodeType::FUNCTION_DECL) {
+        if (child->type == ASTNodeType::FUNCTION_DECL) {
             generateNode(child.get(), global_scope);
         }
     }
     
-    // Calculate jump distance to skip functions and patch the jump
-    size_t functions_end = emitter.buffer.size();
-    int32_t jump_distance = functions_end - (jump_over_functions + 5); // +5 for jump instruction size
+    // Bind the label after functions
+    a.bind(after_functions);
     
-    // Patch the jump instruction
-    uint8_t* jump_patch = &emitter.buffer[jump_over_functions + 1];
-    jump_patch[0] = jump_distance & 0xFF;
-    jump_patch[1] = (jump_distance >> 8) & 0xFF;
-    jump_patch[2] = (jump_distance >> 16) & 0xFF;
-    jump_patch[3] = (jump_distance >> 24) & 0xFF;
+    // Exit cleanly
+    a.mov(x86::rax, 60);  // sys_exit
+    a.xor_(x86::rdi, x86::rdi);      // exit code 0
+    a.syscall();
     
-    // NOW patch all function addresses in the closures
-    patchFunctionAddresses();
+    // Finalize the code
+    a.finalize();
     
-    // PROGRAM CONTINUATION: This is where the main program continues after the function call
-    // No need to restore R15 for global scope since we never pushed it
-    
-    // For now, just exit cleanly
-    emitter.emitMovRAXImm64(60);  // sys_exit
-    emitter.emitXorRdiRdi();      // exit code 0
-    emitter.emitSyscall();
+    // Get the machine code from AsmJit
+    buffer.resize(code.codeSize());
+    code.relocateToBase(0); // Relocate to base address 0 for now
+    code.copyFlattenedData(buffer.data(), buffer.size());
 }
 
 void Codegen::writeProgramToExecutable() {
-    // First, update function addresses to absolute addresses before patching
-    // We need to know where functions will be located in the executable memory
-    
     // Allocate executable memory
-    void* exec_mem = mmap(nullptr, emitter.buffer.size(), 
+    void* exec_mem = mmap(nullptr, buffer.size(), 
                          PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     
@@ -814,33 +779,11 @@ void Codegen::writeProgramToExecutable() {
     // Convert relative addresses to absolute addresses in executable memory
     uint64_t base_address = reinterpret_cast<uint64_t>(exec_mem);
     
-    // Patch all addresses (both function and string addresses) BEFORE copying to executable memory
-    for (const auto& patch : function_patches) {
-        uint64_t addr_to_patch;
-        
-        if (patch.is_string_patch) {
-            // For string patches, calculate absolute address
-            addr_to_patch = base_address + patch.string_offset;
-        } else {
-            // For function patches, calculate absolute address in executable memory
-            if (patch.func == nullptr) {
-                throw std::runtime_error("ERROR: Function patch has null function pointer at offset " + std::to_string(patch.offset_in_buffer));
-            }
-            // The function address should be base_address + relative offset in buffer
-            addr_to_patch = base_address + patch.func->functionAddress;
-        }
-        
-        // Write the address into the buffer at the exact offset
-        for (int i = 0; i < 8; i++) {
-            emitter.buffer[patch.offset_in_buffer + i] = static_cast<uint8_t>((addr_to_patch >> (i * 8)) & 0xFF);
-        }
-    }
-
-    // Copy machine code to executable memory AFTER patching
-    std::memcpy(exec_mem, emitter.buffer.data(), emitter.buffer.size());
+    // Copy machine code to executable memory
+    std::memcpy(exec_mem, buffer.data(), buffer.size());
     
-    // Disassemble the patched code
-    disassembleCode(emitter.buffer, base_address);
+    // Disassemble the code
+    disassembleCode(buffer, base_address);
     
     // Execute the code
     typedef void (*func_ptr)();
@@ -848,7 +791,7 @@ void Codegen::writeProgramToExecutable() {
     func();
     
     // Clean up
-    munmap(exec_mem, emitter.buffer.size());
+    munmap(exec_mem, buffer.size());
 }
 
 size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register target_reg) {
@@ -860,7 +803,6 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register ta
     }
     
     auto access = identifier->getVariableAccess();
-    int reg_num = static_cast<int>(target_reg);
     
     // Debug output with call stack info
     printf("DEBUG loadVariableIntoRegister: var='%s' paramIndex=%d\n", 
@@ -892,8 +834,28 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register ta
         // Variable is in current scope - load from R15+offset
         printf("DEBUG: Loading from current scope R15+%d\n", access.offset);
         
-        // Use general method for all registers (simplified and consistent)
-        total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.offset); // R15 = 15
+        // Get the target register
+        x86::Gp targetReg;
+        switch(target_reg) {
+            case Register::RAX: targetReg = x86::rax; break;
+            case Register::RCX: targetReg = x86::rcx; break;
+            case Register::RDX: targetReg = x86::rdx; break;
+            case Register::RBX: targetReg = x86::rbx; break;
+            case Register::RSP: targetReg = x86::rsp; break;
+            case Register::RBP: targetReg = x86::rbp; break;
+            case Register::RSI: targetReg = x86::rsi; break;
+            case Register::RDI: targetReg = x86::rdi; break;
+            case Register::R8:  targetReg = x86::r8; break;
+            case Register::R9:  targetReg = x86::r9; break;
+            case Register::R10: targetReg = x86::r10; break;
+            case Register::R11: targetReg = x86::r11; break;
+            case Register::R12: targetReg = x86::r12; break;
+            case Register::R13: targetReg = x86::r13; break;
+            case Register::R14: targetReg = x86::r14; break;
+            case Register::R15: targetReg = x86::r15; break;
+        }
+        
+        a.mov(targetReg, x86::qword_ptr(x86::r15, access.offset));
     } else {
         // Variable is in a parent scope - load scope address from hidden parameter
         printf("DEBUG: Loading from parent scope via parameter offset %d + variable offset %d\n", access.parameterOffset, access.offset);
@@ -901,12 +863,32 @@ size_t Codegen::loadVariableIntoRegister(IdentifierNode* identifier, Register ta
         // Use the pre-calculated parameter offset directly (accounts for variable-sized parameters)
         printf("DEBUG: Using parameter offset: %d\n", access.parameterOffset);
         
+        // Get the target register
+        x86::Gp targetReg;
+        switch(target_reg) {
+            case Register::RAX: targetReg = x86::rax; break;
+            case Register::RCX: targetReg = x86::rcx; break;
+            case Register::RDX: targetReg = x86::rdx; break;
+            case Register::RBX: targetReg = x86::rbx; break;
+            case Register::RSP: targetReg = x86::rsp; break;
+            case Register::RBP: targetReg = x86::rbp; break;
+            case Register::RSI: targetReg = x86::rsi; break;
+            case Register::RDI: targetReg = x86::rdi; break;
+            case Register::R8:  targetReg = x86::r8; break;
+            case Register::R9:  targetReg = x86::r9; break;
+            case Register::R10: targetReg = x86::r10; break;
+            case Register::R11: targetReg = x86::r11; break;
+            case Register::R12: targetReg = x86::r12; break;
+            case Register::R13: targetReg = x86::r13; break;
+            case Register::R14: targetReg = x86::r14; break;
+            case Register::R15: targetReg = x86::r15; break;
+        }
+        
         // Load the parent scope address from parameter, then load the variable
-        // Use general method for all registers (simplified and consistent)
         printf("DEBUG: About to load scope address from R15+%d\n", access.parameterOffset);
-        total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.parameterOffset);
+        a.mov(targetReg, x86::qword_ptr(x86::r15, access.parameterOffset));
         printf("DEBUG: About to load variable from scope+%d\n", access.offset);
-        total_length += emitter.emitMovRegFromMemory(reg_num, reg_num, access.offset);
+        a.mov(targetReg, x86::qword_ptr(targetReg, access.offset));
     }
     
     return total_length;
@@ -921,7 +903,6 @@ size_t Codegen::loadVariableDefiningScopeAddressIntoRegister(IdentifierNode* ide
     }
     
     auto access = identifier->getVariableAccess();
-    int reg_num = static_cast<int>(target_reg);
     
     // Debug output
     printf("DEBUG loadVariableDefiningScopeAddressIntoRegister: var='%s' paramIndex=%d paramOffset=%d\n", 
@@ -943,8 +924,28 @@ size_t Codegen::loadVariableDefiningScopeAddressIntoRegister(IdentifierNode* ide
             // No need to move if target is already R15
             printf("DEBUG: Target register is already R15, no move needed\n");
         } else {
-            printf("DEBUG: Target register is NOT R15, calling emitMovRegFromReg\n");
-            total_length += emitter.emitMovRegFromReg(reg_num, 15); // Move R15 to target register
+            printf("DEBUG: Target register is NOT R15, moving R15 to target\n");
+            // Get the target register
+            x86::Gp targetReg;
+            switch(target_reg) {
+                case Register::RAX: targetReg = x86::rax; break;
+                case Register::RCX: targetReg = x86::rcx; break;
+                case Register::RDX: targetReg = x86::rdx; break;
+                case Register::RBX: targetReg = x86::rbx; break;
+                case Register::RSP: targetReg = x86::rsp; break;
+                case Register::RBP: targetReg = x86::rbp; break;
+                case Register::RSI: targetReg = x86::rsi; break;
+                case Register::RDI: targetReg = x86::rdi; break;
+                case Register::R8:  targetReg = x86::r8; break;
+                case Register::R9:  targetReg = x86::r9; break;
+                case Register::R10: targetReg = x86::r10; break;
+                case Register::R11: targetReg = x86::r11; break;
+                case Register::R12: targetReg = x86::r12; break;
+                case Register::R13: targetReg = x86::r13; break;
+                case Register::R14: targetReg = x86::r14; break;
+                case Register::R15: targetReg = x86::r15; break;
+            }
+            a.mov(targetReg, x86::r15);
         }
     } else {
         // Variable is in a parent scope - load the parent scope address from hidden parameter
@@ -953,8 +954,29 @@ size_t Codegen::loadVariableDefiningScopeAddressIntoRegister(IdentifierNode* ide
         // Use the pre-calculated parameter offset directly (accounts for variable-sized parameters)
         printf("DEBUG: Using parameter offset: %d\n", access.parameterOffset);
         
+        // Get the target register
+        x86::Gp targetReg;
+        switch(target_reg) {
+            case Register::RAX: targetReg = x86::rax; break;
+            case Register::RCX: targetReg = x86::rcx; break;
+            case Register::RDX: targetReg = x86::rdx; break;
+            case Register::RBX: targetReg = x86::rbx; break;
+            case Register::RSP: targetReg = x86::rsp; break;
+            case Register::RBP: targetReg = x86::rbp; break;
+            case Register::RSI: targetReg = x86::rsi; break;
+            case Register::RDI: targetReg = x86::rdi; break;
+            case Register::R8:  targetReg = x86::r8; break;
+            case Register::R9:  targetReg = x86::r9; break;
+            case Register::R10: targetReg = x86::r10; break;
+            case Register::R11: targetReg = x86::r11; break;
+            case Register::R12: targetReg = x86::r12; break;
+            case Register::R13: targetReg = x86::r13; break;
+            case Register::R14: targetReg = x86::r14; break;
+            case Register::R15: targetReg = x86::r15; break;
+        }
+        
         // Load the parent scope address from parameter
-        total_length += emitter.emitMovRegFromMemory(reg_num, 15, access.parameterOffset);
+        a.mov(targetReg, x86::qword_ptr(x86::r15, access.parameterOffset));
     }
     
     return total_length;
@@ -1013,29 +1035,8 @@ void Codegen::runWithUnicornDebugger() {
         return;
     }
     
-    // Patch function addresses for Unicorn execution
-    for (const auto& patch : function_patches) {
-        uint64_t addr_to_patch;
-        
-        if (patch.is_string_patch) {
-            // For string patches, calculate absolute address
-            addr_to_patch = code_base + patch.string_offset;
-        } else {
-            // For function patches, calculate absolute address
-            if (patch.func == nullptr) {
-                throw std::runtime_error("ERROR: Function patch has null function pointer at offset " + std::to_string(patch.offset_in_buffer));
-            }
-            addr_to_patch = code_base + patch.func->functionAddress;
-        }
-        
-        // Write the address into the buffer at the exact offset
-        for (int i = 0; i < 8; i++) {
-            emitter.buffer[patch.offset_in_buffer + i] = static_cast<uint8_t>((addr_to_patch >> (i * 8)) & 0xFF);
-        }
-    }
-    
-    // Load code into emulator
-    if (!debugger.loadCode(emitter.buffer.data(), emitter.buffer.size(), code_base)) {
+    // Load code into emulator (AsmJit has already resolved all labels)
+    if (!debugger.loadCode(buffer.data(), buffer.size(), code_base)) {
         std::cerr << "Failed to load code: " << debugger.getLastError() << std::endl;
         return;
     }
@@ -1045,7 +1046,7 @@ void Codegen::runWithUnicornDebugger() {
     debugger.registerExternalFunction(print_int64_addr, "print_int64");
     
     // Disassemble the code for reference
-    disassembleCode(emitter.buffer, code_base);
+    disassembleCode(buffer, code_base);
     
     // Run the program
     std::cout << "UNICORN: Starting execution..." << std::endl;

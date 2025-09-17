@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -Wno-unused-parameter -O0
-LDFLAGS = -lcapstone -lunicorn
+LDFLAGS = -lcapstone -lunicorn -lasmjit
 # Updated sources after moving emitter functionality into codegen.cpp
 SOURCES = main.cpp parser.cpp analyzer.cpp ast_printer.cpp ast.cpp codegen.cpp emitter.cpp library.cpp debugger.cpp
 TARGET = technoscript
