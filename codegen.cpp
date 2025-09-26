@@ -43,6 +43,8 @@ void Codegen::run() {
 
 // CodeGenerator class implementation
 CodeGenerator::CodeGenerator() : currentScope(nullptr) {
+    // Builder will be initialized in generateCode when code holder is ready
+    
     // Initialize Capstone for disassembly
     if (cs_open(CS_ARCH_X86, CS_MODE_64, &capstoneHandle) != CS_ERR_OK) {
         throw std::runtime_error("Failed to initialize Capstone disassembler");
@@ -59,23 +61,30 @@ void* CodeGenerator::generateCode(ASTNode* root) {
     code.reset();
     code.init(rt.environment(), rt.cpuFeatures());
     
-    // Create assembler with the code holder
-    x86::Assembler assembler(&code);
+    // Create builder with the code holder
+    cb = new x86::Builder(&code);
     
     std::cout << "=== Generated Assembly Code ===" << std::endl;
     
-    // Generate code for the program using the new assembler - let AST nodes handle their own setup
-    generateProgramWithAssembler(root, assembler);
+    // Generate code for the program
+    generateProgram(root);
     
     std::cout << "Code size after program: " << code.codeSize() << std::endl;
     
     // Simple return for main program
-    assembler.mov(x86::eax, 0); // Return 0
-    assembler.ret();
+    cb->mov(x86::eax, 0); // Return 0
+    cb->ret();
+    
+    // Finalize the code (this resolves all forward references)
+    cb->finalize();
     
     std::cout << "Final code size: " << code.codeSize() << std::endl;
     
-    // Finalize the code
+    // Clean up builder
+    delete cb;
+    cb = nullptr;
+    
+    // Commit the code to executable memory
     void* executableFunc;
     Error err = rt.add(&executableFunc, &code);
     if (err) {
@@ -96,18 +105,10 @@ void* CodeGenerator::generateCode(ASTNode* root) {
 }
 
 void CodeGenerator::declareExternalFunctions() {
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     // We'll resolve these at runtime by getting their addresses
-    printInt64Label = asm_ref.newLabel();
-    mallocLabel = asm_ref.newLabel();
-    freeLabel = asm_ref.newLabel();
-}
-
-void CodeGenerator::generateProgramWithAssembler(ASTNode* root, x86::Assembler& assembler) {
-    // Just delegate to existing method but store assembler reference
-    currentAssembler = &assembler;
-    generateProgram(root);
+    printInt64Label = cb->newLabel();
+    mallocLabel = cb->newLabel();
+    freeLabel = cb->newLabel();
 }
 
 void CodeGenerator::generateProgram(ASTNode* root) {
@@ -161,30 +162,28 @@ void CodeGenerator::visitNode(ASTNode* node) {
 void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     std::cout << "Allocating scope of size: " << scope->totalSize << " bytes" << std::endl;
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     // Call malloc to allocate scope
     // mov rdi, scope->totalSize (first argument)
-    asm_ref.mov(x86::rdi, scope->totalSize);
+    cb->mov(x86::rdi, scope->totalSize);
     
     // Call malloc - we need to call the actual malloc function
     // For simplicity, we'll embed the function pointer directly
     uint64_t mallocAddr = reinterpret_cast<uint64_t>(&malloc_wrapper);
-    asm_ref.mov(x86::rax, mallocAddr);
-    asm_ref.call(x86::rax);
+    cb->mov(x86::rax, mallocAddr);
+    cb->call(x86::rax);
     
     // Store the allocated memory address in r15
-    asm_ref.mov(x86::r15, x86::rax);
+    cb->mov(x86::r15, x86::rax);
     
     // Zero out the allocated memory
-    asm_ref.mov(x86::rdi, x86::r15);         // destination
-    asm_ref.mov(x86::rsi, 0);                // value to fill (0)
-    asm_ref.mov(x86::rdx, scope->totalSize); // count
+    cb->mov(x86::rdi, x86::r15);         // destination
+    cb->mov(x86::rsi, 0);                // value to fill (0)
+    cb->mov(x86::rdx, scope->totalSize); // count
     
     // Call memset - embed function pointer
     uint64_t memsetAddr = reinterpret_cast<uint64_t>(&memset);
-    asm_ref.mov(x86::rax, memsetAddr);
-    asm_ref.call(x86::rax);
+    cb->mov(x86::rax, memsetAddr);
+    cb->call(x86::rax);
     
     currentScope = scope;
 }
@@ -193,7 +192,7 @@ void CodeGenerator::generateLexicalScope(LexicalScopeNode* scope) {
     // Allocate memory for this scope
     allocateScope(scope);
     
-    // First pass: Handle function hoisting - create closures for all functions using efficient variables map
+    // Handle function hoisting - create closures for all functions using efficient variables map
     for (const auto& [name, varInfo] : scope->variables) {
         if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
             auto funcDecl = varInfo.funcNode;
@@ -203,7 +202,7 @@ void CodeGenerator::generateLexicalScope(LexicalScopeNode* scope) {
         }
     }
     
-    // Second pass: Process all other children (including function bodies)
+    // Process all other children (including function bodies)
     for (auto& child : scope->children) {
         visitNode(child.get());
     }
@@ -234,13 +233,11 @@ void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
 void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
     if (!valueNode) return;
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     switch (valueNode->type) {
         case ::NodeType::LITERAL: {
             // Parse the literal value and load it
             int64_t value = std::stoll(valueNode->value);
-            asm_ref.mov(destReg, value);
+            cb->mov(destReg, value);
             break;
         }
         case ::NodeType::IDENTIFIER: {
@@ -253,7 +250,7 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
             generateFunctionCall(static_cast<FunctionCallNode*>(valueNode));
             // Function call result is in rax, move to destReg if different
             if (destReg.id() != x86::rax.id()) {
-                asm_ref.mov(destReg, x86::rax);
+                cb->mov(destReg, x86::rax);
             }
             break;
         }
@@ -269,13 +266,11 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
         throw std::runtime_error("Variable not found in scope: " + varName);
     }
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     int offset = it->second.offset;
     std::cout << "Storing variable '" << varName << "' at offset " << offset << " in scope" << std::endl;
     
     // Store the value at [r15 + offset]
-    asm_ref.mov(x86::ptr(x86::r15, offset), valueReg);
+    cb->mov(x86::ptr(x86::r15, offset), valueReg);
 }
 
 void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg) {
@@ -283,15 +278,13 @@ void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp de
         throw std::runtime_error("Variable reference not analyzed: " + identifier->value);
     }
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     // Get the variable access information
     auto access = identifier->getVariableAccess();
     
     if (access.parameterIndex == -1) {
         // Variable is in current scope (r15)
         std::cout << "Loading variable '" << identifier->value << "' from current scope at offset " << access.offset << std::endl;
-        asm_ref.mov(destReg, x86::ptr(x86::r15, access.offset));
+        cb->mov(destReg, x86::ptr(x86::r15, access.offset));
     } else {
         // Variable is in a parent scope - would need to load from parameter
         // For now, throw an error as we're not implementing function calls yet
@@ -303,8 +296,6 @@ void CodeGenerator::generatePrintStmt(ASTNode* printStmt) {
     if (printStmt->children.empty()) {
         throw std::runtime_error("Print statement without argument");
     }
-    
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
     
     ASTNode* arg = printStmt->children[0].get();
     
@@ -320,8 +311,8 @@ void CodeGenerator::generatePrintStmt(ASTNode* printStmt) {
     
     // Call the external print function
     uint64_t printAddr = reinterpret_cast<uint64_t>(&print_int64);
-    asm_ref.mov(x86::rax, printAddr);
-    asm_ref.call(x86::rax);
+    cb->mov(x86::rax, printAddr);
+    cb->call(x86::rax);
 }
 
 void CodeGenerator::printInt64(IdentifierNode* identifier) {
@@ -332,8 +323,8 @@ void CodeGenerator::printInt64(IdentifierNode* identifier) {
     
     // Call the external print function
     uint64_t printAddr = reinterpret_cast<uint64_t>(&print_int64);
-    a.mov(x86::rax, printAddr);
-    a.call(x86::rax);
+    cb->mov(x86::rax, printAddr);
+    cb->call(x86::rax);
 }
 
 void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
@@ -363,8 +354,6 @@ void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
 void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
     std::cout << "Generating function: " << funcDecl->funcName << std::endl;
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     // The label should already exist from hoisting phase
     Label* funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
     if (!funcLabel) {
@@ -372,7 +361,7 @@ void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
     }
     
     // Bind the function label (start of actual function code)
-    asm_ref.bind(*funcLabel);
+    cb->bind(*funcLabel);
     
     // Generate function prologue (now includes scope allocation and parameter copying)
     generateFunctionPrologue(funcDecl);
@@ -394,26 +383,22 @@ void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
 }
 
 void CodeGenerator::createFunctionLabel(FunctionDeclNode* funcDecl) {
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     // Create a new label for this function
-    Label* funcLabel = new Label(asm_ref.newLabel());
-    funcDecl->asmjitLabel = funcLabel;
+    Label funcLabel = cb->newLabel();
+    funcDecl->asmjitLabel = new Label(funcLabel);
     
     std::cout << "Created label for function: " << funcDecl->funcName << std::endl;
 }
 
 void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     std::cout << "Generating prologue for function: " << funcDecl->funcName << std::endl;
     
     // Standard function prologue
-    asm_ref.push(x86::rbp);
-    asm_ref.mov(x86::rbp, x86::rsp);
+    cb->push(x86::rbp);
+    cb->mov(x86::rbp, x86::rsp);
     
     // Save r15 (current scope pointer) 
-    asm_ref.push(x86::r15);
+    cb->push(x86::r15);
     
     // Allocate the function's lexical scope first (moved from generateFunction)
     allocateScope(funcDecl);
@@ -433,14 +418,14 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
         
         if (i < maxRegParams) {
             // Parameter is in register - copy to scope
-            asm_ref.mov(x86::ptr(x86::r15, offset), paramRegs[i]);
+            cb->mov(x86::ptr(x86::r15, offset), paramRegs[i]);
         } else {
             // Parameter is on stack - calculate stack offset and copy
             // Stack parameters start at rbp+16 (8 for return address + 8 for saved rbp)
             // Each parameter is 8 bytes aligned
             int stackOffset = 16 + (i - maxRegParams) * 8;
-            asm_ref.mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-            asm_ref.mov(x86::ptr(x86::r15, offset), x86::rax);
+            cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
+            cb->mov(x86::ptr(x86::r15, offset), x86::rax);
         }
     }
     
@@ -456,34 +441,32 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
         
         if (paramIndex < maxRegParams) {
             // Hidden parameter is in register
-            asm_ref.mov(x86::ptr(x86::r15, offset), paramRegs[paramIndex]);
+            cb->mov(x86::ptr(x86::r15, offset), paramRegs[paramIndex]);
         } else {
             // Hidden parameter is on stack
             int stackOffset = 16 + (paramIndex - maxRegParams) * 8;
-            asm_ref.mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-            asm_ref.mov(x86::ptr(x86::r15, offset), x86::rax);
+            cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
+            cb->mov(x86::ptr(x86::r15, offset), x86::rax);
         }
     }
 }
 
 void CodeGenerator::generateFunctionEpilogue(FunctionDeclNode* funcDecl) {
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     std::cout << "Generating epilogue for function: " << funcDecl->funcName << std::endl;
     
     // Free the current scope memory
-    asm_ref.mov(x86::rdi, x86::r15);  // scope pointer to free
+    cb->mov(x86::rdi, x86::r15);  // scope pointer to free
     uint64_t freeAddr = reinterpret_cast<uint64_t>(&free_wrapper);
-    asm_ref.mov(x86::rax, freeAddr);
-    asm_ref.call(x86::rax);
+    cb->mov(x86::rax, freeAddr);
+    cb->call(x86::rax);
     
     // Restore r15 (previous scope pointer)
-    asm_ref.pop(x86::r15);
+    cb->pop(x86::r15);
     
     // Standard function epilogue
-    asm_ref.mov(x86::rsp, x86::rbp);
-    asm_ref.pop(x86::rbp);
-    asm_ref.ret();
+    cb->mov(x86::rsp, x86::rbp);
+    cb->pop(x86::rbp);
+    cb->ret();
 }
 
 void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, LexicalScopeNode* scope) {
@@ -493,8 +476,6 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         return; // Function not referenced as closure in this scope
     }
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
     std::cout << "Storing function address for closure: " << funcDecl->funcName << std::endl;
     
     // Get the label for this function
@@ -503,28 +484,35 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         throw std::runtime_error("Function label not created for: " + funcDecl->funcName);
     }
     
-    // Load the function address using LEA (Load Effective Address)
-    // This will be resolved by AsmJit when the code is finalized
-    asm_ref.lea(x86::rax, x86::ptr(*funcLabel));
+    // Get the address of the label by using lea with a RIP-relative reference
+    // This creates a memory operand that references the label
+    cb->lea(x86::rax, x86::ptr(*funcLabel));
     
     // Store the function address in the closure at the variable's offset
     int offset = it->second.offset;
-    asm_ref.mov(x86::ptr(x86::r15, offset), x86::rax);
+    cb->mov(x86::ptr(x86::r15, offset), x86::rax);
 }
 
 void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     std::cout << "Generating function call: " << funcCall->value << std::endl;
     
-    x86::Assembler& asm_ref = currentAssembler ? *currentAssembler : a;
-    
-    // Load the function address from the closure
+    // Get the function address from the closure stored in the current scope
     auto access = funcCall->getVariableAccess();
     
     if (access.parameterIndex == -1) {
-        // Function is in current scope
-        asm_ref.mov(x86::r11, x86::ptr(x86::r15, access.offset)); // Store function address in r11
+        // Function is in current scope - load address from closure variable
+        auto it = currentScope->variables.find(funcCall->value);
+        if (it == currentScope->variables.end() || it->second.type != DataType::CLOSURE) {
+            throw std::runtime_error("Function not found or not a closure: " + funcCall->value);
+        }
+        
+        // Load function address from r15 + offset into rax
+        int offset = it->second.offset;
+        std::cout << "Loading function address from r15+" << offset << std::endl;
+        cb->mov(x86::rax, x86::ptr(x86::r15, offset));
+        
     } else {
-        // Function is in parent scope - load from parameter
+        // Function is in parent scope - not implemented yet
         throw std::runtime_error("Parent scope function calls not implemented yet");
     }
     
@@ -543,7 +531,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     
     // Ensure stack is 16-byte aligned before call (stack params are 8 bytes each)
     if (stackParams % 2 == 1) {
-        asm_ref.sub(x86::rsp, 8); // Add padding for alignment
+        cb->sub(x86::rsp, 8); // Add padding for alignment
     }
     
     // Push stack parameters in reverse order (right to left)
@@ -556,7 +544,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
             loadValue(arg, x86::rax);
         }
         
-        asm_ref.push(x86::rax);
+        cb->push(x86::rax);
         std::cout << "  Stack arg " << (i - maxRegParams) << ": pushed" << std::endl;
     }
     
@@ -577,13 +565,13 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     // For now, we're not implementing lexical scope capture in function calls
     
     // Save current r15 before function call
-    asm_ref.push(x86::r15);
+    cb->push(x86::r15);
     
-    // Call the function
-    asm_ref.call(x86::r11);
+    // Indirect call through function address loaded from closure
+    cb->call(x86::rax);
     
     // Restore r15 after function call
-    asm_ref.pop(x86::r15);
+    cb->pop(x86::r15);
     
     // Clean up stack parameters (if any)
     int totalStackBytes = stackParams * 8;
@@ -592,7 +580,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     }
     
     if (totalStackBytes > 0) {
-        asm_ref.add(x86::rsp, totalStackBytes);
+        cb->add(x86::rsp, totalStackBytes);
         std::cout << "Cleaned up " << totalStackBytes << " bytes from stack" << std::endl;
     }
 }

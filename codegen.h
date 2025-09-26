@@ -28,8 +28,7 @@ public:
 private:
     JitRuntime rt;
     CodeHolder code;
-    x86::Assembler a; // Keep for compatibility, but use currentAssembler when available
-    x86::Assembler* currentAssembler = nullptr;
+    x86::Builder* cb = nullptr; // Builder pointer - created fresh each time
     csh capstoneHandle;
     
     // Current function context
@@ -39,7 +38,6 @@ private:
     // Helper methods
     void visitNode(ASTNode* node);
     void generateProgram(ASTNode* root);
-    void generateProgramWithAssembler(ASTNode* root, x86::Assembler& assembler);
     void generateLexicalScope(LexicalScopeNode* scope);
     void generateVarDecl(VarDeclNode* varDecl);
     void generatePrintStmt(ASTNode* printStmt);

@@ -272,7 +272,12 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
         // Skip type annotation if present (e.g., ": int64")
         if (match(TokenType::COLON)) {
             advance(); // skip colon
-            expect(TokenType::IDENTIFIER); // skip type name
+            // Accept either IDENTIFIER or INT64_TYPE for type names
+            if (current().type == TokenType::INT64_TYPE) {
+                advance();
+            } else {
+                expect(TokenType::IDENTIFIER); // For other type names
+            }
         }
         
         func->params.push_back(paramName);
