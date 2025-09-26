@@ -2,10 +2,6 @@
 #include <iostream>
 
 void Analyzer::analyze(LexicalScopeNode* root) {
-    std::cout << "DEBUG Analyzer: Starting collectVariables..." << std::endl;
-    collectVariables(root, root);
-    std::cout << "DEBUG Analyzer: collectVariables completed" << std::endl;
-    
     std::cout << "DEBUG Analyzer: Starting setupParentPointers..." << std::endl;
     setupParentPointers(root, nullptr, 0);
     std::cout << "DEBUG Analyzer: setupParentPointers completed" << std::endl;
@@ -27,65 +23,27 @@ void Analyzer::analyze(LexicalScopeNode* root) {
     std::cout << "DEBUG Analyzer: buildAllScopeDepthToParentParameterIndexMaps completed" << std::endl;
 }
 
-void Analyzer::collectVariables(ASTNode* node, LexicalScopeNode* scope) {
-    if (node->type == NodeType::VAR_DECL) {
-        auto varDecl = static_cast<VarDeclNode*>(node);
-        VariableInfo varInfo;
-        varInfo.type = varDecl->varType;
-        varInfo.name = varDecl->varName;
-        varInfo.definedIn = scope;
-        // Set size based on type
-        if (varDecl->varType == DataType::INT32) {
-            varInfo.size = 4;
-        } else {
-            varInfo.size = 8; // INT64 and other types
-        }
-        scope->variables[varDecl->varName] = varInfo;
+    
+void Analyzer::analyzeScope(LexicalScopeNode* scope, int depth) {
+    // Prevent infinite recursion
+    if (depth > RobustnessLimits::MAX_AST_RECURSION_DEPTH) {
+        throw std::runtime_error("AST recursion depth exceeded " + 
+                               std::to_string(RobustnessLimits::MAX_AST_RECURSION_DEPTH) + " in analyzeScope");
     }
     
-    if (node->type == NodeType::FUNCTION_DECL) {
-        auto func = static_cast<FunctionDeclNode*>(node);
-        
-        // Create closure variable for function (hoisting)
-        VariableInfo closureVar;
-        closureVar.type = DataType::CLOSURE;
-        closureVar.name = func->funcName;
-        closureVar.definedIn = scope;
-        closureVar.funcNode = func;
-        closureVar.size = 8; // Temporary size, will be updated after analysis
-        scope->variables[func->funcName] = closureVar;
-        
-        // Add function parameters as variables in the function scope
-        for (const std::string& paramName : func->params) {
-            VariableInfo paramVar;
-            paramVar.type = DataType::INT64; // Default type for now (should be improved with actual type analysis)
-            paramVar.name = paramName;
-            paramVar.definedIn = func;
-            paramVar.size = 8; // Parameters are 8 bytes
-            func->variables[paramName] = paramVar;
-        }
-        
-        // Recursively collect variables in function body (children, not the function itself)
-        for (auto& child : func->ASTNode::children) {
-            collectVariables(child.get(), func);
-        }
-        return; // Don't process children again below
-    }
-    
-    for (auto& child : node->children) {
-        collectVariables(child.get(), scope);
-    }
-}
-
-void Analyzer::analyzeScope(LexicalScopeNode* scope) {
     // Analyze all AST children - this includes function declarations which will recursively analyze their scopes
     for (auto& child : scope->ASTNode::children) {
-        analyzeNode(child.get(), scope);
+        analyzeNode(child.get(), scope, depth + 1);
     }
     // No need for separate scope children traversal - function declarations are handled above
 }
 
-void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
+void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope, int depth) {
+    // Prevent infinite recursion
+    if (depth > RobustnessLimits::MAX_AST_RECURSION_DEPTH) {
+        throw std::runtime_error("AST recursion depth exceeded " + 
+                               std::to_string(RobustnessLimits::MAX_AST_RECURSION_DEPTH) + " in analyzeNode");
+    }
     if (node->type == NodeType::IDENTIFIER || node->type == NodeType::FUNCTION_CALL) {
         node->varRef = findVariable(node->value, currentScope);
         
@@ -101,7 +59,7 @@ void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
     
     if (node->type == NodeType::FUNCTION_DECL) {
         auto func = static_cast<FunctionDeclNode*>(node);
-        analyzeScope(func);
+        analyzeScope(func, depth + 1);
         return;
     }
     
@@ -109,12 +67,12 @@ void Analyzer::analyzeNode(ASTNode* node, LexicalScopeNode* currentScope) {
     if (node->type == NodeType::FUNCTION_CALL) {
         auto funcCall = static_cast<FunctionCallNode*>(node);
         for (auto& arg : funcCall->args) {
-            analyzeNode(arg.get(), currentScope);
+            analyzeNode(arg.get(), currentScope, depth + 1);
         }
     }
     
     for (auto& child : node->children) {
-        analyzeNode(child.get(), currentScope);
+        analyzeNode(child.get(), currentScope, depth + 1);
     }
 }
 
@@ -124,6 +82,7 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
     LexicalScopeNode* current = scope->parentFunctionScope;
     LexicalScopeNode* defScope = nullptr;
     int traversal_count = 0;
+    std::set<LexicalScopeNode*> visitedScopes; // Track visited scopes to detect cycles
     
     std::cout << "DEBUG findVariable: Starting parent traversal from scope depth " << scope->depth << std::endl;
     
@@ -132,9 +91,16 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
         traversal_count++;
         std::cout << "DEBUG findVariable: Checking scope depth " << current->depth << " (traversal #" << traversal_count << ")" << std::endl;
         
-        if (traversal_count > 20) {
-            std::cout << "ERROR findVariable: Excessive traversal (>20) for variable '" << name << "' - possible infinite loop" << std::endl;
-            throw std::runtime_error("Infinite loop detected in findVariable for variable: " + name);
+        // Check for cycles in parent chain
+        if (visitedScopes.find(current) != visitedScopes.end()) {
+            throw std::runtime_error("Cycle detected in parent scope chain for variable: " + name);
+        }
+        visitedScopes.insert(current);
+        
+        if (traversal_count > RobustnessLimits::MAX_SCOPE_TRAVERSAL_DEPTH) {
+            std::cout << "ERROR findVariable: Excessive traversal (>" << RobustnessLimits::MAX_SCOPE_TRAVERSAL_DEPTH 
+                     << ") for variable '" << name << "' - possible infinite loop" << std::endl;
+            throw std::runtime_error("Scope traversal depth exceeded for variable: " + name);
         }
         
         auto it = current->variables.find(name);
@@ -154,13 +120,22 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
         // Add descendant dependencies to all parents up to definition
         LexicalScopeNode* parent = scope->parentFunctionScope;
         int dep_traversal_count = 0;
+        std::set<LexicalScopeNode*> depVisitedScopes; // Track visited scopes in dependency traversal
+        
         while (parent && parent != defScope) {
             dep_traversal_count++;
             std::cout << "DEBUG findVariable: Adding descendant dep to scope depth " << parent->depth << " (dep traversal #" << dep_traversal_count << ")" << std::endl;
             
-            if (dep_traversal_count > 20) {
-                std::cout << "ERROR findVariable: Excessive dependency traversal (>20) for variable '" << name << "' - possible infinite loop" << std::endl;
-                throw std::runtime_error("Infinite loop detected in findVariable dependency traversal for variable: " + name);
+            // Check for cycles in dependency traversal
+            if (depVisitedScopes.find(parent) != depVisitedScopes.end()) {
+                throw std::runtime_error("Cycle detected in dependency traversal for variable: " + name);
+            }
+            depVisitedScopes.insert(parent);
+            
+            if (dep_traversal_count > RobustnessLimits::MAX_SCOPE_TRAVERSAL_DEPTH) {
+                std::cout << "ERROR findVariable: Excessive dependency traversal (>" << RobustnessLimits::MAX_SCOPE_TRAVERSAL_DEPTH 
+                         << ") for variable '" << name << "' - possible infinite loop" << std::endl;
+                throw std::runtime_error("Dependency traversal depth exceeded for variable: " + name);
             }
             
             addDescendantDep(parent, defScope->depth);
@@ -191,14 +166,21 @@ void Analyzer::addDescendantDep(LexicalScopeNode* scope, int depthIdx) {
     scope->descendantDeps.insert(depthIdx);
 }
 
-void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
-    printf("DEBUG updateAllNeededArrays: Processing scope at depth %d, type=%d\n", scope->depth, (int)scope->type);
+void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope, int depth) {
+    // Prevent infinite recursion
+    if (depth > RobustnessLimits::MAX_AST_RECURSION_DEPTH) {
+        throw std::runtime_error("AST recursion depth exceeded " + 
+                               std::to_string(RobustnessLimits::MAX_AST_RECURSION_DEPTH) + " in updateAllNeededArrays");
+    }
+    
+    printf("DEBUG updateAllNeededArrays: Processing scope at depth %d, type=%d, recursion depth=%d\n", 
+           scope->depth, (int)scope->type, depth);
     
     // First, recursively process all child function scopes
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
-            updateAllNeededArrays(func);
+            updateAllNeededArrays(func, depth + 1);
         }
     }
     
@@ -222,19 +204,30 @@ void Analyzer::updateAllNeededArrays(LexicalScopeNode* scope) {
     }
 }
 
-void Analyzer::buildAllScopeDepthToParentParameterIndexMaps(LexicalScopeNode* scope) {
+void Analyzer::buildAllScopeDepthToParentParameterIndexMaps(LexicalScopeNode* scope, int depth) {
+    // Prevent infinite recursion
+    if (depth > RobustnessLimits::MAX_AST_RECURSION_DEPTH) {
+        throw std::runtime_error("AST recursion depth exceeded " + 
+                               std::to_string(RobustnessLimits::MAX_AST_RECURSION_DEPTH) + " in buildAllScopeDepthToParentParameterIndexMaps");
+    }
+    
     scope->buildScopeDepthToParentParameterIndexMap();
     
     // Traverse AST children (not scope children)
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL || child->type == NodeType::LEXICAL_SCOPE) {
             LexicalScopeNode* childScope = static_cast<LexicalScopeNode*>(child.get());
-            buildAllScopeDepthToParentParameterIndexMaps(childScope);
+            buildAllScopeDepthToParentParameterIndexMaps(childScope, depth + 1);
         }
     }
 }
 
 void Analyzer::setupParentPointers(ASTNode* node, LexicalScopeNode* parent, int depth) {
+    // Prevent infinite recursion
+    if (depth > RobustnessLimits::MAX_AST_RECURSION_DEPTH) {
+        throw std::runtime_error("AST recursion depth exceeded " + 
+                               std::to_string(RobustnessLimits::MAX_AST_RECURSION_DEPTH) + " in setupParentPointers");
+    }
     if (node->type == NodeType::LEXICAL_SCOPE || node->type == NodeType::FUNCTION_DECL) {
         auto scope = static_cast<LexicalScopeNode*>(node);
         scope->parentFunctionScope = parent;
@@ -244,18 +237,24 @@ void Analyzer::setupParentPointers(ASTNode* node, LexicalScopeNode* parent, int 
     }
     
     for (auto& child : node->children) {
-        setupParentPointers(child.get(), parent, depth);
+        setupParentPointers(child.get(), parent, depth + 1);
     }
 }
 
-void Analyzer::packScopes(LexicalScopeNode* scope) {
+void Analyzer::packScopes(LexicalScopeNode* scope, int depth) {
+    // Prevent infinite recursion
+    if (depth > RobustnessLimits::MAX_AST_RECURSION_DEPTH) {
+        throw std::runtime_error("AST recursion depth exceeded " + 
+                               std::to_string(RobustnessLimits::MAX_AST_RECURSION_DEPTH) + " in packScopes");
+    }
+    
     scope->pack();
     
     // Recursively pack all function scopes (they're in AST children)
     for (auto& child : scope->ASTNode::children) {
         if (child->type == NodeType::FUNCTION_DECL) {
             auto func = static_cast<FunctionDeclNode*>(child.get());
-            packScopes(func);
+            packScopes(func, depth + 1);
         }
     }
     // No need for separate scope children traversal - covered above

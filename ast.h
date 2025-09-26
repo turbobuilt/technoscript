@@ -8,6 +8,14 @@
 #include <algorithm>
 #include <stdexcept>
 
+// Robustness limits to prevent infinite loops and hangs
+namespace RobustnessLimits {
+    constexpr int MAX_SCOPE_TRAVERSAL_DEPTH = 50;
+    constexpr int MAX_AST_RECURSION_DEPTH = 1000;
+    constexpr int MAX_PARSER_ITERATIONS = 10000;
+    constexpr int MAX_ANALYSIS_ITERATIONS = 10000;
+}
+
 enum class NodeType {
     PROGRAM, LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT
@@ -37,6 +45,13 @@ struct VariableInfo {
     int size = 8;    // Size in bytes: 8 for regular vars, correct closure size for closures
     LexicalScopeNode* definedIn = nullptr;
     FunctionDeclNode* funcNode = nullptr; // For closures: back-reference to function
+};
+
+// Structure to track closure creation and patching
+struct ClosurePatchInfo {
+    int scopeOffset;              // Offset in scope where closure is stored
+    FunctionDeclNode* function;   // Function this closure points to
+    LexicalScopeNode* scope;      // Scope where this closure is created
 };
 
 
@@ -114,7 +129,7 @@ class FunctionDeclNode : public LexicalScopeNode {
 public:
     std::string funcName;
     std::vector<std::string> params;
-    uint64_t functionAddress = 0;  // Set during codegen, used for patching closures
+    void* asmjitLabel = nullptr;   // asmjit::Label for this function (stored as void* to avoid header dependency)
     
     // NEW: Unified parameter information - single source of truth for all parameter layout
     std::vector<VariableInfo> paramsInfo;        // Regular parameters with calculated offsets

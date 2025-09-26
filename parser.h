@@ -20,11 +20,18 @@ private:
     std::vector<Token> tokens;
     size_t pos = 0;
     int currentDepth = 0;
+    LexicalScopeNode* currentLexicalScope = nullptr;  // Track current lexical scope during parsing
     
     Token& current() { return tokens[pos]; }
     void advance() { if (pos < tokens.size() - 1) pos++; }
     bool match(TokenType t) { return current().type == t; }
     void expect(TokenType t);
+    
+    // Error recovery method
+    bool synchronizeToNextStatement();
+    
+    // Helper method for error messages
+    std::string tokenTypeToString(TokenType type);
     
     std::vector<Token> tokenize(const std::string& code);
     std::unique_ptr<ASTNode> parseStatement(LexicalScopeNode* scope);

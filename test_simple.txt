@@ -1,0 +1,7 @@
+function test(a, b) {
+    var c = 42;
+    print(a);
+}
+
+var x = 10;
+test(x, 20);
