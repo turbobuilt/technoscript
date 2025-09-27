@@ -10,10 +10,14 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
     std::string code = R"(
-test()
-function test() {
-  var a: int64 = 5;
-  print(a)
+var a: int64 = 5;
+var c: int64 = 15;
+test(c)
+function test(z: int64) {
+  var b: int64 = 10;
+  print(a);
+  print(b);
+  print(z);
 }
 )";
     std::cout << "=== Running simple test program ===\n";

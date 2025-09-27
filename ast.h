@@ -17,7 +17,7 @@ namespace RobustnessLimits {
 }
 
 enum class AstNodeType {
-    LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
+    VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT
 };
 
@@ -82,8 +82,9 @@ public:
     // -1 means it's the immediate parent scope itself (stored in current scope)
     std::map<int, int> scopeDepthToParentParameterIndexMap;
     
-    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(AstNodeType::LEXICAL_SCOPE), parentFunctionScope(p), depth(d) {
+    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(AstNodeType::FUNCTION_DECL), parentFunctionScope(p), depth(d) {
         // Parent pointers are set later by setupParentPointers() in analyzer
+        // Note: type will be properly set by derived classes (e.g., FunctionDeclNode)
     }
     
     void updateAllNeeded() {

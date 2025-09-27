@@ -9,6 +9,10 @@ extern "C" {
         return malloc(size);
     }
     
+    void* calloc_wrapper(size_t nmemb, size_t size) {
+        return calloc(nmemb, size);
+    }
+    
     void free_wrapper(void* ptr) {
         free(ptr);
     }
@@ -162,28 +166,28 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     // copy r15 to r14
     cb->mov(x86::r14, x86::r15);
     
-    // Call malloc to allocate scope
-    // mov rdi, scope->totalSize (first argument)
-    cb->mov(x86::rdi, scope->totalSize);
+    // Save rdi and rsi before calling calloc (they might contain parameters)
+    cb->push(x86::rdi);
+    cb->push(x86::rsi);
     
-    // Call malloc - we need to call the actual malloc function
+    // Call calloc to allocate and zero-initialize scope
+    // mov rdi, 1 (number of elements)
+    cb->mov(x86::rdi, 1);
+    // mov rsi, scope->totalSize (size of each element)
+    cb->mov(x86::rsi, scope->totalSize);
+    
+    // Call calloc - we need to call the actual calloc function
     // For simplicity, we'll embed the function pointer directly
-    uint64_t mallocAddr = reinterpret_cast<uint64_t>(&malloc_wrapper);
-    cb->mov(x86::rax, mallocAddr);
+    uint64_t callocAddr = reinterpret_cast<uint64_t>(&calloc_wrapper);
+    cb->mov(x86::rax, callocAddr);
     cb->call(x86::rax);
+    
+    // Restore rsi and rdi after calloc (in reverse order due to stack)
+    cb->pop(x86::rsi);
+    cb->pop(x86::rdi);
     
     // Store the allocated memory address in r15
     cb->mov(x86::r15, x86::rax);
-    
-    // Zero out the allocated memory
-    cb->mov(x86::rdi, x86::r15);         // destination
-    cb->mov(x86::rsi, 0);                // value to fill (0)
-    cb->mov(x86::rdx, scope->totalSize); // count
-    
-    // Call memset - embed function pointer
-    uint64_t memsetAddr = reinterpret_cast<uint64_t>(&memset);
-    cb->mov(x86::rax, memsetAddr);
-    cb->call(x86::rax);
     
     currentScope = scope;
 }
@@ -293,6 +297,27 @@ void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp de
         
         x86::Gp parentScopeReg = getParameterByIndex(access.scopeParameterIndex);
         cb->mov(destReg, x86::ptr(parentScopeReg, access.offset + offsetInVariable));
+    }
+}
+
+void CodeGenerator::loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable) {
+    if (!identifier->varRef) {
+        throw std::runtime_error("Variable reference not analyzed: " + identifier->value);
+    }
+    
+    // Get the variable access information
+    auto access = identifier->getVariableAccess();
+    
+    if (access.inCurrentScope) {
+        // Variable is in current scope (r15) - load address using LEA
+        std::cout << "Loading address of variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
+        cb->lea(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
+    } else {
+        // Variable is in a parent scope - get the parameter by index and load address from that scope
+        std::cout << "Loading address of variable '" << identifier->value << "' from parent scope parameter index " << access.scopeParameterIndex << " at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
+        
+        x86::Gp parentScopeReg = getParameterByIndex(access.scopeParameterIndex);
+        cb->lea(destReg, x86::ptr(parentScopeReg, access.offset + offsetInVariable));
     }
 }
 
@@ -425,19 +450,12 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     cb->push(x86::rbp);
     cb->mov(x86::rbp, x86::rsp);
     
-    // Save r15 (current scope pointer) 
+    // Save r15 (current scope pointer)
     cb->push(x86::r15);
     
     // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
     const int maxRegParams = 6;
-    
-    // FIRST: Save parameter registers to stack before malloc/memset clobbers them
-    std::cout << "Saving " << funcDecl->paramsInfo.size() << " parameters to stack temporarily" << std::endl;
-    for (size_t i = 0; i < funcDecl->paramsInfo.size() && i < maxRegParams; i++) {
-        std::cout << "  Saving parameter " << i << " from register to stack" << std::endl;
-        cb->push(paramRegs[i]);
-    }
     
     // NOW: Allocate the function's lexical scope (this calls malloc/memset which clobbers registers)
     allocateScope(funcDecl);
@@ -449,12 +467,9 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     for (int i = std::min((int)funcDecl->paramsInfo.size(), maxRegParams) - 1; i >= 0; i--) {
         const VariableInfo& param = funcDecl->paramsInfo[i];
         int offset = param.offset;
-        
-        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "] (from stack)" << std::endl;
-        
-        // Pop the saved parameter from stack and store in scope
-        cb->pop(x86::rax);
-        cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+        // print out the offset and register it's in
+        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "] (from register)" << std::endl;
+        cb->mov(x86::ptr(x86::r15, offset), paramRegs[i]);
     }
     
     // Copy stack parameters (if any) - these weren't clobbered by malloc
@@ -578,22 +593,72 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
     const int maxRegParams = 6;
     
-    // Evaluate and pass arguments
-    std::cout << "Passing " << funcCall->args.size() << " arguments" << std::endl;
+    // Calculate total parameters (regular + hidden)
+    size_t regularArgCount = funcCall->args.size();
+    size_t hiddenParamCount = funcCall->varRef->funcNode->allNeeded.size();
+    size_t totalParamCount = regularArgCount + hiddenParamCount;
     
-    // Count stack parameters for alignment
-    int stackParams = 0;
-    if (funcCall->args.size() > maxRegParams) {
-        stackParams = funcCall->args.size() - maxRegParams;
+    std::cout << "Passing " << regularArgCount << " regular arguments and " << hiddenParamCount << " hidden parameters" << std::endl;
+    
+    // Count total stack parameters for alignment
+    int totalStackParams = 0;
+    if (totalParamCount > maxRegParams) {
+        totalStackParams = totalParamCount - maxRegParams;
     }
     
     // Ensure stack is 16-byte aligned before call (stack params are 8 bytes each)
-    if (stackParams % 2 == 1) {
+    if (totalStackParams % 2 == 1) {
         cb->sub(x86::rsp, 8); // Add padding for alignment
+    }
+
+    // Load regular arguments into available registers
+    for (size_t i = 0; i < regularArgCount && i < maxRegParams; i++) {
+        ASTNode* arg = funcCall->args[i].get();
+        
+        std::cout << "  Regular arg " << i << " -> register " << i << std::endl;
+        
+        if (arg->type == AstNodeType::IDENTIFIER) {
+            loadVariableFromScope(static_cast<IdentifierNode*>(arg), paramRegs[i]);
+        } else {
+            loadValue(arg, paramRegs[i]);
+        }
+    }
+
+    // Load the closure address for accessing hidden parameters
+    loadVariableAddress(static_cast<IdentifierNode*>(funcCall), x86::rbx);
+    
+    // Load hidden parameters into remaining available registers
+    for (size_t i = 0; i < hiddenParamCount; i++) {
+        size_t paramIndex = regularArgCount + i;
+        
+        if (paramIndex < maxRegParams) {
+            // Hidden parameter fits in register
+            int closureOffset = 8 + (i * 8); // offset + 8 for scope pointer
+            std::cout << "  Hidden param " << i << " (depth " << funcCall->varRef->funcNode->allNeeded[i] << ") -> register " << paramIndex << std::endl;
+            
+            // Load the scope pointer from closure: [rbx + closureOffset]
+            cb->mov(paramRegs[paramIndex], x86::ptr(x86::rbx, closureOffset));
+        }
     }
     
     // Push stack parameters in reverse order (right to left)
-    for (int i = funcCall->args.size() - 1; i >= maxRegParams; i--) {
+    // First push hidden stack parameters in reverse order
+    for (int i = hiddenParamCount - 1; i >= 0; i--) {
+        size_t paramIndex = regularArgCount + i;
+        
+        if (paramIndex >= maxRegParams) {
+            // Hidden parameter goes on stack
+            int closureOffset = 8 + (i * 8); // offset + 8 for scope pointer
+            std::cout << "  Hidden param " << i << " (depth " << funcCall->varRef->funcNode->allNeeded[i] << ") -> stack" << std::endl;
+            
+            // Load the scope pointer from closure and push it
+            cb->mov(x86::rax, x86::ptr(x86::rbx, closureOffset));
+            cb->push(x86::rax);
+        }
+    }
+    
+    // Then push regular stack parameters in reverse order
+    for (int i = regularArgCount - 1; i >= maxRegParams; i--) {
         ASTNode* arg = funcCall->args[i].get();
         
         if (arg->type == AstNodeType::IDENTIFIER) {
@@ -603,24 +668,9 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
         }
         
         cb->push(x86::rax);
-        std::cout << "  Stack arg " << (i - maxRegParams) << ": pushed" << std::endl;
+        std::cout << "  Regular stack arg " << (i - maxRegParams) << ": pushed" << std::endl;
     }
-    
-    // Load arguments into registers
-    for (size_t i = 0; i < funcCall->args.size() && i < maxRegParams; i++) {
-        ASTNode* arg = funcCall->args[i].get();
-        
-        std::cout << "  Register arg " << i << " -> register " << i << std::endl;
-        
-        if (arg->type == AstNodeType::IDENTIFIER) {
-            loadVariableFromScope(static_cast<IdentifierNode*>(arg), paramRegs[i]);
-        } else {
-            loadValue(arg, paramRegs[i]);
-        }
-    }
-    
-    // TODO: Add hidden parameters (parent scope pointers) after regular arguments
-    // For now, we're not implementing lexical scope capture in function calls
+
     
     // Save current r15 before function call
     cb->push(x86::r15);
@@ -635,8 +685,8 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     cb->pop(x86::r15);
     
     // Clean up stack parameters (if any)
-    int totalStackBytes = stackParams * 8;
-    if (stackParams % 2 == 1) {
+    int totalStackBytes = totalStackParams * 8;
+    if (totalStackParams % 2 == 1) {
         totalStackBytes += 8; // Include alignment padding
     }
     

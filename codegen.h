@@ -55,6 +55,7 @@ private:
     void loadValue(ASTNode* valueNode, x86::Gp destReg);
     void storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope);
     void loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
+    void loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
     x86::Gp getParameterByIndex(int paramIndex);
     
     // External function declarations
