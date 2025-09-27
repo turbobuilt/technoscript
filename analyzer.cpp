@@ -71,8 +71,9 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         // Pack the scope
         scope->pack();
         
-        // Build parameter index maps
+        // Build parameter index maps if it's a function scope or the root scope
         scope->buildScopeDepthToParentParameterIndexMap();
+
         
         std::cout << "DEBUG: Completed post-processing for scope at depth " << scope->depth << std::endl;
     }

@@ -42,5 +42,5 @@ private:
     std::unique_ptr<ASTNode> parseGoStmt();
     
 public:
-    std::unique_ptr<LexicalScopeNode> parse(const std::string& code);
+    std::unique_ptr<FunctionDeclNode> parse(const std::string& code);
 };

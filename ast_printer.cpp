@@ -6,7 +6,6 @@ void printAST(ASTNode* node, int indent) {
     std::cout << spaces;
     
     switch (node->type) {
-        case AstNodeType::PROGRAM: std::cout << "PROGRAM"; break;
         case AstNodeType::FUNCTION_DECL:
             // Fall through to LEXICAL_SCOPE
         case AstNodeType::LEXICAL_SCOPE: {

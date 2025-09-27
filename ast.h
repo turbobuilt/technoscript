@@ -17,7 +17,7 @@ namespace RobustnessLimits {
 }
 
 enum class AstNodeType {
-    PROGRAM, LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
+    LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT
 };
 
@@ -152,7 +152,6 @@ class IdentifierNode : public ASTNode {
 public:
     struct VariableAccess {
         int scopeParameterIndex; // -1 if in current scope, else index in parent params
-        int parameterOffset; // Byte offset for variable-sized parameters
         int offset; // Offset within the scope for the variable
     };
     
@@ -169,15 +168,19 @@ public:
         LexicalScopeNode* definingScope = varRef->definedIn;
         
         if (definingScope == accessedIn) {
-            return {-1, 0, varRef->offset};
+            return {-1, varRef->offset};
         } else {
             // Use the access method to get parameter index for the defining scope
-            int scopeParamIndex = definingScope->getParameterIndexInCurrentScope(accessedIn);
-            
-            // Use the helper method to calculate parameter offset
-            int paramOffset = accessedIn->getParameterOffset(scopeParamIndex);
-            
-            return {scopeParamIndex, paramOffset, varRef->offset};
+            // check if it is a FunctionDeclNode, we handle those different than block scope
+            if (accessedIn->type == AstNodeType::FUNCTION_DECL) {
+                int scopeParamIndex = definingScope->getParameterIndexInCurrentScope(accessedIn);
+                
+                return {scopeParamIndex, varRef->offset};
+            } else {
+                // throw for now
+                // for block scope we will have pushed needed scope addresses onto stack.
+                throw std::runtime_error("Variable in non-function parent scope not supported yet: " + value);
+            }
         }
     }
 };
@@ -209,10 +212,9 @@ inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
         throw std::runtime_error("buildScopeDepthToParentParameterIndexMap called multiple times on same scope - analysis bug");
     }
     
-    if (!parentFunctionScope) return; // Root scope has no parent
-    
     // Only function scopes need parameter mapping
     if (this->type != AstNodeType::FUNCTION_DECL) return;
+    
     
     // Get the current function's parameter count
     FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
@@ -227,9 +229,8 @@ inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
     
     for (int neededDepth : allNeeded) {
         if (neededDepth == this->depth) {
-            // This is the current scope - access via R15
-            printf("DEBUG buildScopeDepthToParentParameterIndexMap: depth %d (current) -> param index -1\n", neededDepth);
-            scopeDepthToParentParameterIndexMap[neededDepth] = -1;
+            // this should throw an error that the current scope shouldn't be in allNeeded
+            throw std::runtime_error("Current scope depth found in allNeeded - analysis bug");
         } else {
             // Scope parameters start after regular parameters
             int paramIndex = currentParamCount + hiddenParamIndex;

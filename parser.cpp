@@ -62,7 +62,7 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
     return result;
 }
 
-std::unique_ptr<LexicalScopeNode> Parser::parse(const std::string& code) {
+std::unique_ptr<FunctionDeclNode> Parser::parse(const std::string& code) {
     std::cout << "DEBUG Parser::parse: Starting parse" << std::endl;
     
     tokens = tokenize(code);
@@ -75,7 +75,8 @@ std::unique_ptr<LexicalScopeNode> Parser::parse(const std::string& code) {
     
     pos = 0;
     currentDepth = 0;
-    auto root = std::make_unique<LexicalScopeNode>(nullptr, 0);
+    auto root = std::make_unique<FunctionDeclNode>("main", nullptr);
+    root->depth = 0; // Explicitly set main function depth to 0
     currentLexicalScope = root.get();  // Set initial scope
     
     int iterations = 0;

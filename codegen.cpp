@@ -112,17 +112,12 @@ void CodeGenerator::generateProgram(ASTNode* root) {
         throw std::runtime_error("Null program root");
     }
     
-    // Handle both PROGRAM nodes and LexicalScopeNode as root
-    if (root->type == AstNodeType::PROGRAM) {
-        // Process all children of the program
-        for (auto& child : root->children) {
-            visitNode(child.get());
-        }
-    } else if (root->type == AstNodeType::LEXICAL_SCOPE) {
-        // Treat the lexical scope as the main program scope
+    // Root should always be a FUNCTION_DECL (the main function)
+    if (root->type == AstNodeType::FUNCTION_DECL) {
+        // Treat the main function as the program root
         visitNode(root);
     } else {
-        throw std::runtime_error("Invalid program root node type");
+        throw std::runtime_error("Invalid program root node type - expected FUNCTION_DECL");
     }
 }
 
@@ -130,7 +125,6 @@ void CodeGenerator::visitNode(ASTNode* node) {
     if (!node) return;
     
     switch (node->type) {
-        case AstNodeType::PROGRAM:
         case AstNodeType::LEXICAL_SCOPE:
             generateLexicalScope(static_cast<LexicalScopeNode*>(node));
             break;
