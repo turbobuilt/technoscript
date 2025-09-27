@@ -18,7 +18,7 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
     LexicalScopeNode* currentScope = parentScope;
     
     // Step 1: Setup parent pointers and depth for scope nodes (on the way down)
-    if (node->type == AstNodeType::LEXICAL_SCOPE || node->type == AstNodeType::FUNCTION_DECL) {
+    if (node->type == AstNodeType::FUNCTION_DECL) {
         auto scope = static_cast<LexicalScopeNode*>(node);
         scope->parentFunctionScope = parentScope;
         scope->depth = depth;
@@ -51,7 +51,7 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
     }
     
     // Step 4: Post-process scope nodes (on the way back up)
-    if (node->type == AstNodeType::LEXICAL_SCOPE || node->type == AstNodeType::FUNCTION_DECL) {
+    if (node->type == AstNodeType::FUNCTION_DECL) {
         auto scope = static_cast<LexicalScopeNode*>(node);
         
         // Update allNeeded arrays now that all children have been processed

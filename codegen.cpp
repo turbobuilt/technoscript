@@ -112,10 +112,18 @@ void CodeGenerator::generateProgram(ASTNode* root) {
         throw std::runtime_error("Null program root");
     }
     
+    std::cout << "Generating program - treating main as regular function" << std::endl;
+    
     // Root should always be a FUNCTION_DECL (the main function)
     if (root->type == AstNodeType::FUNCTION_DECL) {
-        // Treat the main function as the program root
-        visitNode(root);
+        FunctionDeclNode* mainFunc = static_cast<FunctionDeclNode*>(root);
+        
+        // Pre-create the main function label
+        Label mainFuncLabel = cb->newLabel();
+        mainFunc->asmjitLabel = new Label(mainFuncLabel);
+        
+        // Generate the main function like any other function
+        generateFunctionDecl(mainFunc);
     } else {
         throw std::runtime_error("Invalid program root node type - expected FUNCTION_DECL");
     }
@@ -125,9 +133,6 @@ void CodeGenerator::visitNode(ASTNode* node) {
     if (!node) return;
     
     switch (node->type) {
-        case AstNodeType::LEXICAL_SCOPE:
-            generateLexicalScope(static_cast<LexicalScopeNode*>(node));
-            break;
         case AstNodeType::VAR_DECL:
             generateVarDecl(static_cast<VarDeclNode*>(node));
             break;
@@ -151,7 +156,6 @@ void CodeGenerator::visitNode(ASTNode* node) {
 
 void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     std::cout << "Allocating scope of size: " << scope->totalSize << " bytes" << std::endl;
-
 
     // push r14 to stack
     cb->push(x86::r14);
@@ -182,42 +186,6 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     cb->call(x86::rax);
     
     currentScope = scope;
-}
-
-void CodeGenerator::generateLexicalScope(LexicalScopeNode* scope) {
-    // Allocate memory for this scope
-    allocateScope(scope);
-    
-    // Handle function hoisting - create closures for all functions using efficient variables map
-    for (const auto& [name, varInfo] : scope->variables) {
-        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
-            auto funcDecl = varInfo.funcNode;
-            // Create function label and store address in closure
-            createFunctionLabel(funcDecl);
-            storeFunctionAddressInClosure(funcDecl, scope);
-        }
-    }
-    
-    // Process all NON-FUNCTION children first (main program logic)
-    for (auto& child : scope->children) {
-        if (child->type != AstNodeType::FUNCTION_DECL) {
-            visitNode(child.get());
-        }
-    }
-    
-    // Add return instruction to end main program execution before function definitions
-    // Only do this for the root scope to avoid returns in nested scopes
-    if (scope->depth == 0) {
-        cb->mov(x86::eax, 0); // Return 0 for main program
-        cb->ret();
-    }
-    
-    // Then generate function bodies AFTER main program logic
-    for (auto& child : scope->children) {
-        if (child->type == AstNodeType::FUNCTION_DECL) {
-            visitNode(child.get());
-        }
-    }
 }
 
 void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
@@ -315,7 +283,7 @@ void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp de
     // Get the variable access information
     auto access = identifier->getVariableAccess();
     
-    if (access.scopeParameterIndex == -1) {
+    if (access.inCurrentScope) {
         // Variable is in current scope (r15)
         std::cout << "Loading variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         cb->mov(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
@@ -335,15 +303,14 @@ void CodeGenerator::generatePrintStmt(ASTNode* printStmt) {
     
     ASTNode* arg = printStmt->children[0].get();
     
+    std::cout << "Generating call to print_int64" << std::endl;
+    
     // Load the value to print into rdi (first argument register)
     if (arg->type == AstNodeType::IDENTIFIER) {
         loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rdi);
     } else {
         loadValue(arg, x86::rdi);
     }
-    
-    // Call the print function
-    std::cout << "Generating call to print_int64" << std::endl;
     
     // Call the external print function
     uint64_t printAddr = reinterpret_cast<uint64_t>(&print_int64);
@@ -390,8 +357,9 @@ void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
 void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
     std::cout << "Generating function: " << funcDecl->funcName << std::endl;
     
+    Label* funcLabel;
     // The label should already exist from hoisting phase
-    Label* funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
+    funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
     if (!funcLabel) {
         throw std::runtime_error("Function label not found for hoisted function: " + funcDecl->funcName);
     }
@@ -399,20 +367,44 @@ void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
     // Bind the function label (start of actual function code)
     cb->bind(*funcLabel);
     
-    // Generate function prologue (now includes scope allocation and parameter copying)
+    // Generate function prologue (includes scope allocation and parameter copying)
     generateFunctionPrologue(funcDecl);
     
     // Set this function as current scope for variable access
     LexicalScopeNode* previousScope = currentScope;
     currentScope = funcDecl;
     
-    // Generate the function body
-    for (auto& child : funcDecl->children) {
-        visitNode(child.get());
+    // Handle function hoisting - create closures for all functions in this scope
+    for (const auto& [name, varInfo] : funcDecl->variables) {
+        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
+            auto childFuncDecl = varInfo.funcNode;
+            // Create function label and store address in closure
+            createFunctionLabel(childFuncDecl);
+            storeFunctionAddressInClosure(childFuncDecl, funcDecl);
+        }
     }
     
-    // Generate function epilogue
+    // Process all NON-FUNCTION children (the actual function body)
+    for (auto& child : funcDecl->children) {
+        if (child->type != AstNodeType::FUNCTION_DECL) {
+            visitNode(child.get());
+        }
+    }
+    
+    // For main function, set return value
+    if (funcDecl->funcName == "main") {
+        cb->mov(x86::eax, 0); // Return 0 for main program
+    }
+    
+    // Generate function epilogue - end this function completely
     generateFunctionEpilogue(funcDecl);
+    
+    // Now generate nested functions as separate standalone functions  
+    for (auto& child : funcDecl->children) {
+        if (child->type == AstNodeType::FUNCTION_DECL) {
+            visitNode(child.get());
+        }
+    }
     
     // Restore previous scope
     currentScope = previousScope;
@@ -547,6 +539,14 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
     // now store any needed closure addresses for parent scopes allNeeded
     // loop through allNeeded
     for (const auto& neededDepth : funcDecl->allNeeded) {
+        // Special case: if we're in the scope that matches the needed depth,
+        // we don't need to look up parameter mapping - use current scope directly
+        if (scope->depth == neededDepth) {
+            cb->mov(x86::rax, x86::r15); // current scope address
+            cb->mov(x86::ptr(x86::r15, offset + 8), x86::rax); // store in closure (offset + 8 for scope pointer)
+            continue;
+        }
+        
         // find parameter index in scopeDepthToParentParameterIndexMap
         auto it = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
         if (it == scope->scopeDepthToParentParameterIndexMap.end()) {
@@ -554,7 +554,7 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         }
         // r14 value if -1
         if (it->second == -1) {
-            cb->mov(x86::ptr(x86::r15, offset), x86::r14); // parent scope address
+            cb->mov(x86::ptr(x86::r15, offset + 8), x86::r14); // parent scope address
             continue;
         } 
         // cast to FunctionDeclNode
@@ -563,36 +563,16 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         // index - paramsInfo.size() gives the hidden parameter index in hiddenParamsInfo
         int hiddenParamIndex = it->second - funcDeclParent->paramsInfo.size();
         if (hiddenParamIndex < 0 || hiddenParamIndex >= static_cast<int>(funcDeclParent->hiddenParamsInfo.size())) {
-            throw std::runtime_error("Hidden parameter index out of range for needed variable: " + neededDepth);
+            throw std::runtime_error("Hidden parameter index out of range for needed variable: " + std::to_string(neededDepth));
         }
         int hiddenParamOffset = funcDeclParent->hiddenParamsInfo[hiddenParamIndex].offset;
         cb->mov(x86::rax, x86::ptr(x86::r14, hiddenParamOffset)); // load parent scope address
-        cb->mov(x86::ptr(x86::r15, offset), x86::rax); // store in closure
+        cb->mov(x86::ptr(x86::r15, offset + 8), x86::rax); // store in closure
     }
 }
 
 void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     std::cout << "Generating function call: " << funcCall->value << std::endl;
-    
-    // Get the function address from the closure stored in the current scope
-    auto access = funcCall->getVariableAccess();
-    int funcAddrOffset = -1; // Initialize function address offset
-    
-    if (access.scopeParameterIndex == -1) {
-        // Function is in current scope - load address from closure variable
-        auto it = currentScope->variables.find(funcCall->value);
-        if (it == currentScope->variables.end() || it->second.type != DataType::CLOSURE) {
-            throw std::runtime_error("Function not found or not a closure: " + funcCall->value);
-        }
-        
-        // Store function address offset for later use (don't load yet to avoid clobbering)
-        funcAddrOffset = it->second.offset;
-        std::cout << "Function address will be loaded from r15+" << funcAddrOffset << std::endl;
-        
-    } else {
-        // Function is in parent scope - not implemented yet
-        throw std::runtime_error("Parent scope function calls not implemented yet");
-    }
     
     // System V ABI: rdi, rsi, rdx, rcx, r8, r9, then stack
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
@@ -645,8 +625,8 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     // Save current r15 before function call
     cb->push(x86::r15);
     
-    // Now load the function address from closure (after all register setup is done)
-    cb->mov(x86::rax, x86::ptr(x86::r15, funcAddrOffset));
+    // Load the function address from closure using loadVariableFromScope
+    loadVariableFromScope(static_cast<IdentifierNode*>(funcCall), x86::rax);
     
     // Indirect call through function address loaded from closure
     cb->call(x86::rax);

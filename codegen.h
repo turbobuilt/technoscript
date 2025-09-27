@@ -38,7 +38,6 @@ private:
     // Helper methods
     void visitNode(ASTNode* node);
     void generateProgram(ASTNode* root);
-    void generateLexicalScope(LexicalScopeNode* scope);
     void generateVarDecl(VarDeclNode* varDecl);
     void generatePrintStmt(ASTNode* printStmt);
     void generateFunctionDecl(FunctionDeclNode* funcDecl);

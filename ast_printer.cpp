@@ -6,17 +6,13 @@ void printAST(ASTNode* node, int indent) {
     std::cout << spaces;
     
     switch (node->type) {
-        case AstNodeType::FUNCTION_DECL:
-            // Fall through to LEXICAL_SCOPE
-        case AstNodeType::LEXICAL_SCOPE: {
+        case AstNodeType::FUNCTION_DECL: {
             auto scope = static_cast<LexicalScopeNode*>(node);
             std::cout << "SCOPE(depth=" << scope->depth << ")";
             
-            // If this scope is also a function
-            if (node->type == AstNodeType::FUNCTION_DECL) {
-                auto func = static_cast<FunctionDeclNode*>(scope);
-                std::cout << " FUNC(" << func->funcName << ")";
-            }
+            // This scope is a function
+            auto func = static_cast<FunctionDeclNode*>(scope);
+            std::cout << " FUNC(" << func->funcName << ")";
             
             // Print parent dependencies
             if (!scope->parentDeps.empty()) {

@@ -103,10 +103,6 @@ public:
     }
     
     void buildScopeDepthToParentParameterIndexMap();
-    
-    int getParameterIndexInCurrentScope(LexicalScopeNode* activeScope) {
-        return activeScope->scopeDepthToParentParameterIndexMap.at(this->depth);
-    }
 
     int getParameterOffset(int index); // Declaration only, implementation after FunctionDeclNode
     
@@ -151,7 +147,8 @@ public:
 class IdentifierNode : public ASTNode {
 public:
     struct VariableAccess {
-        int scopeParameterIndex; // -1 if in current scope, else index in parent params
+        bool inCurrentScope; // true if in current scope, false if in parent scope
+        size_t scopeParameterIndex; // index in parent params (only valid if inCurrentScope is false)
         int offset; // Offset within the scope for the variable
     };
     
@@ -168,14 +165,22 @@ public:
         LexicalScopeNode* definingScope = varRef->definedIn;
         
         if (definingScope == accessedIn) {
-            return {-1, varRef->offset};
+            return {true, 0, varRef->offset}; // inCurrentScope=true, scopeParameterIndex irrelevant
         } else {
             // Use the access method to get parameter index for the defining scope
             // check if it is a FunctionDeclNode, we handle those different than block scope
             if (accessedIn->type == AstNodeType::FUNCTION_DECL) {
-                int scopeParamIndex = definingScope->getParameterIndexInCurrentScope(accessedIn);
+                // cast to FunctionDeclNode
+                auto funcDecl = static_cast<FunctionDeclNode*>(accessedIn);
+                // get index in allneeded
+                auto it = std::find(funcDecl->allNeeded.begin(), funcDecl->allNeeded.end(), definingScope->depth);
+                if (it == funcDecl->allNeeded.end()) {
+                    throw std::runtime_error("Scope depth not found in allNeeded: " + std::to_string(definingScope->depth));
+                }
+                auto hiddenIndex = std::distance(funcDecl->allNeeded.begin(), it);
+                auto actualParameterIndex = funcDecl->paramsInfo.size() + hiddenIndex; // regular params + hidden param index
                 
-                return {scopeParamIndex, varRef->offset};
+                return {false, actualParameterIndex, varRef->offset}; // inCurrentScope=false
             } else {
                 // throw for now
                 // for block scope we will have pushed needed scope addresses onto stack.
