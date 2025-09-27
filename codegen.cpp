@@ -71,10 +71,6 @@ void* CodeGenerator::generateCode(ASTNode* root) {
     
     std::cout << "Code size after program: " << code.codeSize() << std::endl;
     
-    // Simple return for main program
-    cb->mov(x86::eax, 0); // Return 0
-    cb->ret();
-    
     // Finalize the code (this resolves all forward references)
     cb->finalize();
     
@@ -117,12 +113,12 @@ void CodeGenerator::generateProgram(ASTNode* root) {
     }
     
     // Handle both PROGRAM nodes and LexicalScopeNode as root
-    if (root->type == ::NodeType::PROGRAM) {
+    if (root->type == AstNodeType::PROGRAM) {
         // Process all children of the program
         for (auto& child : root->children) {
             visitNode(child.get());
         }
-    } else if (root->type == ::NodeType::LEXICAL_SCOPE) {
+    } else if (root->type == AstNodeType::LEXICAL_SCOPE) {
         // Treat the lexical scope as the main program scope
         visitNode(root);
     } else {
@@ -134,20 +130,20 @@ void CodeGenerator::visitNode(ASTNode* node) {
     if (!node) return;
     
     switch (node->type) {
-        case ::NodeType::PROGRAM:
-        case ::NodeType::LEXICAL_SCOPE:
+        case AstNodeType::PROGRAM:
+        case AstNodeType::LEXICAL_SCOPE:
             generateLexicalScope(static_cast<LexicalScopeNode*>(node));
             break;
-        case ::NodeType::VAR_DECL:
+        case AstNodeType::VAR_DECL:
             generateVarDecl(static_cast<VarDeclNode*>(node));
             break;
-        case ::NodeType::PRINT_STMT:
+        case AstNodeType::PRINT_STMT:
             generatePrintStmt(node);
             break;
-        case ::NodeType::FUNCTION_DECL:
+        case AstNodeType::FUNCTION_DECL:
             generateFunctionDecl(static_cast<FunctionDeclNode*>(node));
             break;
-        case ::NodeType::FUNCTION_CALL:
+        case AstNodeType::FUNCTION_CALL:
             generateFunctionCall(static_cast<FunctionCallNode*>(node));
             break;
         default:
@@ -161,6 +157,12 @@ void CodeGenerator::visitNode(ASTNode* node) {
 
 void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     std::cout << "Allocating scope of size: " << scope->totalSize << " bytes" << std::endl;
+
+
+    // push r14 to stack
+    cb->push(x86::r14);
+    // copy r15 to r14
+    cb->mov(x86::r14, x86::r15);
     
     // Call malloc to allocate scope
     // mov rdi, scope->totalSize (first argument)
@@ -202,9 +204,25 @@ void CodeGenerator::generateLexicalScope(LexicalScopeNode* scope) {
         }
     }
     
-    // Process all other children (including function bodies)
+    // Process all NON-FUNCTION children first (main program logic)
     for (auto& child : scope->children) {
-        visitNode(child.get());
+        if (child->type != AstNodeType::FUNCTION_DECL) {
+            visitNode(child.get());
+        }
+    }
+    
+    // Add return instruction to end main program execution before function definitions
+    // Only do this for the root scope to avoid returns in nested scopes
+    if (scope->depth == 0) {
+        cb->mov(x86::eax, 0); // Return 0 for main program
+        cb->ret();
+    }
+    
+    // Then generate function bodies AFTER main program logic
+    for (auto& child : scope->children) {
+        if (child->type == AstNodeType::FUNCTION_DECL) {
+            visitNode(child.get());
+        }
     }
 }
 
@@ -234,18 +252,18 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
     if (!valueNode) return;
     
     switch (valueNode->type) {
-        case ::NodeType::LITERAL: {
+        case AstNodeType::LITERAL: {
             // Parse the literal value and load it
             int64_t value = std::stoll(valueNode->value);
             cb->mov(destReg, value);
             break;
         }
-        case ::NodeType::IDENTIFIER: {
+        case AstNodeType::IDENTIFIER: {
             // Load variable from scope
             loadVariableFromScope(static_cast<IdentifierNode*>(valueNode), destReg);
             break;
         }
-        case ::NodeType::FUNCTION_CALL: {
+        case AstNodeType::FUNCTION_CALL: {
             // Generate function call and load result into destReg
             generateFunctionCall(static_cast<FunctionCallNode*>(valueNode));
             // Function call result is in rax, move to destReg if different
@@ -273,7 +291,29 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
     cb->mov(x86::ptr(x86::r15, offset), valueReg);
 }
 
-void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg) {
+x86::Gp CodeGenerator::getParameterByIndex(int paramIndex) {
+    // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9
+    x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
+    const int maxRegParams = 6;
+    
+    if (paramIndex < maxRegParams) {
+        // Parameter is in a register
+        std::cout << "Parameter " << paramIndex << " is in register" << std::endl;
+        return paramRegs[paramIndex];
+    } else {
+        // Parameter is on stack - load it into a temporary register (rax)
+        std::cout << "Parameter " << paramIndex << " is on stack, loading to rax" << std::endl;
+        
+        // Calculate stack offset for this parameter
+        // Stack layout: [return_addr][saved_rbp][saved_r15][stack_params...]
+        int stackOffset = 24 + (paramIndex - maxRegParams) * 8;
+        cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
+        
+        return x86::rax;
+    }
+}
+
+void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable) {
     if (!identifier->varRef) {
         throw std::runtime_error("Variable reference not analyzed: " + identifier->value);
     }
@@ -281,14 +321,16 @@ void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp de
     // Get the variable access information
     auto access = identifier->getVariableAccess();
     
-    if (access.parameterIndex == -1) {
+    if (access.scopeParameterIndex == -1) {
         // Variable is in current scope (r15)
-        std::cout << "Loading variable '" << identifier->value << "' from current scope at offset " << access.offset << std::endl;
-        cb->mov(destReg, x86::ptr(x86::r15, access.offset));
+        std::cout << "Loading variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
+        cb->mov(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
     } else {
-        // Variable is in a parent scope - would need to load from parameter
-        // For now, throw an error as we're not implementing function calls yet
-        throw std::runtime_error("Parent scope variable access not implemented yet: " + identifier->value);
+        // Variable is in a parent scope - get the parameter by index and load from that scope
+        std::cout << "Loading variable '" << identifier->value << "' from parent scope parameter index " << access.scopeParameterIndex << " at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
+        
+        x86::Gp parentScopeReg = getParameterByIndex(access.scopeParameterIndex);
+        cb->mov(destReg, x86::ptr(parentScopeReg, access.offset + offsetInVariable));
     }
 }
 
@@ -300,7 +342,7 @@ void CodeGenerator::generatePrintStmt(ASTNode* printStmt) {
     ASTNode* arg = printStmt->children[0].get();
     
     // Load the value to print into rdi (first argument register)
-    if (arg->type == ::NodeType::IDENTIFIER) {
+    if (arg->type == AstNodeType::IDENTIFIER) {
         loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rdi);
     } else {
         loadValue(arg, x86::rdi);
@@ -400,33 +442,49 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     // Save r15 (current scope pointer) 
     cb->push(x86::r15);
     
-    // Allocate the function's lexical scope first (moved from generateFunction)
-    allocateScope(funcDecl);
-    
-    // Copy parameters from ABI registers/stack to their locations in the scope
-    // System V ABI: rdi, rsi, rdx, rcx, r8, r9, then stack
+    // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
     const int maxRegParams = 6;
     
+    // FIRST: Save parameter registers to stack before malloc/memset clobbers them
+    std::cout << "Saving " << funcDecl->paramsInfo.size() << " parameters to stack temporarily" << std::endl;
+    for (size_t i = 0; i < funcDecl->paramsInfo.size() && i < maxRegParams; i++) {
+        std::cout << "  Saving parameter " << i << " from register to stack" << std::endl;
+        cb->push(paramRegs[i]);
+    }
+    
+    // NOW: Allocate the function's lexical scope (this calls malloc/memset which clobbers registers)
+    allocateScope(funcDecl);
+    
+    // FINALLY: Copy parameters from stack and original stack locations to their final locations in scope
     std::cout << "Copying " << funcDecl->paramsInfo.size() << " parameters to scope" << std::endl;
     
-    for (size_t i = 0; i < funcDecl->paramsInfo.size(); i++) {
+    // Copy register parameters (in reverse order since we pushed them)
+    for (int i = std::min((int)funcDecl->paramsInfo.size(), maxRegParams) - 1; i >= 0; i--) {
         const VariableInfo& param = funcDecl->paramsInfo[i];
         int offset = param.offset;
         
-        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "]" << std::endl;
+        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "] (from stack)" << std::endl;
         
-        if (i < maxRegParams) {
-            // Parameter is in register - copy to scope
-            cb->mov(x86::ptr(x86::r15, offset), paramRegs[i]);
-        } else {
-            // Parameter is on stack - calculate stack offset and copy
-            // Stack parameters start at rbp+16 (8 for return address + 8 for saved rbp)
-            // Each parameter is 8 bytes aligned
-            int stackOffset = 16 + (i - maxRegParams) * 8;
-            cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-            cb->mov(x86::ptr(x86::r15, offset), x86::rax);
-        }
+        // Pop the saved parameter from stack and store in scope
+        cb->pop(x86::rax);
+        cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+    }
+    
+    // Copy stack parameters (if any) - these weren't clobbered by malloc
+    for (size_t i = maxRegParams; i < funcDecl->paramsInfo.size(); i++) {
+        const VariableInfo& param = funcDecl->paramsInfo[i];
+        int offset = param.offset;
+        
+        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "] (from original stack)" << std::endl;
+        
+        // Calculate stack offset - need to account for the additional pushes we did
+        // Original stack: [return_addr][saved_rbp][saved_r15][stack_params...]
+        // Plus we pushed register params: [saved_reg_params...][return_addr][saved_rbp][saved_r15][stack_params...]
+        int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
+        int stackOffset = 24 + (regParamCount * 8) + (i - maxRegParams) * 8;
+        cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
+        cb->mov(x86::ptr(x86::r15, offset), x86::rax);
     }
     
     // Copy hidden parameters (parent scope pointers) after regular parameters
@@ -444,7 +502,7 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
             cb->mov(x86::ptr(x86::r15, offset), paramRegs[paramIndex]);
         } else {
             // Hidden parameter is on stack
-            int stackOffset = 16 + (paramIndex - maxRegParams) * 8;
+            int stackOffset = 24 + (paramIndex - maxRegParams) * 8;
             cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
             cb->mov(x86::ptr(x86::r15, offset), x86::rax);
         }
@@ -491,6 +549,32 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
     // Store the function address in the closure at the variable's offset
     int offset = it->second.offset;
     cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+
+    // now store any needed closure addresses for parent scopes allNeeded
+    // loop through allNeeded
+    for (const auto& neededDepth : funcDecl->allNeeded) {
+        // find parameter index in scopeDepthToParentParameterIndexMap
+        auto it = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
+        if (it == scope->scopeDepthToParentParameterIndexMap.end()) {
+            throw std::runtime_error("Needed variable not found in scope: " + std::to_string(neededDepth));
+        }
+        // r14 value if -1
+        if (it->second == -1) {
+            cb->mov(x86::ptr(x86::r15, offset), x86::r14); // parent scope address
+            continue;
+        } 
+        // cast to FunctionDeclNode
+        auto funcDeclParent = dynamic_cast<FunctionDeclNode*>(scope);
+
+        // index - paramsInfo.size() gives the hidden parameter index in hiddenParamsInfo
+        int hiddenParamIndex = it->second - funcDeclParent->paramsInfo.size();
+        if (hiddenParamIndex < 0 || hiddenParamIndex >= static_cast<int>(funcDeclParent->hiddenParamsInfo.size())) {
+            throw std::runtime_error("Hidden parameter index out of range for needed variable: " + neededDepth);
+        }
+        int hiddenParamOffset = funcDeclParent->hiddenParamsInfo[hiddenParamIndex].offset;
+        cb->mov(x86::rax, x86::ptr(x86::r14, hiddenParamOffset)); // load parent scope address
+        cb->mov(x86::ptr(x86::r15, offset), x86::rax); // store in closure
+    }
 }
 
 void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
@@ -498,18 +582,18 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     
     // Get the function address from the closure stored in the current scope
     auto access = funcCall->getVariableAccess();
+    int funcAddrOffset = -1; // Initialize function address offset
     
-    if (access.parameterIndex == -1) {
+    if (access.scopeParameterIndex == -1) {
         // Function is in current scope - load address from closure variable
         auto it = currentScope->variables.find(funcCall->value);
         if (it == currentScope->variables.end() || it->second.type != DataType::CLOSURE) {
             throw std::runtime_error("Function not found or not a closure: " + funcCall->value);
         }
         
-        // Load function address from r15 + offset into rax
-        int offset = it->second.offset;
-        std::cout << "Loading function address from r15+" << offset << std::endl;
-        cb->mov(x86::rax, x86::ptr(x86::r15, offset));
+        // Store function address offset for later use (don't load yet to avoid clobbering)
+        funcAddrOffset = it->second.offset;
+        std::cout << "Function address will be loaded from r15+" << funcAddrOffset << std::endl;
         
     } else {
         // Function is in parent scope - not implemented yet
@@ -538,7 +622,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     for (int i = funcCall->args.size() - 1; i >= maxRegParams; i--) {
         ASTNode* arg = funcCall->args[i].get();
         
-        if (arg->type == ::NodeType::IDENTIFIER) {
+        if (arg->type == AstNodeType::IDENTIFIER) {
             loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax);
         } else {
             loadValue(arg, x86::rax);
@@ -554,7 +638,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
         
         std::cout << "  Register arg " << i << " -> register " << i << std::endl;
         
-        if (arg->type == ::NodeType::IDENTIFIER) {
+        if (arg->type == AstNodeType::IDENTIFIER) {
             loadVariableFromScope(static_cast<IdentifierNode*>(arg), paramRegs[i]);
         } else {
             loadValue(arg, paramRegs[i]);
@@ -566,6 +650,9 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     
     // Save current r15 before function call
     cb->push(x86::r15);
+    
+    // Now load the function address from closure (after all register setup is done)
+    cb->mov(x86::rax, x86::ptr(x86::r15, funcAddrOffset));
     
     // Indirect call through function address loaded from closure
     cb->call(x86::rax);

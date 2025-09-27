@@ -6,15 +6,15 @@ void printAST(ASTNode* node, int indent) {
     std::cout << spaces;
     
     switch (node->type) {
-        case NodeType::PROGRAM: std::cout << "PROGRAM"; break;
-        case NodeType::FUNCTION_DECL:
+        case AstNodeType::PROGRAM: std::cout << "PROGRAM"; break;
+        case AstNodeType::FUNCTION_DECL:
             // Fall through to LEXICAL_SCOPE
-        case NodeType::LEXICAL_SCOPE: {
+        case AstNodeType::LEXICAL_SCOPE: {
             auto scope = static_cast<LexicalScopeNode*>(node);
             std::cout << "SCOPE(depth=" << scope->depth << ")";
             
             // If this scope is also a function
-            if (node->type == NodeType::FUNCTION_DECL) {
+            if (node->type == AstNodeType::FUNCTION_DECL) {
                 auto func = static_cast<FunctionDeclNode*>(scope);
                 std::cout << " FUNC(" << func->funcName << ")";
             }
@@ -78,10 +78,10 @@ void printAST(ASTNode* node, int indent) {
             }
             break;
         }
-        case NodeType::VAR_DECL: 
+        case AstNodeType::VAR_DECL: 
             std::cout << "VAR " << static_cast<VarDeclNode*>(node)->varName; 
             break;
-        case NodeType::FUNCTION_CALL: {
+        case AstNodeType::FUNCTION_CALL: {
             auto* call = static_cast<FunctionCallNode*>(node);
             std::cout << "CALL " << call->value;
             if (!call->args.empty()) {
@@ -94,16 +94,16 @@ void printAST(ASTNode* node, int indent) {
             }
             break;
         }
-        case NodeType::IDENTIFIER: {
+        case AstNodeType::IDENTIFIER: {
             std::cout << "ID " << node->value;
             if (node->varRef) {
                 std::cout << " -> depth" << node->varRef->definedIn->depth;
             }
             break;
         }
-        case NodeType::LITERAL: std::cout << "LIT " << node->value; break;
-        case NodeType::PRINT_STMT: std::cout << "PRINT"; break;
-        case NodeType::GO_STMT: std::cout << "GO"; break;
+        case AstNodeType::LITERAL: std::cout << "LIT " << node->value; break;
+        case AstNodeType::PRINT_STMT: std::cout << "PRINT"; break;
+        case AstNodeType::GO_STMT: std::cout << "GO"; break;
     }
     std::cout << "\n";
     

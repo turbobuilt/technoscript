@@ -16,7 +16,7 @@ namespace RobustnessLimits {
     constexpr int MAX_ANALYSIS_ITERATIONS = 10000;
 }
 
-enum class NodeType {
+enum class AstNodeType {
     PROGRAM, LEXICAL_SCOPE, VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT
 };
@@ -58,12 +58,12 @@ struct ClosurePatchInfo {
 
 class ASTNode {
 public:
-    NodeType type;
+    AstNodeType type;
     std::vector<std::unique_ptr<ASTNode>> children;
     std::string value;
     VariableInfo* varRef = nullptr; // For analysis phase
     
-    ASTNode(NodeType t, const std::string& v = "") : type(t), value(v) {}
+    ASTNode(AstNodeType t, const std::string& v = "") : type(t), value(v) {}
     virtual ~ASTNode() = default;
 };
 
@@ -82,7 +82,7 @@ public:
     // -1 means it's the immediate parent scope itself (stored in current scope)
     std::map<int, int> scopeDepthToParentParameterIndexMap;
     
-    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(NodeType::LEXICAL_SCOPE), parentFunctionScope(p), depth(d) {
+    LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(AstNodeType::LEXICAL_SCOPE), parentFunctionScope(p), depth(d) {
         // Parent pointers are set later by setupParentPointers() in analyzer
     }
     
@@ -122,7 +122,7 @@ public:
     DataType varType;
     
     VarDeclNode(const std::string& name, DataType type) 
-        : ASTNode(NodeType::VAR_DECL), varName(name), varType(type) {}
+        : ASTNode(AstNodeType::VAR_DECL), varName(name), varType(type) {}
 };
 
 class FunctionDeclNode : public LexicalScopeNode {
@@ -137,7 +137,7 @@ public:
     
     FunctionDeclNode(const std::string& name, LexicalScopeNode* p = nullptr) 
         : LexicalScopeNode(p), funcName(name) {
-        type = NodeType::FUNCTION_DECL;
+        type = AstNodeType::FUNCTION_DECL;
         value = name;
     }
     
@@ -151,14 +151,14 @@ public:
 class IdentifierNode : public ASTNode {
 public:
     struct VariableAccess {
-        int parameterIndex; // -1 if in current scope, else index in parent params
+        int scopeParameterIndex; // -1 if in current scope, else index in parent params
         int parameterOffset; // Byte offset for variable-sized parameters
         int offset; // Offset within the scope for the variable
     };
     
     LexicalScopeNode* accessedIn = nullptr; // Set during analysis: the scope where this identifier is accessed
     
-    IdentifierNode(const std::string& name) : ASTNode(NodeType::IDENTIFIER, name) {}
+    IdentifierNode(const std::string& name) : ASTNode(AstNodeType::IDENTIFIER, name) {}
     
     // any time this is accessed it could be in the current scope or in an ancestor scope. Ancestor scopes are passed as "hidden params" after actual params. This function tells us the absolute parameter index of that scope address, and the offset in it we can find this variable at.
     VariableAccess getVariableAccess() {
@@ -172,19 +172,19 @@ public:
             return {-1, 0, varRef->offset};
         } else {
             // Use the access method to get parameter index for the defining scope
-            int paramIndex = definingScope->getParameterIndexInCurrentScope(accessedIn);
+            int scopeParamIndex = definingScope->getParameterIndexInCurrentScope(accessedIn);
             
             // Use the helper method to calculate parameter offset
-            int paramOffset = accessedIn->getParameterOffset(paramIndex);
+            int paramOffset = accessedIn->getParameterOffset(scopeParamIndex);
             
-            return {paramIndex, paramOffset, varRef->offset};
+            return {scopeParamIndex, paramOffset, varRef->offset};
         }
     }
 };
 
 class LiteralNode : public ASTNode {
 public:
-    LiteralNode(const std::string& val) : ASTNode(NodeType::LITERAL, val) {}
+    LiteralNode(const std::string& val) : ASTNode(AstNodeType::LITERAL, val) {}
 };
 
 class FunctionCallNode : public IdentifierNode {
@@ -192,7 +192,7 @@ public:
     std::vector<std::unique_ptr<ASTNode>> args;
 
     FunctionCallNode(const std::string& name) : IdentifierNode(name) {
-        type = NodeType::FUNCTION_CALL;  // Override the type set by IdentifierNode
+        type = AstNodeType::FUNCTION_CALL;  // Override the type set by IdentifierNode
     }
 };
 
@@ -204,12 +204,15 @@ inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
 
 // Implementation of buildScopeDepthToParentParameterIndexMap after all classes are defined
 inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
-    scopeDepthToParentParameterIndexMap.clear();
+    // Check if already processed - should only happen once per scope in single-pass analysis
+    if (!scopeDepthToParentParameterIndexMap.empty()) {
+        throw std::runtime_error("buildScopeDepthToParentParameterIndexMap called multiple times on same scope - analysis bug");
+    }
     
     if (!parentFunctionScope) return; // Root scope has no parent
     
     // Only function scopes need parameter mapping
-    if (this->type != NodeType::FUNCTION_DECL) return;
+    if (this->type != AstNodeType::FUNCTION_DECL) return;
     
     // Get the current function's parameter count
     FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
@@ -249,7 +252,7 @@ inline void LexicalScopeNode::pack() {
     std::vector<std::pair<std::string, VariableInfo*>> params;
     
     // For function scopes, separate parameters from regular variables
-    if (this->type == NodeType::FUNCTION_DECL) {
+    if (this->type == AstNodeType::FUNCTION_DECL) {
         FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(this);
         
         // Clear the unified parameter info arrays
@@ -285,7 +288,7 @@ inline void LexicalScopeNode::pack() {
     int offset = 0;
     
     // For function scopes, first allocate space for parameters
-    if (this->type == NodeType::FUNCTION_DECL) {
+    if (this->type == AstNodeType::FUNCTION_DECL) {
         FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(this);
         
         // 1. Pack regular parameters first and populate paramsInfo
@@ -385,7 +388,7 @@ inline int FunctionDeclNode::getTotalRegularParamsSize() const {
 // Implementation of LexicalScopeNode::getParameterOffset after FunctionDeclNode is defined
 inline int LexicalScopeNode::getParameterOffset(int index) {
     // Delegate to FunctionDeclNode's unified parameter offset calculation
-    if (this->type == NodeType::FUNCTION_DECL) {
+    if (this->type == AstNodeType::FUNCTION_DECL) {
         return static_cast<FunctionDeclNode*>(this)->getParameterOffset(index);
     } else {
         throw std::runtime_error("getParameterOffset called on non-function scope");

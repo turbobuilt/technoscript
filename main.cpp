@@ -11,9 +11,8 @@ int main(int argc, char* argv[]) {
     std::cout << "DEBUG: Using built-in test program" << std::endl;
     std::string code = R"(
 var a: int64 = 5;
-test(a);
-function test(x: int64) {
-  print(x);
+function test() {
+  print(a);
 }
 )";
     std::cout << "=== Running simple test program ===\n";

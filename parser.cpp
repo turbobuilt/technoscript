@@ -176,7 +176,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
             // Parse as print statement
             expect(TokenType::LPAREN);
             
-            auto print = std::make_unique<ASTNode>(NodeType::PRINT_STMT);
+            auto print = std::make_unique<ASTNode>(AstNodeType::PRINT_STMT);
             while (!match(TokenType::RPAREN)) {
                 if (match(TokenType::STRING)) {
                     print->children.push_back(std::make_unique<LiteralNode>(current().value));
@@ -347,7 +347,7 @@ std::unique_ptr<ASTNode> Parser::parsePrintStmt() {
     expect(TokenType::PRINT);
     expect(TokenType::LPAREN);
     
-    auto print = std::make_unique<ASTNode>(NodeType::PRINT_STMT);
+    auto print = std::make_unique<ASTNode>(AstNodeType::PRINT_STMT);
     while (!match(TokenType::RPAREN)) {
         if (match(TokenType::STRING)) {
             print->children.push_back(std::make_unique<LiteralNode>(current().value));
@@ -367,7 +367,7 @@ std::unique_ptr<ASTNode> Parser::parsePrintStmt() {
 
 std::unique_ptr<ASTNode> Parser::parseGoStmt() {
     expect(TokenType::GO);
-    auto go = std::make_unique<ASTNode>(NodeType::GO_STMT);
+    auto go = std::make_unique<ASTNode>(AstNodeType::GO_STMT);
     go->children.push_back(parseFunctionCall());
     return go;
 }
