@@ -61,7 +61,7 @@ void printAST(ASTNode* node, int indent) {
                     } else if (var.type == DataType::INT64) {
                         std::cout << "i64";
                     } else if (var.type == DataType::CLOSURE) {
-                        int closureSize = 8; // base size
+                        int closureSize = 16; // function_address (8) + size (8)
                         if (var.funcNode) {
                             closureSize += var.funcNode->allNeeded.size() * 8;
                         }

@@ -262,7 +262,7 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     closureVar.name = name;
     closureVar.definedIn = currentLexicalScope;
     closureVar.funcNode = func.get();
-    closureVar.size = 8; // Just store function address (8 bytes initially)
+    closureVar.size = 16; // function_address (8) + size (8) - scope pointers added later by analyzer
     currentLexicalScope->variables[name] = closureVar;
     
     // Parse parameters

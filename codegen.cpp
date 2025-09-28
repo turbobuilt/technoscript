@@ -596,12 +596,17 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
     // Store the function address in the closure at the variable's offset
     int offset = it->second.offset;
     cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+    
+    // Store the closure size (in bytes) right after the function address
+    size_t closureSize = it->second.size;
+    cb->mov(x86::rax, closureSize);
+    cb->mov(x86::ptr(x86::r15, offset + 8), x86::rax);
 
     // now store any needed closure addresses for parent scopes allNeeded
     // loop through allNeeded with index to calculate proper offset
     int scopeIndex = 0;
     for (const auto& neededDepth : funcDecl->allNeeded) {
-        int scopeOffset = offset + 8 + (scopeIndex * 8); // Each scope pointer is 8 bytes
+        int scopeOffset = offset + 16 + (scopeIndex * 8); // function_address (8) + size (8) + scope_pointers
         
         // Special case: if we're in the scope that matches the needed depth,
         // we don't need to look up parameter mapping - use current scope directly
@@ -632,7 +637,7 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
             throw std::runtime_error("Hidden parameter index out of range for needed variable: " + std::to_string(neededDepth));
         }
         int hiddenParamOffset = funcDeclParent->hiddenParamsInfo[hiddenParamIndex].offset;
-        cb->mov(x86::rax, x86::ptr(x86::r14, hiddenParamOffset)); // load parent scope address
+        cb->mov(x86::rax, x86::ptr(x86::r15, hiddenParamOffset)); // load parent scope address from current scope's parameters
         cb->mov(x86::ptr(x86::r15, scopeOffset), x86::rax); // store in closure at proper offset
         scopeIndex++;
     }
@@ -685,7 +690,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
         
         if (paramIndex < maxRegParams) {
             // Hidden parameter fits in register
-            int closureOffset = 8 + (i * 8); // offset + 8 for scope pointer
+            int closureOffset = 16 + (i * 8); // function_address (8) + size (8) + scope_pointers
             std::cout << "  Hidden param " << i << " (depth " << funcCall->varRef->funcNode->allNeeded[i] << ") -> register " << paramIndex << std::endl;
             
             // Load the scope pointer from closure: [rbx + closureOffset]
@@ -700,7 +705,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
         
         if (paramIndex >= maxRegParams) {
             // Hidden parameter goes on stack
-            int closureOffset = 8 + (i * 8); // offset + 8 for scope pointer
+            int closureOffset = 16 + (i * 8); // function_address (8) + size (8) + scope_pointers
             std::cout << "  Hidden param " << i << " (depth " << funcCall->varRef->funcNode->allNeeded[i] << ") -> stack" << std::endl;
             
             // Load the scope pointer from closure and push it

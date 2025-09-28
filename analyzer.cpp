@@ -62,7 +62,8 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         for (auto& [name, varInfo] : scope->variables) {
             if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
                 size_t old_size = varInfo.size;
-                varInfo.size = 8 + (varInfo.funcNode->allNeeded.size() * 8);
+                // New closure layout: [function_address] [size] [scope_pointer_1] ... [scope_pointer_N]
+                varInfo.size = 8 + 8 + (varInfo.funcNode->allNeeded.size() * 8); // function + size + scopes
                 std::cout << "DEBUG: Updated closure '" << name << "' size from " << old_size 
                          << " to " << varInfo.size << " (needs " << varInfo.funcNode->allNeeded.size() << " scopes)" << std::endl;
             }
