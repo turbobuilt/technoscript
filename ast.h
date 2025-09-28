@@ -18,10 +18,11 @@ namespace RobustnessLimits {
 
 enum class AstNodeType {
     VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
-    IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT
+    IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT, SETTIMEOUT_STMT, 
+    AWAIT_EXPR, SLEEP_CALL
 };
 
-enum class DataType { INT32, INT64, CLOSURE };
+enum class DataType { INT32, INT64, CLOSURE, PROMISE };
 
 // Forward declarations
 class FunctionDeclNode;
@@ -210,6 +211,24 @@ public:
     std::unique_ptr<FunctionCallNode> functionCall;
     
     GoStmtNode() : ASTNode(AstNodeType::GO_STMT) {}
+};
+
+class SetTimeoutStmtNode : public ASTNode {
+public:
+    std::unique_ptr<IdentifierNode> functionName;
+    std::unique_ptr<ASTNode> delay; // LiteralNode for delay in milliseconds
+    
+    SetTimeoutStmtNode() : ASTNode(AstNodeType::SETTIMEOUT_STMT) {}
+};
+
+class AwaitExprNode : public ASTNode {
+public:
+    AwaitExprNode() : ASTNode(AstNodeType::AWAIT_EXPR) {}
+};
+
+class SleepCallNode : public ASTNode {
+public:
+    SleepCallNode() : ASTNode(AstNodeType::SLEEP_CALL) {}
 };
 
 // Implementation of getTypeSize after all classes are defined

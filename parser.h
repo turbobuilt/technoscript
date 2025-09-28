@@ -6,7 +6,8 @@
 enum class TokenType {
     VAR, FUNCTION, GO, IDENTIFIER, INT32_TYPE, INT64_TYPE, LITERAL, 
     ASSIGN, SEMICOLON, LPAREN, RPAREN, LBRACE, RBRACE, 
-    COLON, COMMA, STRING, PRINT, DOT, EOF_TOKEN
+    COLON, COMMA, STRING, PRINT, SETTIMEOUT, DOT, 
+    ASYNC, AWAIT, PROMISE, SLEEP, EOF_TOKEN
 };
 
 struct Token {
@@ -39,6 +40,7 @@ private:
     std::unique_ptr<FunctionDeclNode> parseFunctionDecl();
     std::unique_ptr<ASTNode> parseFunctionCall();
     std::unique_ptr<ASTNode> parsePrintStmt();
+    std::unique_ptr<ASTNode> parseSetTimeoutStmt();
     std::unique_ptr<ASTNode> parseGoStmt();
     
 public:

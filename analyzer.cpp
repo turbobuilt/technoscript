@@ -43,6 +43,19 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
                 analyzeNodeSinglePass(arg.get(), currentScope, depth + 1);
             }
         }
+    } else if (node->type == AstNodeType::SETTIMEOUT_STMT) {
+        // Analyze setTimeout statement - need to resolve function name and delay
+        auto setTimeoutStmt = static_cast<SetTimeoutStmtNode*>(node);
+        
+        // Analyze the function name identifier
+        if (setTimeoutStmt->functionName) {
+            analyzeNodeSinglePass(setTimeoutStmt->functionName.get(), currentScope, depth + 1);
+        }
+        
+        // Analyze the delay literal
+        if (setTimeoutStmt->delay) {
+            analyzeNodeSinglePass(setTimeoutStmt->delay.get(), currentScope, depth + 1);
+        }
     }
     
     // Step 3: Recursively process all children

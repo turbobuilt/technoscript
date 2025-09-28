@@ -44,6 +44,7 @@ private:
     void generateFunctionDecl(FunctionDeclNode* funcDecl);
     void generateFunctionCall(FunctionCallNode* funcCall);
     void generateGoStmt(GoStmtNode* goStmt);
+    void generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt);
     
     // Function-related utilities
     void createFunctionLabel(FunctionDeclNode* funcDecl);

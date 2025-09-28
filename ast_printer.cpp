@@ -6,6 +6,12 @@ void printAST(ASTNode* node, int indent) {
     std::cout << spaces;
     
     switch (node->type) {
+        case AstNodeType::AWAIT_EXPR:
+            std::cout << "AWAIT_EXPR";
+            break;
+        case AstNodeType::SLEEP_CALL:
+            std::cout << "SLEEP_CALL";
+            break;
         case AstNodeType::FUNCTION_DECL: {
             auto scope = static_cast<LexicalScopeNode*>(node);
             std::cout << "SCOPE(depth=" << scope->depth << ")";
@@ -99,6 +105,7 @@ void printAST(ASTNode* node, int indent) {
         case AstNodeType::LITERAL: std::cout << "LIT " << node->value; break;
         case AstNodeType::PRINT_STMT: std::cout << "PRINT"; break;
         case AstNodeType::GO_STMT: std::cout << "GO"; break;
+        case AstNodeType::SETTIMEOUT_STMT: std::cout << "SETTIMEOUT"; break;
     }
     std::cout << "\n";
     

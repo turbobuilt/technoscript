@@ -1,6 +1,9 @@
 #include <iostream>
 #include <cstdint>
-#include <unistd.h>
+#include "goroutine.h"
+
+// Forward declaration of runtime functions
+extern "C" uint64_t runtime_sleep(int64_t milliseconds);
 
 // Extern C functions for TechnoScript runtime
 extern "C" {
@@ -9,6 +12,12 @@ extern "C" {
     }
     
     void print_string(const char* str) {
-        std::cout << str << std::endl;
-    }
+    std::cout << str << std::endl;
+}
+
+// Async functions implementation
+uint64_t sleep(int64_t milliseconds) {
+    // Delegate to the runtime function
+    return runtime_sleep(milliseconds);
+}
 }

@@ -152,6 +152,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::GO_STMT:
             generateGoStmt(static_cast<GoStmtNode*>(node));
             break;
+        case AstNodeType::SETTIMEOUT_STMT:
+            generateSetTimeoutStmt(static_cast<SetTimeoutStmtNode*>(node));
+            break;
         default:
             // For other nodes, just visit children
             for (auto& child : node->children) {
@@ -806,4 +809,52 @@ void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
     cb->pop(x86::rax);
     
     std::cout << "Generated GO statement call to runtime_spawn_goroutine" << std::endl;
+}
+
+void CodeGenerator::generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt) {
+    std::cout << "Generating setTimeout statement for function: " << setTimeoutStmt->functionName->value << std::endl;
+    
+    // Find the target function
+    if (!setTimeoutStmt->functionName->varRef) {
+        throw std::runtime_error("Function not found in setTimeout statement: " + setTimeoutStmt->functionName->value);
+    }
+    
+    if (setTimeoutStmt->functionName->varRef->type != DataType::CLOSURE) {
+        throw std::runtime_error("setTimeout target is not a function: " + setTimeoutStmt->functionName->value);
+    }
+    
+    // Get the function address from the closure
+    // Similar to generateGoStmt but with additional delay parameter
+    x86::Gp funcPtrReg = x86::rdi;  // First argument to runtime_set_timeout
+    loadVariableAddress(setTimeoutStmt->functionName.get(), funcPtrReg, 0); // Load closure address
+    cb->mov(funcPtrReg, x86::qword_ptr(funcPtrReg)); // Dereference to get function pointer
+    
+    // For now, pass NULL for args and 0 for argsSize (no argument support yet)
+    cb->mov(x86::rsi, 0);  // args = NULL  
+    cb->mov(x86::rdx, 0);  // argsSize = 0
+    
+    // Fourth argument: delay in milliseconds (parse from literal)
+    int delayMs = std::stoi(setTimeoutStmt->delay->value);
+    cb->mov(x86::rcx, delayMs);  // delayMs
+    
+    // Save registers before calling runtime function
+    cb->push(x86::rax);
+    cb->push(x86::r8);
+    cb->push(x86::r9);
+    cb->push(x86::r10);
+    cb->push(x86::r11);
+    
+    // Call runtime_set_timeout(func, args, argsSize, delayMs)
+    uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_set_timeout);
+    cb->mov(x86::rax, runtimeAddr);
+    cb->call(x86::rax);
+    
+    // Restore registers
+    cb->pop(x86::r11);
+    cb->pop(x86::r10);
+    cb->pop(x86::r9);
+    cb->pop(x86::r8);
+    cb->pop(x86::rax);
+    
+    std::cout << "Generated setTimeout statement call to runtime_set_timeout" << std::endl;
 }

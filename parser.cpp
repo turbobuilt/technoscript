@@ -30,6 +30,11 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             else if (word == "int32") result.emplace_back(TokenType::INT32_TYPE);
             else if (word == "int64") result.emplace_back(TokenType::INT64_TYPE);
             else if (word == "print") result.emplace_back(TokenType::PRINT);
+            else if (word == "setTimeout") result.emplace_back(TokenType::SETTIMEOUT);
+            else if (word == "async") result.emplace_back(TokenType::ASYNC);
+            else if (word == "await") result.emplace_back(TokenType::AWAIT);
+            else if (word == "promise") result.emplace_back(TokenType::PROMISE);
+            else if (word == "sleep") result.emplace_back(TokenType::SLEEP);
             else result.emplace_back(TokenType::IDENTIFIER, word);
         }
         else if (std::isdigit(code[i])) {
@@ -136,7 +141,9 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
     while (current().type != TokenType::EOF_TOKEN && 
            current().type != TokenType::VAR &&
            current().type != TokenType::FUNCTION &&
+           current().type != TokenType::ASYNC &&  // Add ASYNC token
            current().type != TokenType::PRINT &&
+           current().type != TokenType::SETTIMEOUT &&
            current().type != TokenType::GO &&
            current().type != TokenType::IDENTIFIER &&
            current().type != TokenType::RBRACE) { // Allow } to end blocks naturally
@@ -153,12 +160,28 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
         std::cout << "DEBUG parseStatement: parsing VAR" << std::endl;
         return parseVarDecl();
     }
+    if (match(TokenType::ASYNC)) {
+        std::cout << "DEBUG parseStatement: parsing ASYNC FUNCTION" << std::endl;
+        std::cout << "DEBUG: Before advance, pos=" << pos << ", token type=" << (int)current().type << std::endl;
+        advance(); // consume ASYNC token
+        std::cout << "DEBUG: After advance, pos=" << pos << ", token type=" << (int)current().type << std::endl;
+        if (match(TokenType::FUNCTION)) {
+            std::cout << "DEBUG parseStatement: found FUNCTION after ASYNC" << std::endl;
+            return parseFunctionDecl(); // Don't advance again, parseFunctionDecl will handle it
+        } else {
+            std::cout << "DEBUG: Expected FUNCTION but found token type " << (int)current().type << " at pos " << pos << std::endl;
+            throw std::runtime_error("Expected FUNCTION after ASYNC");
+        }
+    }
     if (match(TokenType::FUNCTION)) {
         std::cout << "DEBUG parseStatement: parsing FUNCTION" << std::endl;
         return parseFunctionDecl();
     }
     if (match(TokenType::PRINT)) {
         return parsePrintStmt();
+    }
+    if (match(TokenType::SETTIMEOUT)) {
+        return parseSetTimeoutStmt();
     }
     if (match(TokenType::GO)) {
         return parseGoStmt();
@@ -226,10 +249,47 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     
     expect(TokenType::ASSIGN);
     auto varDecl = std::make_unique<VarDeclNode>(name, varType);
+    
     if (match(TokenType::LITERAL)) {
         varDecl->children.push_back(std::make_unique<LiteralNode>(current().value));
         advance();
+    } else if (match(TokenType::AWAIT)) {
+        std::cout << "DEBUG parseVarDecl: parsing AWAIT expression" << std::endl;
+        advance(); // consume AWAIT token
+        
+        // Create an AWAIT_EXPR node
+        auto awaitExpr = std::make_unique<AwaitExprNode>();
+        
+        if (match(TokenType::SLEEP)) {
+            std::cout << "DEBUG parseVarDecl: parsing SLEEP call" << std::endl;
+            advance(); // consume SLEEP token
+            expect(TokenType::LPAREN);
+            
+            // Create a SLEEP_CALL node
+            auto sleepCall = std::make_unique<SleepCallNode>();
+            
+            if (match(TokenType::LITERAL)) {
+                sleepCall->children.push_back(std::make_unique<LiteralNode>(current().value));
+                advance();
+            } else {
+                throw std::runtime_error("Expected literal argument for sleep()");
+            }
+            
+            expect(TokenType::RPAREN);
+            awaitExpr->children.push_back(std::move(sleepCall));
+        } else {
+            throw std::runtime_error("Expected function call after await");
+        }
+        
+        varDecl->children.push_back(std::move(awaitExpr));
+    } else if (match(TokenType::IDENTIFIER)) {
+        std::cout << "DEBUG parseVarDecl: parsing identifier/function call" << std::endl;
+        varDecl->children.push_back(std::make_unique<IdentifierNode>(current().value));
+        advance();
+    } else {
+        throw std::runtime_error("Expected literal, await expression, or identifier after assignment");
     }
+    
     expect(TokenType::SEMICOLON);
     
     // Add variable to current scope's variables map during parsing
@@ -385,6 +445,34 @@ std::unique_ptr<ASTNode> Parser::parseGoStmt() {
     return go;
 }
 
+std::unique_ptr<ASTNode> Parser::parseSetTimeoutStmt() {
+    expect(TokenType::SETTIMEOUT);
+    expect(TokenType::LPAREN);
+    
+    auto setTimeout = std::make_unique<SetTimeoutStmtNode>();
+    
+    // First parameter: function name (identifier)
+    if (!match(TokenType::IDENTIFIER)) {
+        throw std::runtime_error("Expected function name as first parameter to setTimeout");
+    }
+    setTimeout->functionName = std::make_unique<IdentifierNode>(current().value);
+    advance();
+    
+    expect(TokenType::COMMA);
+    
+    // Second parameter: delay in milliseconds (literal)
+    if (!match(TokenType::LITERAL)) {
+        throw std::runtime_error("Expected delay in milliseconds as second parameter to setTimeout");
+    }
+    setTimeout->delay = std::make_unique<LiteralNode>(current().value);
+    advance();
+    
+    expect(TokenType::RPAREN);
+    expect(TokenType::SEMICOLON);
+    
+    return setTimeout;
+}
+
 bool Parser::synchronizeToNextStatement() {
     std::cout << "DEBUG: Attempting to synchronize from position " << pos << std::endl;
     
@@ -457,6 +545,7 @@ std::string Parser::tokenTypeToString(TokenType type) {
         case TokenType::COMMA: return "COMMA (,)";
         case TokenType::STRING: return "STRING";
         case TokenType::PRINT: return "PRINT";
+        case TokenType::SETTIMEOUT: return "SETTIMEOUT";
         case TokenType::DOT: return "DOT (.)";
         case TokenType::EOF_TOKEN: return "EOF";
         default: return "UNKNOWN";
