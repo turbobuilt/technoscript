@@ -205,6 +205,13 @@ public:
     }
 };
 
+class GoStmtNode : public ASTNode {
+public:
+    std::unique_ptr<FunctionCallNode> functionCall;
+    
+    GoStmtNode() : ASTNode(AstNodeType::GO_STMT) {}
+};
+
 // Implementation of getTypeSize after all classes are defined
 inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
     // Use the precomputed size field for fast access

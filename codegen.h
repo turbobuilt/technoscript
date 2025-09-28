@@ -2,6 +2,7 @@
 
 #include "ast.h"
 #include "library.h"
+#include "goroutine.h"
 #include <asmjit/asmjit.h>
 #include <capstone/capstone.h>
 #include <memory>
@@ -42,6 +43,7 @@ private:
     void generatePrintStmt(ASTNode* printStmt);
     void generateFunctionDecl(FunctionDeclNode* funcDecl);
     void generateFunctionCall(FunctionCallNode* funcCall);
+    void generateGoStmt(GoStmtNode* goStmt);
     
     // Function-related utilities
     void createFunctionLabel(FunctionDeclNode* funcDecl);
@@ -56,6 +58,7 @@ private:
     void storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope);
     void loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
     void loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
+    void loadParameterIntoRegister(int paramIndex, x86::Gp destReg);
     x86::Gp getParameterByIndex(int paramIndex);
     
     // External function declarations

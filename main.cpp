@@ -1,6 +1,7 @@
 #include "parser.h"
 #include "analyzer.h"
 #include "ast_printer.h"
+#include "goroutine.h"
 #include <iostream>
 #include "codegen.h"
 
@@ -15,9 +16,14 @@ var c: int64 = 15;
 test(c)
 function test(z: int64) {
   var b: int64 = 10;
-  print(a);
-  print(b);
-  print(z);
+  print(b)
+  function test2(q: int64){
+    print(b);
+    print(c);
+    print(a);
+    print(q);
+  }
+  test2(a);
 }
 )";
     std::cout << "=== Running simple test program ===\n";
@@ -34,7 +40,6 @@ function test(z: int64) {
     std::cout << "DEBUG: Starting analysis..." << std::endl;
     analyzer.analyze(ast.get());
     std::cout << "DEBUG: Analysis completed successfully" << std::endl;
-    // printAST(ast.get()); // Commented out - missing implementation
     
     // Debug: Check what address print_int64 actually has
     uint64_t actual_print_addr = reinterpret_cast<uint64_t>(print_int64);
@@ -44,7 +49,15 @@ function test(z: int64) {
     codeGen.generateProgram(*ast);
     std::cout << "DEBUG: Code generation completed successfully" << std::endl;
     
-    codeGen.run();
+    // Spawn the main program as a goroutine instead of running it directly
+    EventLoop::getInstance().spawnGoroutine([&codeGen]() {
+        std::cout << "\n=== Main goroutine starting ===" << std::endl;
+        codeGen.run();
+        std::cout << "=== Main goroutine finished ===" << std::endl;
+    });
+    
+    // Start the event loop to handle the main goroutine and any spawned goroutines
+    runtime_start_event_loop();
     
     return 0;
 }

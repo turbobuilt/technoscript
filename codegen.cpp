@@ -149,6 +149,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::FUNCTION_CALL:
             generateFunctionCall(static_cast<FunctionCallNode*>(node));
             break;
+        case AstNodeType::GO_STMT:
+            generateGoStmt(static_cast<GoStmtNode*>(node));
+            break;
         default:
             // For other nodes, just visit children
             for (auto& child : node->children) {
@@ -166,9 +169,13 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     // copy r15 to r14
     cb->mov(x86::r14, x86::r15);
     
-    // Save rdi and rsi before calling calloc (they might contain parameters)
+    // save all 6 registers
     cb->push(x86::rdi);
     cb->push(x86::rsi);
+    cb->push(x86::rdx);
+    cb->push(x86::rcx);
+    cb->push(x86::r8);
+    cb->push(x86::r9);
     
     // Call calloc to allocate and zero-initialize scope
     // mov rdi, 1 (number of elements)
@@ -182,7 +189,11 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     cb->mov(x86::rax, callocAddr);
     cb->call(x86::rax);
     
-    // Restore rsi and rdi after calloc (in reverse order due to stack)
+    // Restore
+    cb->pop(x86::r9);
+    cb->pop(x86::r8);
+    cb->pop(x86::rcx);
+    cb->pop(x86::rdx);
     cb->pop(x86::rsi);
     cb->pop(x86::rdi);
     
@@ -257,6 +268,37 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
     cb->mov(x86::ptr(x86::r15, offset), valueReg);
 }
 
+void CodeGenerator::loadParameterIntoRegister(int paramIndex, x86::Gp destReg) {
+    // Since all parameters (including hidden scope parameters) are stored in the current
+    // function's lexical scope during the prologue, we should load them from there
+    // instead of relying on parameter registers which can be clobbered by function calls
+    
+    auto* currentFunc = dynamic_cast<FunctionDeclNode*>(currentScope);
+    if (!currentFunc) {
+        throw std::runtime_error("Current scope is not a function");
+    }
+    
+    // Calculate which parameter this is (regular params + hidden params)
+    size_t totalRegularParams = currentFunc->paramsInfo.size();
+    
+    if (static_cast<size_t>(paramIndex) < totalRegularParams) {
+        // This is a regular parameter - load from its scope offset
+        const VariableInfo& param = currentFunc->paramsInfo[paramIndex];
+        std::cout << "Loading regular parameter " << paramIndex << " from scope offset " << param.offset << std::endl;
+        cb->mov(destReg, x86::ptr(x86::r15, param.offset));
+    } else {
+        // This is a hidden parameter - load from its scope offset
+        size_t hiddenParamIndex = paramIndex - totalRegularParams;
+        if (hiddenParamIndex >= currentFunc->hiddenParamsInfo.size()) {
+            throw std::runtime_error("Hidden parameter index out of range");
+        }
+        
+        const ParameterInfo& hiddenParam = currentFunc->hiddenParamsInfo[hiddenParamIndex];
+        std::cout << "Loading hidden parameter " << hiddenParamIndex << " (total param index " << paramIndex << ") from scope offset " << hiddenParam.offset << std::endl;
+        cb->mov(destReg, x86::ptr(x86::r15, hiddenParam.offset));
+    }
+}
+
 x86::Gp CodeGenerator::getParameterByIndex(int paramIndex) {
     // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
@@ -292,11 +334,13 @@ void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp de
         std::cout << "Loading variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         cb->mov(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
     } else {
-        // Variable is in a parent scope - get the parameter by index and load from that scope
+        // Variable is in a parent scope - load the parent scope pointer from our lexical scope first
         std::cout << "Loading variable '" << identifier->value << "' from parent scope parameter index " << access.scopeParameterIndex << " at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         
-        x86::Gp parentScopeReg = getParameterByIndex(access.scopeParameterIndex);
-        cb->mov(destReg, x86::ptr(parentScopeReg, access.offset + offsetInVariable));
+        // Load parent scope pointer from our lexical scope into a temporary register
+        loadParameterIntoRegister(access.scopeParameterIndex, x86::rax);
+        // Now load the variable from that parent scope
+        cb->mov(destReg, x86::ptr(x86::rax, access.offset + offsetInVariable));
     }
 }
 
@@ -313,11 +357,13 @@ void CodeGenerator::loadVariableAddress(IdentifierNode* identifier, x86::Gp dest
         std::cout << "Loading address of variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         cb->lea(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
     } else {
-        // Variable is in a parent scope - get the parameter by index and load address from that scope
+        // Variable is in a parent scope - load the parent scope pointer from our lexical scope first
         std::cout << "Loading address of variable '" << identifier->value << "' from parent scope parameter index " << access.scopeParameterIndex << " at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         
-        x86::Gp parentScopeReg = getParameterByIndex(access.scopeParameterIndex);
-        cb->lea(destReg, x86::ptr(parentScopeReg, access.offset + offsetInVariable));
+        // Load parent scope pointer from our lexical scope into a temporary register
+        loadParameterIntoRegister(access.scopeParameterIndex, x86::rax);
+        // Now load the address from that parent scope
+        cb->lea(destReg, x86::ptr(x86::rax, access.offset + offsetInVariable));
     }
 }
 
@@ -552,13 +598,17 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
     cb->mov(x86::ptr(x86::r15, offset), x86::rax);
 
     // now store any needed closure addresses for parent scopes allNeeded
-    // loop through allNeeded
+    // loop through allNeeded with index to calculate proper offset
+    int scopeIndex = 0;
     for (const auto& neededDepth : funcDecl->allNeeded) {
+        int scopeOffset = offset + 8 + (scopeIndex * 8); // Each scope pointer is 8 bytes
+        
         // Special case: if we're in the scope that matches the needed depth,
         // we don't need to look up parameter mapping - use current scope directly
         if (scope->depth == neededDepth) {
             cb->mov(x86::rax, x86::r15); // current scope address
-            cb->mov(x86::ptr(x86::r15, offset + 8), x86::rax); // store in closure (offset + 8 for scope pointer)
+            cb->mov(x86::ptr(x86::r15, scopeOffset), x86::rax); // store in closure at proper offset
+            scopeIndex++;
             continue;
         }
         
@@ -569,7 +619,8 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         }
         // r14 value if -1
         if (it->second == -1) {
-            cb->mov(x86::ptr(x86::r15, offset + 8), x86::r14); // parent scope address
+            cb->mov(x86::ptr(x86::r15, scopeOffset), x86::r14); // parent scope address at proper offset
+            scopeIndex++;
             continue;
         } 
         // cast to FunctionDeclNode
@@ -582,7 +633,8 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         }
         int hiddenParamOffset = funcDeclParent->hiddenParamsInfo[hiddenParamIndex].offset;
         cb->mov(x86::rax, x86::ptr(x86::r14, hiddenParamOffset)); // load parent scope address
-        cb->mov(x86::ptr(x86::r15, offset + 8), x86::rax); // store in closure
+        cb->mov(x86::ptr(x86::r15, scopeOffset), x86::rax); // store in closure at proper offset
+        scopeIndex++;
     }
 }
 
@@ -694,4 +746,59 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
         cb->add(x86::rsp, totalStackBytes);
         std::cout << "Cleaned up " << totalStackBytes << " bytes from stack" << std::endl;
     }
+}
+
+void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
+    std::cout << "Generating GO statement for function: " << goStmt->functionCall->value << std::endl;
+    
+    // For now, we'll create a simple wrapper function that calls the target function
+    // and pass it to runtime_spawn_goroutine
+    
+    FunctionCallNode* funcCall = goStmt->functionCall.get();
+    
+    // We need to create a closure that captures the function call
+    // For simplicity, we'll generate code that calls the function directly
+    // In a more complete implementation, we'd need to capture arguments and scope
+    
+    // Find the target function
+    if (!funcCall->varRef) {
+        throw std::runtime_error("Function not found in go statement: " + funcCall->value);
+    }
+    
+    if (funcCall->varRef->type != DataType::CLOSURE) {
+        throw std::runtime_error("Go statement target is not a function: " + funcCall->value);
+    }
+    
+    // Get the function address from the closure
+    x86::Gp funcPtrReg = x86::rdi;  // First argument to runtime_spawn_goroutine
+    loadVariableAddress(funcCall, funcPtrReg, 0); // Load closure address
+    cb->mov(funcPtrReg, x86::qword_ptr(funcPtrReg)); // Dereference to get function pointer
+    
+    // For now, pass NULL for args and 0 for argsSize (no argument support yet)
+    cb->mov(x86::rsi, 0);  // args = NULL  
+    cb->mov(x86::rdx, 0);  // argsSize = 0
+    
+    // Save registers before calling runtime function
+    cb->push(x86::rax);
+    cb->push(x86::rcx);
+    cb->push(x86::r8);
+    cb->push(x86::r9);
+    cb->push(x86::r10);
+    cb->push(x86::r11);
+    
+    // Call runtime_spawn_goroutine(func, args, argsSize)
+    // Load the function address into rax first
+    uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_spawn_goroutine);
+    cb->mov(x86::rax, runtimeAddr);
+    cb->call(x86::rax);
+    
+    // Restore registers
+    cb->pop(x86::r11);
+    cb->pop(x86::r10);
+    cb->pop(x86::r9);
+    cb->pop(x86::r8);
+    cb->pop(x86::rcx);
+    cb->pop(x86::rax);
+    
+    std::cout << "Generated GO statement call to runtime_spawn_goroutine" << std::endl;
 }

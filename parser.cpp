@@ -368,8 +368,20 @@ std::unique_ptr<ASTNode> Parser::parsePrintStmt() {
 
 std::unique_ptr<ASTNode> Parser::parseGoStmt() {
     expect(TokenType::GO);
-    auto go = std::make_unique<ASTNode>(AstNodeType::GO_STMT);
-    go->children.push_back(parseFunctionCall());
+    auto go = std::make_unique<GoStmtNode>();
+    
+    // Parse the function call that follows 'go'
+    auto functionCall = parseFunctionCall();
+    if (!functionCall) {
+        throw std::runtime_error("Expected function call after 'go' keyword");
+    }
+    
+    // Cast to FunctionCallNode (we know it's a function call from parseFunctionCall)
+    auto funcCall = std::unique_ptr<FunctionCallNode>(
+        static_cast<FunctionCallNode*>(functionCall.release())
+    );
+    
+    go->functionCall = std::move(funcCall);
     return go;
 }
 
