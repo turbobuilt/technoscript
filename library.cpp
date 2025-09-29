@@ -16,7 +16,7 @@ extern "C" {
 }
 
 // Async functions implementation
-uint64_t sleep(int64_t milliseconds) {
+uint64_t technoscript_sleep(int64_t milliseconds) {
     // Delegate to the runtime function
     return runtime_sleep(milliseconds);
 }

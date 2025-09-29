@@ -40,17 +40,27 @@ private:
     void visitNode(ASTNode* node);
     void generateProgram(ASTNode* root);
     void generateVarDecl(VarDeclNode* varDecl);
+    void generateLetDecl(LetDeclNode* letDecl);
     void generatePrintStmt(ASTNode* printStmt);
     void generateFunctionDecl(FunctionDeclNode* funcDecl);
     void generateFunctionCall(FunctionCallNode* funcCall);
     void generateGoStmt(GoStmtNode* goStmt);
     void generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt);
+    void generateAwaitExpr(ASTNode* awaitExpr, x86::Gp destReg);
+    void generateSleepCall(ASTNode* sleepCall, x86::Gp destReg);
     
     // Function-related utilities
     void createFunctionLabel(FunctionDeclNode* funcDecl);
     void generateFunctionPrologue(FunctionDeclNode* funcDecl);
     void generateFunctionEpilogue(FunctionDeclNode* funcDecl);
     void storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, LexicalScopeNode* scope);
+    
+    // Generic scope management utilities (shared by functions and blocks)
+    void generateScopePrologue(LexicalScopeNode* scope);
+    void generateScopeEpilogue(LexicalScopeNode* scope);
+    
+    // Block statement utilities
+    void generateBlockStmt(BlockStmtNode* blockStmt);
     
     // Code generation utilities
     void setupMainFunction();
@@ -59,7 +69,7 @@ private:
     void storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope);
     void loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
     void loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
-    void loadParameterIntoRegister(int paramIndex, x86::Gp destReg);
+    void loadParameterIntoRegister(int paramIndex, x86::Gp destReg, x86::Gp scopeReg = x86::r15);
     x86::Gp getParameterByIndex(int paramIndex);
     
     // External function declarations

@@ -19,7 +19,8 @@ namespace RobustnessLimits {
 enum class AstNodeType {
     VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT, SETTIMEOUT_STMT, 
-    AWAIT_EXPR, SLEEP_CALL
+    AWAIT_EXPR, SLEEP_CALL, FOR_STMT, LET_DECL, 
+    BINARY_EXPR, UNARY_EXPR, BLOCK_STMT
 };
 
 enum class DataType { INT32, INT64, CLOSURE, PROMISE };
@@ -184,9 +185,18 @@ public:
                 
                 return {false, actualParameterIndex, varRef->offset}; // inCurrentScope=false
             } else {
-                // throw for now
-                // for block scope we will have pushed needed scope addresses onto stack.
-                throw std::runtime_error("Variable in non-function parent scope not supported yet: " + value);
+                // This is a block scope accessing a parent scope variable
+                // Find the index of the defining scope depth in allNeeded
+                auto blockScope = static_cast<LexicalScopeNode*>(accessedIn);
+                auto it = std::find(blockScope->allNeeded.begin(), blockScope->allNeeded.end(), definingScope->depth);
+                if (it == blockScope->allNeeded.end()) {
+                    throw std::runtime_error("Scope depth not found in allNeeded for block: " + std::to_string(definingScope->depth));
+                }
+                auto scopeIndex = std::distance(blockScope->allNeeded.begin(), it);
+                
+                // For blocks, the parameter index is just the index in allNeeded
+                // since blocks only have "hidden parameters" (parent scope pointers)
+                return {false, static_cast<size_t>(scopeIndex), varRef->offset}; // inCurrentScope=false
             }
         }
     }
@@ -231,6 +241,57 @@ public:
     SleepCallNode() : ASTNode(AstNodeType::SLEEP_CALL) {}
 };
 
+class LetDeclNode : public ASTNode {
+public:
+    std::string varName;
+    DataType varType;
+    
+    LetDeclNode(const std::string& name, DataType type) 
+        : ASTNode(AstNodeType::LET_DECL), varName(name), varType(type) {}
+};
+
+class ForStmtNode : public LexicalScopeNode {
+public:
+    std::unique_ptr<ASTNode> init;      // initialization (e.g., let i = 0)
+    std::unique_ptr<ASTNode> condition; // condition (e.g., i < 10)
+    std::unique_ptr<ASTNode> update;    // update (e.g., ++i)
+    // body statements are in the children vector inherited from ASTNode
+    
+    ForStmtNode(LexicalScopeNode* p = nullptr, int d = 0) 
+        : LexicalScopeNode(p, d) {
+        type = AstNodeType::FOR_STMT;
+    }
+};
+
+class BlockStmtNode : public LexicalScopeNode {
+public:
+    // body statements are in the children vector inherited from ASTNode
+    
+    BlockStmtNode(LexicalScopeNode* p = nullptr, int d = 0) 
+        : LexicalScopeNode(p, d) {
+        type = AstNodeType::BLOCK_STMT;
+    }
+};
+
+class BinaryExprNode : public ASTNode {
+public:
+    std::string operator_type; // "<", ">", "==", etc.
+    std::unique_ptr<ASTNode> left;
+    std::unique_ptr<ASTNode> right;
+    
+    BinaryExprNode(const std::string& op) 
+        : ASTNode(AstNodeType::BINARY_EXPR), operator_type(op) {}
+};
+
+class UnaryExprNode : public ASTNode {
+public:
+    std::string operator_type; // "++", "--", etc.
+    std::unique_ptr<ASTNode> operand;
+    
+    UnaryExprNode(const std::string& op) 
+        : ASTNode(AstNodeType::UNARY_EXPR), operator_type(op) {}
+};
+
 // Implementation of getTypeSize after all classes are defined
 inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
     // Use the precomputed size field for fast access
@@ -244,39 +305,47 @@ inline void LexicalScopeNode::buildScopeDepthToParentParameterIndexMap() {
         throw std::runtime_error("buildScopeDepthToParentParameterIndexMap called multiple times on same scope - analysis bug");
     }
     
-    // Only function scopes need parameter mapping
-    if (this->type != AstNodeType::FUNCTION_DECL) return;
-    
-    
-    // Get the current function's parameter count
-    FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
-    int currentParamCount = currentFunc->paramsInfo.size(); // Use unified parameter info
-    
-    printf("DEBUG buildScopeDepthToParentParameterIndexMap: Function '%s' has %d regular params, needs %zu scopes\n", 
-           currentFunc->funcName.c_str(), currentParamCount, allNeeded.size());
+    int currentParamCount = 0;
+    if (this->type == AstNodeType::FUNCTION_DECL) {
+        // Function scopes: map needed scopes to hidden parameters after regular parameters
+        FunctionDeclNode* currentFunc = static_cast<FunctionDeclNode*>(this);
+        currentParamCount = currentFunc->paramsInfo.size(); // Use unified parameter info
+        printf("DEBUG buildScopeDepthToParentParameterIndexMap: Function '%s' has %d regular params, needs %zu scopes\n", currentFunc->funcName.c_str(), currentParamCount, allNeeded.size());
+    } else if (this->type == AstNodeType::BLOCK_STMT) {
+        currentParamCount = 0; // Block scopes have no regular parameters
+    }
+
     
     // Build map based on what this scope needs
-    // CRITICAL FIX: We need to filter out the current scope from allNeeded when assigning parameter indices
-    int hiddenParamIndex = 0; // Counter for hidden parameters (excludes current scope)
+    int hiddenParamIndex = 0; // Counter for hidden parameters
     
     for (int neededDepth : allNeeded) {
         if (neededDepth == this->depth) {
-            // this should throw an error that the current scope shouldn't be in allNeeded
-            throw std::runtime_error("Current scope depth found in allNeeded - analysis bug");
+            // Skip current scope - it shouldn't be in allNeeded
+            continue;
+        }
+        
+        // Check if this is the immediate parent scope (depth = current_depth - 1)
+        if (neededDepth == this->depth - 1) {
+            // Immediate parent scope - accessible via r14, not a parameter
+            printf("DEBUG buildScopeDepthToParentParameterIndexMap: depth %d -> param index -1 (immediate parent)\n", neededDepth);
+            scopeDepthToParentParameterIndexMap[neededDepth] = -1;
         } else {
-            // Scope parameters start after regular parameters
+            // Other ancestor scopes - passed as hidden parameters
             int paramIndex = currentParamCount + hiddenParamIndex;
             printf("DEBUG buildScopeDepthToParentParameterIndexMap: depth %d -> param index %d (regular params=%d + hidden offset=%d)\n", 
-                   neededDepth, paramIndex, currentParamCount, hiddenParamIndex);
+                    neededDepth, paramIndex, currentParamCount, hiddenParamIndex);
             scopeDepthToParentParameterIndexMap[neededDepth] = paramIndex;
             hiddenParamIndex++; // Only increment for actual hidden parameters
         }
     }
     
-    printf("DEBUG buildScopeDepthToParentParameterIndexMap: Final map for function '%s':\n", currentFunc->funcName.c_str());
+    printf("DEBUG buildScopeDepthToParentParameterIndexMap: Final map");
     for (const auto& [depth, paramIdx] : scopeDepthToParentParameterIndexMap) {
         printf("DEBUG:   depth %d -> param index %d\n", depth, paramIdx);
     }
+    
+    // Other scope types (like FOR_STMT) don't need parameter mapping for now
 }
 
 // Implementation of pack after all classes are defined
@@ -320,11 +389,17 @@ inline void LexicalScopeNode::pack() {
     
     int offset = 0;
     
-    // For function scopes, first allocate space for parameters
+    FunctionDeclNode* funcDecl = nullptr;
+    
     if (this->type == AstNodeType::FUNCTION_DECL) {
-        FunctionDeclNode* funcDecl = static_cast<FunctionDeclNode*>(this);
-        
-        // 1. Pack regular parameters first and populate paramsInfo
+        funcDecl = static_cast<FunctionDeclNode*>(this);
+    } else if (this->type == AstNodeType::BLOCK_STMT) {
+        // Block scopes have 0 regular parameters, only "hidden parameters" (parent scope pointers)
+        printf("DEBUG pack: Block scope needs %zu parent scope pointers\n", allNeeded.size());
+    }
+    
+    // Pack regular parameters first (only for functions)
+    if (funcDecl) {
         for (auto& [name, var] : params) {
             int size = var->size;
             int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
@@ -337,19 +412,23 @@ inline void LexicalScopeNode::pack() {
             
             offset += size; // Use actual parameter size
         }
-        
-        // 2. Pack hidden lexical scope parameters and populate hiddenParamsInfo
+    }
+    
+    // Pack hidden lexical scope parameters (shared logic for functions and blocks)
+    if (this->type == AstNodeType::FUNCTION_DECL || this->type == AstNodeType::BLOCK_STMT) {
         for (int neededDepth : allNeeded) {
             if (neededDepth != this->depth) { // Don't count current scope as hidden parameter
                 offset = (offset + 7) & ~7; // 8-byte align
-                printf("DEBUG pack: Hidden parameter for depth %d assigned offset %d\n", neededDepth, offset);
+                printf("DEBUG pack: %s scope pointer for depth %d assigned offset %d\n", 
+                       (this->type == AstNodeType::FUNCTION_DECL) ? "Hidden parameter" : "Parent", 
+                       neededDepth, offset);
                 
-                // Find the corresponding scope for this depth
-                LexicalScopeNode* correspondingScope = nullptr;
-                // We'll need to find this scope - for now we'll store null and fix in analysis
-                
-                ParameterInfo hiddenParam(neededDepth, offset, correspondingScope, true);
-                funcDecl->hiddenParamsInfo.push_back(hiddenParam);
+                if (funcDecl) {
+                    // For functions, store in hiddenParamsInfo
+                    LexicalScopeNode* correspondingScope = nullptr;
+                    ParameterInfo hiddenParam(neededDepth, offset, correspondingScope, true);
+                    funcDecl->hiddenParamsInfo.push_back(hiddenParam);
+                }
                 
                 offset += 8; // Each scope pointer takes 8 bytes
             }

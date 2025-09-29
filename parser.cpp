@@ -35,6 +35,8 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             else if (word == "await") result.emplace_back(TokenType::AWAIT);
             else if (word == "promise") result.emplace_back(TokenType::PROMISE);
             else if (word == "sleep") result.emplace_back(TokenType::SLEEP);
+            else if (word == "for") result.emplace_back(TokenType::FOR);
+            else if (word == "let") result.emplace_back(TokenType::LET);
             else result.emplace_back(TokenType::IDENTIFIER, word);
         }
         else if (std::isdigit(code[i])) {
@@ -50,16 +52,26 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             result.emplace_back(TokenType::STRING, str);
         }
         else {
-            switch (code[i++]) {
-                case '=': result.emplace_back(TokenType::ASSIGN); break;
-                case ';': result.emplace_back(TokenType::SEMICOLON); break;
-                case '(': result.emplace_back(TokenType::LPAREN); break;
-                case ')': result.emplace_back(TokenType::RPAREN); break;
-                case '{': result.emplace_back(TokenType::LBRACE); break;
-                case '}': result.emplace_back(TokenType::RBRACE); break;
-                case ':': result.emplace_back(TokenType::COLON); break;
-                case ',': result.emplace_back(TokenType::COMMA); break;
-                case '.': result.emplace_back(TokenType::DOT); break;
+            switch (code[i]) {
+                case '=': result.emplace_back(TokenType::ASSIGN); i++; break;
+                case ';': result.emplace_back(TokenType::SEMICOLON); i++; break;
+                case '(': result.emplace_back(TokenType::LPAREN); i++; break;
+                case ')': result.emplace_back(TokenType::RPAREN); i++; break;
+                case '{': result.emplace_back(TokenType::LBRACE); i++; break;
+                case '}': result.emplace_back(TokenType::RBRACE); i++; break;
+                case ':': result.emplace_back(TokenType::COLON); i++; break;
+                case ',': result.emplace_back(TokenType::COMMA); i++; break;
+                case '.': result.emplace_back(TokenType::DOT); i++; break;
+                case '<': result.emplace_back(TokenType::LESS_THAN); i++; break;
+                case '+':
+                    if (i + 1 < code.length() && code[i + 1] == '+') {
+                        result.emplace_back(TokenType::PLUS_PLUS);
+                        i += 2;
+                    } else {
+                        i++; // Skip unrecognized single '+'
+                    }
+                    break;
+                default: i++; break; // Skip unrecognized characters
             }
         }
     }
@@ -83,6 +95,7 @@ std::unique_ptr<FunctionDeclNode> Parser::parse(const std::string& code) {
     auto root = std::make_unique<FunctionDeclNode>("main", nullptr);
     root->depth = 0; // Explicitly set main function depth to 0
     currentLexicalScope = root.get();  // Set initial scope
+    currentFunctionScope = root.get(); // Main is also the initial function scope
     
     int iterations = 0;
     size_t lastPos = pos;
@@ -145,6 +158,9 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
            current().type != TokenType::PRINT &&
            current().type != TokenType::SETTIMEOUT &&
            current().type != TokenType::GO &&
+           current().type != TokenType::FOR &&     // Add FOR token
+           current().type != TokenType::LET &&     // Add LET token
+           current().type != TokenType::LBRACE &&  // Add LBRACE for block statements
            current().type != TokenType::IDENTIFIER &&
            current().type != TokenType::RBRACE) { // Allow } to end blocks naturally
         
@@ -159,6 +175,18 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
     if (match(TokenType::VAR)) {
         std::cout << "DEBUG parseStatement: parsing VAR" << std::endl;
         return parseVarDecl();
+    }
+    if (match(TokenType::LET)) {
+        std::cout << "DEBUG parseStatement: parsing LET" << std::endl;
+        return parseLetDecl();
+    }
+    if (match(TokenType::FOR)) {
+        std::cout << "DEBUG parseStatement: parsing FOR" << std::endl;
+        return parseForStmt();
+    }
+    if (match(TokenType::LBRACE)) {
+        std::cout << "DEBUG parseStatement: parsing BLOCK" << std::endl;
+        return parseBlockStmt();
     }
     if (match(TokenType::ASYNC)) {
         std::cout << "DEBUG parseStatement: parsing ASYNC FUNCTION" << std::endl;
@@ -292,20 +320,136 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     
     expect(TokenType::SEMICOLON);
     
-    // Add variable to current scope's variables map during parsing
+    // Add variable to appropriate scope based on declaration type
+    // var: function-scoped (use current function scope)
+    // let: block-scoped (use current lexical scope)
     VariableInfo varInfo;
     varInfo.type = varType;
     varInfo.name = name;
-    varInfo.definedIn = currentLexicalScope;
+    
+    // For var declarations, use the current function scope
+    if (!currentFunctionScope) {
+        throw std::runtime_error("var declaration outside of function scope");
+    }
+    
+    varInfo.definedIn = currentFunctionScope;
+    
     // Set size based on type
     if (varType == DataType::INT32) {
         varInfo.size = 4;
     } else {
         varInfo.size = 8; // INT64 and other types
     }
-    currentLexicalScope->variables[name] = varInfo;
+    
+    std::cout << "DEBUG parseVarDecl: Adding variable '" << name << "' to function scope at depth " << currentFunctionScope->depth << std::endl;
+    currentFunctionScope->variables[name] = varInfo;
     
     return varDecl;
+}
+
+std::unique_ptr<LetDeclNode> Parser::parseLetDecl() {
+    expect(TokenType::LET);
+    std::string name = current().value;
+    expect(TokenType::IDENTIFIER);
+    expect(TokenType::COLON);
+    
+    DataType varType;
+    if (match(TokenType::INT32_TYPE)) {
+        varType = DataType::INT32;
+        advance();
+    } else if (match(TokenType::INT64_TYPE)) {
+        varType = DataType::INT64;
+        advance();
+    } else {
+        throw std::runtime_error("Expected type");
+    }
+    
+    expect(TokenType::ASSIGN);
+    auto letDecl = std::make_unique<LetDeclNode>(name, varType);
+    
+    if (match(TokenType::LITERAL)) {
+        letDecl->children.push_back(std::make_unique<LiteralNode>(current().value));
+        advance();
+    } else if (match(TokenType::IDENTIFIER)) {
+        letDecl->children.push_back(std::make_unique<IdentifierNode>(current().value));
+        advance();
+    } else {
+        throw std::runtime_error("Expected literal or identifier after assignment");
+    }
+    
+    // Note: Let declarations don't need semicolons when used in for loops
+    // The caller (parseForStmt) will handle this appropriately
+    
+    // Add variable to current lexical scope (block-scoped for let declarations)
+    VariableInfo varInfo;
+    varInfo.type = varType;
+    varInfo.name = name;
+    varInfo.definedIn = currentLexicalScope;  // let is block-scoped
+    
+    // Set size based on type
+    if (varType == DataType::INT32) {
+        varInfo.size = 4;
+    } else {
+        varInfo.size = 8; // INT64 and other types
+    }
+
+    std::cout << "DEBUG parseLetDecl: Adding variable '" << name << "' to block scope at depth " << (currentLexicalScope ? currentLexicalScope->depth : -1) << std::endl;
+    currentLexicalScope->variables[name] = varInfo;    return letDecl;
+}
+
+std::unique_ptr<ASTNode> Parser::parseExpression() {
+    // Simple expression parser for basic operations
+    // For now, we'll handle:
+    // - Comparisons: identifier < literal
+    // - Increment: ++identifier
+    // - Identifiers and literals
+    
+    if (match(TokenType::PLUS_PLUS)) {
+        advance(); // consume ++
+        if (match(TokenType::IDENTIFIER)) {
+            // Create a unary expression node for ++i
+            auto increment = std::make_unique<UnaryExprNode>("++");
+            increment->operand = std::make_unique<IdentifierNode>(current().value);
+            advance();
+            return increment;
+        } else {
+            throw std::runtime_error("Expected identifier after ++");
+        }
+    } else if (match(TokenType::IDENTIFIER)) {
+        std::string leftSide = current().value;
+        advance();
+        
+        // Check if this is a comparison
+        if (match(TokenType::LESS_THAN)) {
+            advance(); // consume <
+            
+            // Create a binary expression node for comparison
+            std::cout << "DEBUG parseExpression: Creating binary expression for " << leftSide << " < ..." << std::endl;
+            auto comparison = std::make_unique<BinaryExprNode>("<");
+            comparison->left = std::make_unique<IdentifierNode>(leftSide);
+            
+            if (match(TokenType::LITERAL)) {
+                comparison->right = std::make_unique<LiteralNode>(current().value);
+                advance();
+            } else if (match(TokenType::IDENTIFIER)) {
+                comparison->right = std::make_unique<IdentifierNode>(current().value);
+                advance();
+            } else {
+                throw std::runtime_error("Expected literal or identifier after <");
+            }
+            
+            return comparison;
+        } else {
+            // Just return the identifier
+            return std::make_unique<IdentifierNode>(leftSide);
+        }
+    } else if (match(TokenType::LITERAL)) {
+        auto literal = std::make_unique<LiteralNode>(current().value);
+        advance();
+        return literal;
+    } else {
+        throw std::runtime_error("Expected expression");
+    }
 }
 
 std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
@@ -349,8 +493,10 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     expect(TokenType::LBRACE);
     
     // Update scope tracking for function body parsing
-    LexicalScopeNode* previousScope = currentLexicalScope;
+    LexicalScopeNode* previousLexicalScope = currentLexicalScope;
+    LexicalScopeNode* previousFunctionScope = currentFunctionScope;
     currentLexicalScope = func.get();  // Function is a lexical scope
+    currentFunctionScope = func.get(); // Function is also a function scope
     currentDepth++;
     
     // Add function parameters as variables in the function scope during parsing
@@ -369,9 +515,10 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     }
     expect(TokenType::RBRACE);
     
-    // Restore previous scope
+    // Restore previous scopes
     currentDepth--;
-    currentLexicalScope = previousScope;
+    currentLexicalScope = previousLexicalScope;
+    currentFunctionScope = previousFunctionScope;
     
     return func;
 }
@@ -473,6 +620,91 @@ std::unique_ptr<ASTNode> Parser::parseSetTimeoutStmt() {
     return setTimeout;
 }
 
+std::unique_ptr<ForStmtNode> Parser::parseForStmt() {
+    expect(TokenType::FOR);
+    expect(TokenType::LPAREN);
+    
+    // Create a new for loop scope
+    auto forStmt = std::make_unique<ForStmtNode>(currentLexicalScope, currentDepth + 1);
+    
+    // Update scope tracking for the for loop body parsing
+    LexicalScopeNode* previousScope = currentLexicalScope;
+    currentLexicalScope = forStmt.get();  // For loop is a lexical scope
+    currentDepth++;
+    
+    // Parse initialization (e.g., let i: int64 = 0)
+    if (!match(TokenType::SEMICOLON)) {
+        if (match(TokenType::LET)) {
+            forStmt->init = parseLetDecl();
+        } else {
+            throw std::runtime_error("Expected let declaration in for loop initialization");
+        }
+    }
+    expect(TokenType::SEMICOLON);
+    
+    // Parse condition (e.g., i < 2)
+    if (!match(TokenType::SEMICOLON)) {
+        forStmt->condition = parseExpression();
+    }
+    expect(TokenType::SEMICOLON);
+    
+    // Parse update (e.g., ++i)
+    if (!match(TokenType::RPAREN)) {
+        forStmt->update = parseExpression();
+    }
+    expect(TokenType::RPAREN);
+    
+    expect(TokenType::LBRACE);
+    
+    // Parse body statements
+    while (!match(TokenType::RBRACE)) {
+        auto stmt = parseStatement(forStmt.get());
+        if (stmt) {
+            forStmt->ASTNode::children.push_back(std::move(stmt));
+        }
+    }
+    expect(TokenType::RBRACE);
+    
+    // Restore previous scope
+    currentDepth--;
+    currentLexicalScope = previousScope;
+    
+    return forStmt;
+}
+
+std::unique_ptr<BlockStmtNode> Parser::parseBlockStmt() {
+    std::cout << "DEBUG parseBlockStmt: Starting to parse block statement" << std::endl;
+    expect(TokenType::LBRACE);
+    
+    // Create a new block scope
+    auto blockStmt = std::make_unique<BlockStmtNode>(currentLexicalScope, currentDepth + 1);
+    
+    // Update scope tracking for the block body parsing
+    LexicalScopeNode* previousScope = currentLexicalScope;
+    currentLexicalScope = blockStmt.get();  // Block is a lexical scope
+    currentDepth++;
+    
+    std::cout << "DEBUG parseBlockStmt: Entering block scope, depth=" << currentDepth << std::endl;
+    
+    // Parse body statements
+    while (!match(TokenType::RBRACE) && current().type != TokenType::EOF_TOKEN) {
+        auto stmt = parseStatement(blockStmt.get());
+        if (stmt) {
+            std::cout << "DEBUG parseBlockStmt: Adding statement to block" << std::endl;
+            blockStmt->ASTNode::children.push_back(std::move(stmt));
+        }
+    }
+    expect(TokenType::RBRACE);
+    
+    std::cout << "DEBUG parseBlockStmt: Exiting block scope, depth=" << currentDepth << std::endl;
+    
+    // Restore previous scope
+    currentDepth--;
+    currentLexicalScope = previousScope;
+    
+    return blockStmt;
+}
+
 bool Parser::synchronizeToNextStatement() {
     std::cout << "DEBUG: Attempting to synchronize from position " << pos << std::endl;
     
@@ -547,6 +779,10 @@ std::string Parser::tokenTypeToString(TokenType type) {
         case TokenType::PRINT: return "PRINT";
         case TokenType::SETTIMEOUT: return "SETTIMEOUT";
         case TokenType::DOT: return "DOT (.)";
+        case TokenType::FOR: return "FOR";
+        case TokenType::LET: return "LET";
+        case TokenType::LESS_THAN: return "LESS_THAN (<)";
+        case TokenType::PLUS_PLUS: return "PLUS_PLUS (++)";
         case TokenType::EOF_TOKEN: return "EOF";
         default: return "UNKNOWN";
     }

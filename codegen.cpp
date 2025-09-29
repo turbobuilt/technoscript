@@ -140,6 +140,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::VAR_DECL:
             generateVarDecl(static_cast<VarDeclNode*>(node));
             break;
+        case AstNodeType::LET_DECL:
+            generateLetDecl(static_cast<LetDeclNode*>(node));
+            break;
         case AstNodeType::PRINT_STMT:
             generatePrintStmt(node);
             break;
@@ -154,6 +157,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
             break;
         case AstNodeType::SETTIMEOUT_STMT:
             generateSetTimeoutStmt(static_cast<SetTimeoutStmtNode*>(node));
+            break;
+        case AstNodeType::BLOCK_STMT:
+            generateBlockStmt(static_cast<BlockStmtNode*>(node));
             break;
         default:
             // For other nodes, just visit children
@@ -220,6 +226,22 @@ void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
     storeVariableInScope(varDecl->varName, x86::rax, currentScope);
 }
 
+void CodeGenerator::generateLetDecl(LetDeclNode* letDecl) {
+    std::cout << "Generating let declaration: " << letDecl->varName << std::endl;
+    
+    // Let declarations work the same as var declarations
+    // let x: int64 = 10
+    if (letDecl->children.empty()) {
+        throw std::runtime_error("Let declaration without assignment not supported");
+    }
+    
+    // Load the value into a register
+    loadValue(letDecl->children[0].get(), x86::rax);
+    
+    // Store the value in the current scope
+    storeVariableInScope(letDecl->varName, x86::rax, currentScope);
+}
+
 void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
     // Load the value into rax
     loadValue(value, x86::rax);
@@ -230,6 +252,8 @@ void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
 
 void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
     if (!valueNode) return;
+    
+    std::cout << "DEBUG loadValue: node type = " << static_cast<int>(valueNode->type) << std::endl;
     
     switch (valueNode->type) {
         case AstNodeType::LITERAL: {
@@ -252,7 +276,18 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
             }
             break;
         }
+        case AstNodeType::AWAIT_EXPR: {
+            // Handle await expression
+            generateAwaitExpr(valueNode, destReg);
+            break;
+        }
+        case AstNodeType::SLEEP_CALL: {
+            // Handle sleep call
+            generateSleepCall(valueNode, destReg);
+            break;
+        }
         default:
+            std::cout << "DEBUG loadValue: Unsupported node type " << static_cast<int>(valueNode->type) << std::endl;
             throw std::runtime_error("Unsupported value node type in loadValue");
     }
 }
@@ -271,34 +306,36 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
     cb->mov(x86::ptr(x86::r15, offset), valueReg);
 }
 
-void CodeGenerator::loadParameterIntoRegister(int paramIndex, x86::Gp destReg) {
-    // Since all parameters (including hidden scope parameters) are stored in the current
-    // function's lexical scope during the prologue, we should load them from there
-    // instead of relying on parameter registers which can be clobbered by function calls
+void CodeGenerator::loadParameterIntoRegister(int paramIndex, x86::Gp destReg, x86::Gp scopeReg) {
+    // Load a parameter from the specified scope. Parameters can be:
+    // - For functions: regular parameters + hidden parameters (parent scope pointers)
+    // - For blocks: only hidden parameters (parent scope pointers)
     
-    auto* currentFunc = dynamic_cast<FunctionDeclNode*>(currentScope);
-    if (!currentFunc) {
-        throw std::runtime_error("Current scope is not a function");
-    }
-    
-    // Calculate which parameter this is (regular params + hidden params)
-    size_t totalRegularParams = currentFunc->paramsInfo.size();
-    
-    if (static_cast<size_t>(paramIndex) < totalRegularParams) {
-        // This is a regular parameter - load from its scope offset
-        const VariableInfo& param = currentFunc->paramsInfo[paramIndex];
-        std::cout << "Loading regular parameter " << paramIndex << " from scope offset " << param.offset << std::endl;
-        cb->mov(destReg, x86::ptr(x86::r15, param.offset));
-    } else {
-        // This is a hidden parameter - load from its scope offset
-        size_t hiddenParamIndex = paramIndex - totalRegularParams;
-        if (hiddenParamIndex >= currentFunc->hiddenParamsInfo.size()) {
-            throw std::runtime_error("Hidden parameter index out of range");
-        }
+    if (auto currentFunc = dynamic_cast<FunctionDeclNode*>(currentScope)) {
+        // Current scope is a function
+        size_t totalRegularParams = currentFunc->paramsInfo.size();
         
-        const ParameterInfo& hiddenParam = currentFunc->hiddenParamsInfo[hiddenParamIndex];
-        std::cout << "Loading hidden parameter " << hiddenParamIndex << " (total param index " << paramIndex << ") from scope offset " << hiddenParam.offset << std::endl;
-        cb->mov(destReg, x86::ptr(x86::r15, hiddenParam.offset));
+        if (static_cast<size_t>(paramIndex) < totalRegularParams) {
+            // This is a regular parameter - load from its scope offset
+            const VariableInfo& param = currentFunc->paramsInfo[paramIndex];
+            std::cout << "Loading regular parameter " << paramIndex << " from scope offset " << param.offset << " using scope register" << std::endl;
+            cb->mov(destReg, x86::ptr(scopeReg, param.offset));
+        } else {
+            // This is a hidden parameter - load from its scope offset
+            size_t hiddenParamIndex = paramIndex - totalRegularParams;
+            if (hiddenParamIndex >= currentFunc->hiddenParamsInfo.size()) {
+                throw std::runtime_error("Hidden parameter index out of range");
+            }
+            
+            const ParameterInfo& hiddenParam = currentFunc->hiddenParamsInfo[hiddenParamIndex];
+            std::cout << "Loading hidden parameter " << hiddenParamIndex << " (total param index " << paramIndex << ") from scope offset " << hiddenParam.offset << " using scope register" << std::endl;
+            cb->mov(destReg, x86::ptr(scopeReg, hiddenParam.offset));
+        }
+    } else {
+        // Current scope is a block - only has hidden parameters (parent scope pointers)
+        // For blocks, paramIndex directly maps to the index of the parent scope pointer
+        std::cout << "Loading parent scope pointer " << paramIndex << " from block scope offset " << (paramIndex * 8) << " using scope register" << std::endl;
+        cb->mov(destReg, x86::ptr(scopeReg, paramIndex * 8));
     }
 }
 
@@ -499,77 +536,33 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     cb->push(x86::rbp);
     cb->mov(x86::rbp, x86::rsp);
     
-    // Save r15 (current scope pointer)
+    // Save r15 (current scope pointer) - this will become the parent scope
     cb->push(x86::r15);
     
     // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
     const int maxRegParams = 6;
     
-    // NOW: Allocate the function's lexical scope (this calls malloc/memset which clobbers registers)
-    allocateScope(funcDecl);
-    
-    // FINALLY: Copy parameters from stack and original stack locations to their final locations in scope
-    std::cout << "Copying " << funcDecl->paramsInfo.size() << " parameters to scope" << std::endl;
-    
-    // Copy register parameters (in reverse order since we pushed them)
-    for (int i = std::min((int)funcDecl->paramsInfo.size(), maxRegParams) - 1; i >= 0; i--) {
-        const VariableInfo& param = funcDecl->paramsInfo[i];
-        int offset = param.offset;
-        // print out the offset and register it's in
-        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "] (from register)" << std::endl;
-        cb->mov(x86::ptr(x86::r15, offset), paramRegs[i]);
+    // Save register parameters on stack before calling malloc (which clobbers them)
+    int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
+    for (int i = 0; i < regParamCount; i++) {
+        cb->push(paramRegs[i]);
     }
     
-    // Copy stack parameters (if any) - these weren't clobbered by malloc
-    for (size_t i = maxRegParams; i < funcDecl->paramsInfo.size(); i++) {
-        const VariableInfo& param = funcDecl->paramsInfo[i];
-        int offset = param.offset;
-        
-        std::cout << "  Parameter " << i << " (" << param.name << ") -> scope[" << offset << "] (from original stack)" << std::endl;
-        
-        // Calculate stack offset - need to account for the additional pushes we did
-        // Original stack: [return_addr][saved_rbp][saved_r15][stack_params...]
-        // Plus we pushed register params: [saved_reg_params...][return_addr][saved_rbp][saved_r15][stack_params...]
-        int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
-        int stackOffset = 24 + (regParamCount * 8) + (i - maxRegParams) * 8;
-        cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-        cb->mov(x86::ptr(x86::r15, offset), x86::rax);
-    }
+    // Use generic scope prologue to allocate scope and copy ALL parameters (regular + hidden)
+    generateScopePrologue(funcDecl);
     
-    // Copy hidden parameters (parent scope pointers) after regular parameters
-    std::cout << "Copying " << funcDecl->hiddenParamsInfo.size() << " hidden parameters to scope" << std::endl;
-    
-    for (size_t i = 0; i < funcDecl->hiddenParamsInfo.size(); i++) {
-        const ParameterInfo& hiddenParam = funcDecl->hiddenParamsInfo[i];
-        size_t paramIndex = funcDecl->paramsInfo.size() + i; // Hidden params come after regular params
-        int offset = hiddenParam.offset;
-        
-        std::cout << "  Hidden parameter " << i << " (depth " << hiddenParam.depth << ") -> scope[" << offset << "]" << std::endl;
-        
-        if (paramIndex < maxRegParams) {
-            // Hidden parameter is in register
-            cb->mov(x86::ptr(x86::r15, offset), paramRegs[paramIndex]);
-        } else {
-            // Hidden parameter is on stack
-            int stackOffset = 24 + (paramIndex - maxRegParams) * 8;
-            cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-            cb->mov(x86::ptr(x86::r15, offset), x86::rax);
-        }
-    }
+    // All parameters are now copied - no additional copying needed here
 }
 
 void CodeGenerator::generateFunctionEpilogue(FunctionDeclNode* funcDecl) {
     std::cout << "Generating epilogue for function: " << funcDecl->funcName << std::endl;
     
-    // Free the current scope memory
-    cb->mov(x86::rdi, x86::r15);  // scope pointer to free
-    uint64_t freeAddr = reinterpret_cast<uint64_t>(&free_wrapper);
-    cb->mov(x86::rax, freeAddr);
-    cb->call(x86::rax);
+    // Use generic scope epilogue to free scope and restore parent scope pointer
+    generateScopeEpilogue(funcDecl);
     
-    // Restore r15 (previous scope pointer)
-    cb->pop(x86::r15);
+    // Restore r14
+    cb->pop(x86::r14);
     
     // Standard function epilogue
     cb->mov(x86::rsp, x86::rbp);
@@ -644,6 +637,141 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
         cb->mov(x86::ptr(x86::r15, scopeOffset), x86::rax); // store in closure at proper offset
         scopeIndex++;
     }
+}
+
+// Generic scope management utilities that can be shared by functions and blocks
+void CodeGenerator::generateScopePrologue(LexicalScopeNode* scope) {
+    std::cout << "Generating scope prologue for scope at depth: " << scope->depth << std::endl;
+    
+    // Allocate the new scope (this will set r15 to point to the new scope)
+    allocateScope(scope);
+    
+    // Copy "hidden parameters" (parent scope addresses) to the new scope
+    // For functions, these come from actual parameters passed to the function
+    // For blocks, these come from the current lexical environment
+    
+    if (auto funcDecl = dynamic_cast<FunctionDeclNode*>(scope)) {
+        // This is a function scope - copy ALL parameters (regular + hidden) from function arguments
+        size_t totalParams = funcDecl->paramsInfo.size() + funcDecl->hiddenParamsInfo.size();
+        std::cout << "Copying " << totalParams << " total parameters (" << funcDecl->paramsInfo.size() << " regular + " << funcDecl->hiddenParamsInfo.size() << " hidden) to function scope" << std::endl;
+        
+        // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
+        x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
+        const int maxRegParams = 6;
+        
+        // First copy regular parameters
+        for (size_t i = 0; i < funcDecl->paramsInfo.size(); i++) {
+            const VariableInfo& param = funcDecl->paramsInfo[i];
+            int offset = param.offset;
+            
+            std::cout << "  Regular parameter " << i << " (" << param.name << ") -> scope[" << offset << "]" << std::endl;
+            
+            if (i < maxRegParams) {
+                // Regular parameter is in register (but was pushed on stack before malloc)
+                // We need to get it from the saved stack location
+                // Stack layout after pushes: [saved_reg_params...][return_addr][saved_rbp][saved_r15][original_stack_params...]
+                int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
+                // The parameters were pushed in order, so param i is at position (regParamCount - 1 - i)
+                int stackPos = regParamCount - 1 - i;
+                int stackOffset = 24 + (stackPos * 8); // 24 = return(8) + rbp(8) + r15(8)
+                cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
+                cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+            } else {
+                // Regular parameter is on original stack
+                int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
+                int originalStackOffset = 24 + (regParamCount * 8) + (i - maxRegParams) * 8;
+                cb->mov(x86::rax, x86::ptr(x86::rbp, originalStackOffset));
+                cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+            }
+        }
+        
+        // Then copy hidden parameters
+        for (size_t i = 0; i < funcDecl->hiddenParamsInfo.size(); i++) {
+            const ParameterInfo& hiddenParam = funcDecl->hiddenParamsInfo[i];
+            size_t paramIndex = funcDecl->paramsInfo.size() + i; // Hidden params come after regular params
+            int offset = hiddenParam.offset;
+            
+            std::cout << "  Hidden parameter " << i << " (depth " << hiddenParam.depth << ") -> scope[" << offset << "]" << std::endl;
+            
+            if (paramIndex < maxRegParams) {
+                // Hidden parameter is in register - get from original register (not saved on stack)
+                cb->mov(x86::ptr(x86::r15, offset), paramRegs[paramIndex]);
+            } else {
+                // Hidden parameter is on original stack
+                int stackOffset = 24 + (paramIndex - maxRegParams) * 8;
+                cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
+                cb->mov(x86::ptr(x86::r15, offset), x86::rax);
+            }
+        }
+    } else {
+        // This is a block scope - copy needed parent scope addresses from current lexical environment
+        std::cout << "Setting up block scope with access to " << scope->allNeeded.size() << " parent scopes" << std::endl;
+        
+        // For each needed parent scope depth, we need to find where to get the scope address from
+        int scopeIndex = 0;
+        for (const auto& neededDepth : scope->allNeeded) {
+            // Calculate offset in the new scope where this parent scope address should be stored
+            auto it = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
+            if (it == scope->scopeDepthToParentParameterIndexMap.end()) {
+                throw std::runtime_error("Needed parent scope not found in parameter mapping: " + std::to_string(neededDepth));
+            }
+            
+            int paramIndex = it->second;
+            // For blocks, we use a simple offset calculation since we don't have real parameters
+            int offset = 0 + (scopeIndex * 8); // Start at offset 0 for parent scope pointers
+            
+            std::cout << "  Parent scope at depth " << neededDepth << " -> block scope[" << offset << "]" << std::endl;
+
+            std::cout << "    (paramIndex = " << paramIndex << ")" << std::endl;
+            
+            if (paramIndex == -1) {
+                // Parent scope is current r14 (saved parent scope)
+                cb->mov(x86::ptr(x86::r15, offset), x86::r14);
+            } else {
+                // Parent scope is stored in the current scope as a hidden parameter
+                // Load it from the parent scope (r14) using proper parameter loading
+                loadParameterIntoRegister(paramIndex, x86::rax, x86::r14);
+                cb->mov(x86::ptr(x86::r15, offset), x86::rax); // Store in new scope
+            }
+            
+            scopeIndex++;
+        }
+    }
+}
+
+void CodeGenerator::generateScopeEpilogue(LexicalScopeNode* scope) {
+    std::cout << "Generating scope epilogue for scope at depth: " << scope->depth << std::endl;
+    
+    // Free the current scope memory
+    cb->mov(x86::rdi, x86::r15);  // scope pointer to free
+    uint64_t freeAddr = reinterpret_cast<uint64_t>(&free_wrapper);
+    cb->mov(x86::rax, freeAddr);
+    cb->call(x86::rax);
+    
+    // Restore r15 to the parent scope
+    cb->mov(x86::r15, x86::r14);
+}
+
+void CodeGenerator::generateBlockStmt(BlockStmtNode* blockStmt) {
+    std::cout << "Generating block statement" << std::endl;
+    
+    // Generate the scope prologue (allocate new scope, copy parent scope addresses)
+    generateScopePrologue(blockStmt);
+    
+    // Update current scope for variable resolution
+    LexicalScopeNode* prevScope = currentScope;
+    currentScope = blockStmt;
+    
+    // Generate code for all statements in the block
+    for (auto& child : blockStmt->children) {
+        visitNode(child.get());
+    }
+    
+    // Restore previous scope
+    currentScope = prevScope;
+    
+    // Generate the scope epilogue (free scope, restore parent scope pointer)
+    generateScopeEpilogue(blockStmt);
 }
 
 void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
@@ -857,4 +985,87 @@ void CodeGenerator::generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt) {
     cb->pop(x86::rax);
     
     std::cout << "Generated setTimeout statement call to runtime_set_timeout" << std::endl;
+}
+
+void CodeGenerator::generateAwaitExpr(ASTNode* awaitExpr, x86::Gp destReg) {
+    std::cout << "Generating await expression" << std::endl;
+    
+    // The await expression should have a child (sleep call)
+    if (awaitExpr->children.empty()) {
+        throw std::runtime_error("Await expression has no children");
+    }
+    
+    // Generate the async operation (e.g., sleep call)
+    ASTNode* asyncOp = awaitExpr->children[0].get();
+    generateSleepCall(asyncOp, x86::rdi); // Put promise ID directly in rdi (first argument register)
+    
+    // Save registers before calling runtime function
+    cb->push(x86::rcx);
+    cb->push(x86::r8);
+    cb->push(x86::r9);
+    cb->push(x86::r10);
+    cb->push(x86::r11);
+    
+    // Call runtime_await_promise(promiseId) - promise ID is already in rdi
+    uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_await_promise);
+    cb->mov(x86::rax, runtimeAddr);
+    cb->call(x86::rax);
+    
+    // Restore registers
+    cb->pop(x86::r11);
+    cb->pop(x86::r10);
+    cb->pop(x86::r9);
+    cb->pop(x86::r8);
+    cb->pop(x86::rcx);
+    
+    // Result (resolved value) is in rax, move to destReg if different
+    if (destReg.id() != x86::rax.id()) {
+        cb->mov(destReg, x86::rax);
+    }
+    
+    std::cout << "Generated await expression - promise awaited" << std::endl;
+}
+
+void CodeGenerator::generateSleepCall(ASTNode* sleepCall, x86::Gp destReg) {
+    std::cout << "Generating sleep call" << std::endl;
+    
+    // The sleep call should have a child (the duration literal)
+    if (sleepCall->children.empty()) {
+        throw std::runtime_error("Sleep call has no duration argument");
+    }
+    
+    // Load the sleep duration from the literal
+    ASTNode* durationNode = sleepCall->children[0].get();
+    if (durationNode->type != AstNodeType::LITERAL) {
+        throw std::runtime_error("Sleep duration must be a literal");
+    }
+    
+    int64_t duration = std::stoll(durationNode->value);
+    cb->mov(x86::rdi, duration); // First argument: duration in milliseconds
+    
+    // Save registers before calling runtime function (don't save rax since it will have the return value)
+    cb->push(x86::rcx);
+    cb->push(x86::r8);
+    cb->push(x86::r9);
+    cb->push(x86::r10);
+    cb->push(x86::r11);
+    
+    // Call runtime_sleep(milliseconds)
+    uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_sleep);
+    cb->mov(x86::rax, runtimeAddr);
+    cb->call(x86::rax);
+    
+    // Restore registers (don't restore rax since it contains the return value)
+    cb->pop(x86::r11);
+    cb->pop(x86::r10);
+    cb->pop(x86::r9);
+    cb->pop(x86::r8);
+    cb->pop(x86::rcx);
+    
+    // Result (promise ID) is in rax, move to destReg if different
+    if (destReg.id() != x86::rax.id()) {
+        cb->mov(destReg, x86::rax);
+    }
+    
+    std::cout << "Generated sleep call - promise ID returned" << std::endl;
 }

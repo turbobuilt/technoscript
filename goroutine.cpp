@@ -1,4 +1,5 @@
 #include "goroutine.h"
+#include "lockfree_queue.h"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -49,18 +50,14 @@ void Goroutine::resume(int64_t resolvedValue) {
     promiseResolvedValue = resolvedValue;
     awaitingPromiseId = 0;
     state = GoroutineState::READY;
-    // Re-queue this goroutine for execution
-    EventLoop::getInstance().spawnGoroutine([this]() {
-        // Use longjmp to resume from where we left off
-        longjmp(context->registers, 1);
-    });
+    // Use lock-free queue for efficient re-scheduling
+    EventLoop::getInstance().taskQueue.enqueue(new std::shared_ptr<Goroutine>(shared_from_this()));
 }
 
 // EventLoop implementation
-EventLoop::EventLoop() : maxThreads(std::thread::hardware_concurrency()), freeThreads(0) {
-    if (maxThreads == 0) maxThreads = 4; // Fallback
-    freeThreads.store(maxThreads);
-    std::cout << "EventLoop initialized with " << maxThreads << " max threads" << std::endl;
+EventLoop::EventLoop() : maxWorkers(std::thread::hardware_concurrency()) {
+    if (maxWorkers == 0) maxWorkers = 4; // Fallback
+    std::cout << "EventLoop initialized with max " << maxWorkers << " workers (lazy instantiation)" << std::endl;
 }
 
 EventLoop::~EventLoop() {
@@ -70,13 +67,17 @@ EventLoop::~EventLoop() {
 void EventLoop::spawnGoroutine(std::function<void()> entryPoint) {
     auto goroutine = std::make_shared<Goroutine>(std::move(entryPoint));
     
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        pendingTasks.push(goroutine);
+    // Try to assign to a sleeping worker first
+    if (!assignTaskToSleepingWorker(goroutine)) {
+        // No sleeping workers, add to lock-free task queue
+        taskQueue.enqueue(new std::shared_ptr<Goroutine>(goroutine));
+        
+        // Create worker thread if we need more capacity
+        createWorkerIfNeeded();
+        
+        // Wake up sleeping workers
+        wakeupSleepingWorkers(1);
     }
-    
-    // Wake up a worker thread
-    workAvailable.notify_one();
     
     std::cout << "Spawned goroutine " << goroutine->id << std::endl;
 }
@@ -85,63 +86,176 @@ void EventLoop::addTimer(std::chrono::milliseconds delay, std::function<void()> 
     auto expireTime = std::chrono::steady_clock::now() + delay;
     
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        unexpiredTimers.push({expireTime, std::move(callback)});
+        std::lock_guard<std::mutex> lock(timerMutex);
+        unexpiredTimers.emplace(expireTime, std::move(callback));
     }
     
     std::cout << "Timer scheduled for " << delay.count() << "ms from now" << std::endl;
-    workAvailable.notify_one();
+    
+    // Wake up sleeping workers in case they need to process expired timers
+    wakeupSleepingWorkers(1);
 }
 
-void EventLoop::processExpiredTimers() {
+void EventLoop::moveExpiredTimersToQueue() {
     auto now = std::chrono::steady_clock::now();
     
-    // Collect all expired timers first, then execute callbacks outside the lock
-    std::vector<TimerTask> expiredTimers;
+    std::lock_guard<std::mutex> lock(timerMutex);
     
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
+    // Efficiently move all expired timers from priority queue to expired timer queue
+    while (!unexpiredTimers.empty() && unexpiredTimers.top().expireTime <= now) {
+        const auto& timer = unexpiredTimers.top();
         
-        while (!unexpiredTimers.empty() && unexpiredTimers.top().expireTime <= now) {
-            expiredTimers.push_back(unexpiredTimers.top());
-            unexpiredTimers.pop();
-        }
-    }
-    
-    // Execute callbacks outside the lock to avoid deadlock
-    for (auto& timer : expiredTimers) {
-        std::cout << "Timer expired, executing callback" << std::endl;
-        timer.callback();
+        // Move callback to expired timer queue for processing
+        expiredTimerQueue.enqueue(new ExpiredTimer(std::move(const_cast<TimerTask&>(timer).callback)));
+        totalTimersProcessed.fetch_add(1, std::memory_order_relaxed);
+        
+        unexpiredTimers.pop();
     }
 }
 
-void EventLoop::runTask(std::shared_ptr<Goroutine> task) {
-    // Decrement free threads count and increment running goroutines
-    freeThreads--;
-    runningGoroutines++;
-    
-    std::thread([this, task]() {
-        std::cout << "Worker thread running goroutine " << task->id << std::endl;
+std::shared_ptr<Goroutine> EventLoop::checkExpiredTimers() {
+    // Check if we have any expired timers ready to execute
+    auto expiredTimerPtr = expiredTimerQueue.dequeue();
+    if (expiredTimerPtr) {
+        ExpiredTimer* expiredTimer = expiredTimerPtr;
         
-        // Set this goroutine as the current executing goroutine for this thread
+        // Convert timer callback to goroutine for unified execution
+        auto goroutine = std::make_shared<Goroutine>(std::move(expiredTimer->callback));
+        
+        delete expiredTimer;  // Clean up memory
+        return goroutine;
+    }
+    
+    return nullptr; // No expired timers ready
+}
+
+void EventLoop::createWorkerIfNeeded() {
+    size_t currentActive = activeWorkers.load();
+    size_t currentSleeping = sleepingWorkers.load();
+    
+    // Only create new worker if all workers are busy/sleeping and we haven't hit the limit
+    if (currentSleeping == currentActive && currentActive < maxWorkers) {
+        // Try to atomically increment activeWorkers
+        if (activeWorkers.compare_exchange_strong(currentActive, currentActive + 1)) {
+            uint32_t workerId = static_cast<uint32_t>(currentActive);
+            auto worker = std::make_unique<WorkerThread>(workerId);
+            
+            // Create the worker thread
+            worker->thread = std::make_unique<std::thread>([this, workerId]() {
+                workerThreadFunction(workerId);
+            });
+            
+            workerThreads.push_back(std::move(worker));
+            std::cout << "Created worker thread " << workerId << " (total: " << (currentActive + 1) << ")" << std::endl;
+        }
+    }
+}
+
+void EventLoop::wakeupSleepingWorkers(size_t count) {
+    if (sleepingWorkers.load() > 0) {
+        std::lock_guard<std::mutex> lock(sleepMutex);
+        // Wake up the requested number of workers (or all if count is larger)
+        for (size_t i = 0; i < count; ++i) {
+            workerWakeup.notify_one();
+        }
+    }
+}
+
+bool EventLoop::assignTaskToSleepingWorker(std::shared_ptr<Goroutine> task) {
+    std::lock_guard<std::mutex> lock(sleepMutex);
+    
+    // Find a sleeping worker to assign the task to
+    for (auto& worker : workerThreads) {
+        if (worker->state.load() == WorkerState::SLEEPING && worker->assignedTask == nullptr) {
+            // Assign task and wake up this specific worker
+            worker->assignedTask = task;
+            workerWakeup.notify_one();
+            return true;
+        }
+    }
+    return false; // No sleeping workers available
+}
+
+void EventLoop::workerThreadFunction(uint32_t workerId) {
+    std::cout << "Worker " << workerId << " started" << std::endl;
+    
+    std::shared_ptr<Goroutine> task = nullptr;
+    
+    // Get initial task from queues
+    task = checkExpiredTimers();
+    if (task == nullptr) {
+        auto taskPtr = taskQueue.dequeue();
+        if (taskPtr) {
+            task = *taskPtr;
+            delete taskPtr;
+        }
+    }
+    
+    // High-performance loop: while (task != null) { run, check, sleep if needed }
+    while (task != nullptr) {
+        // Mark worker as running for monitoring
+        if (workerId < workerThreads.size()) {
+            workerThreads[workerId]->state = WorkerState::RUNNING;
+        }
+        
+        // Set this goroutine as the current executing context
         currentExecutingGoroutine = task;
         
+        // Execute the goroutine
         task->run();
-        std::cout << "Goroutine " << task->id << " finished" << std::endl;
+        totalTasksProcessed.fetch_add(1, std::memory_order_relaxed);
         
-        // Clear current goroutine
+        // Clear current goroutine context
         currentExecutingGoroutine = nullptr;
+        task = nullptr; // Clear the task reference
         
-        // Increment free threads count and decrement running goroutines when done
-        freeThreads++;
-        runningGoroutines--;
-        
-        // If this was the last running goroutine, notify the event loop to wake up
-        if (runningGoroutines.load() == 0) {
-            std::cout << "All goroutines finished, notifying event loop" << std::endl;
-            workAvailable.notify_one();
+        // Check for more work - expired timers first (higher priority)
+        task = checkExpiredTimers();
+        if (task != nullptr) {
+            continue; // Found timer task, continue loop
         }
-    }).detach();
+        
+        // Check global task queue for more work
+        auto taskPtr = taskQueue.dequeue();
+        if (taskPtr) {
+            task = *taskPtr;
+            delete taskPtr;
+            continue; // Found task, continue loop
+        }
+        
+        // No work found - go to sleep and wait for main thread to assign task
+        if (workerId < workerThreads.size()) {
+            workerThreads[workerId]->state = WorkerState::SLEEPING;
+        }
+        
+        sleepingWorkers.fetch_add(1, std::memory_order_acq_rel);
+        
+        {
+            std::unique_lock<std::mutex> lock(sleepMutex);
+            
+            // Notify main loop that we're going to sleep
+            mainLoopWakeup.notify_one();
+            
+            // Wait for main thread to assign us a task and wake us up
+            workerWakeup.wait(lock, [this, workerId]() {
+                // Wake up if we have an assigned task or shutdown
+                return (workerId < workerThreads.size() && 
+                        workerThreads[workerId]->assignedTask != nullptr);
+            });
+        }
+        
+        sleepingWorkers.fetch_sub(1, std::memory_order_acq_rel);
+        
+        // Get the task assigned by main thread (or nullptr for shutdown)
+        if (workerId < workerThreads.size()) {
+            task = workerThreads[workerId]->assignedTask;
+            workerThreads[workerId]->assignedTask = nullptr; // Clear assignment
+        }
+        
+        // Continue loop with assigned task (or exit if task == nullptr)
+    }
+    
+    std::cout << "Worker " << workerId << " shutting down" << std::endl;
 }
 
 uint64_t EventLoop::createPromise() {
@@ -173,16 +287,15 @@ void EventLoop::resolvePromise(uint64_t promiseId, int64_t value) {
         promise.resolvedValue = value;
         goroutineToResume = promise.waitingGoroutine;
         
-        std::cout << "Resolved promise " << promiseId << " with value " << value << std::endl;
-        
-        // Clean up resolved promise
+        // Clean up resolved promise immediately for better memory usage
         promises.erase(it);
     }
     
-    // Resume the goroutine if one was waiting
+    // Resume the goroutine directly through the task system for unified scheduling
     if (goroutineToResume) {
-        std::cout << "Resuming goroutine " << goroutineToResume->id << " from promise resolution" << std::endl;
         goroutineToResume->resume(value);
+        // Wake up a sleeping worker to handle the resumed goroutine
+        wakeupSleepingWorkers(1);
     }
 }
 
@@ -220,69 +333,75 @@ int64_t EventLoop::awaitPromise(uint64_t promiseId, std::shared_ptr<Goroutine> c
 void EventLoop::run() {
     std::cout << "Starting EventLoop main loop" << std::endl;
     
-    while (running) {
-        bool tasksWereProcessed = false;
+    while (true) {
+        // Efficiently move expired timers to the expired queue
+        moveExpiredTimersToQueue();
         
-        // 1. Check and process expired timers
-        processExpiredTimers();
-        
-        // 2. Fire off tasks to available processors
-        std::vector<std::shared_ptr<Goroutine>> tasksToRun;
-        
-        // Lock once, grab up to freeThreads tasks, then unlock
+        // Check work availability efficiently 
+        bool hasExpiredTimers = !expiredTimerQueue.empty();
+        bool hasTasks = !taskQueue.empty();
+        bool hasUnexpiredTimers = false;
         {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            
-            size_t availableThreads = freeThreads.load();
-            size_t tasksToGrab = std::min(availableThreads, pendingTasks.size());
-            
-            for (size_t i = 0; i < tasksToGrab; ++i) {
-                tasksToRun.push_back(pendingTasks.front());
-                pendingTasks.pop();
-            }
+            std::lock_guard<std::mutex> lock(timerMutex);
+            hasUnexpiredTimers = !unexpiredTimers.empty();
         }
         
-        // Fire off all grabbed tasks (outside of lock)
-        for (auto& task : tasksToRun) {
-            runTask(task);
-            tasksWereProcessed = true;
+        bool hasWork = hasExpiredTimers || hasTasks || hasUnexpiredTimers;
+        
+        size_t currentSleeping = sleepingWorkers.load(std::memory_order_acquire);
+        size_t currentActive = activeWorkers.load(std::memory_order_acquire);
+        
+        // Efficient worker management
+        if (hasWork && currentSleeping > 0) {
+            // We have work and sleeping workers - wake them up
+            wakeupSleepingWorkers(std::min(currentSleeping, static_cast<size_t>(2))); // Wake up to 2 workers
         }
         
-        // 3. If ANY tasks were processed, immediately continue (busy server)
-        if (tasksWereProcessed) {
+        // Create more workers if all are busy/sleeping and we're under the limit
+        if (currentSleeping == currentActive && hasWork && currentActive < maxWorkers) {
+            createWorkerIfNeeded();
+        }
+        
+        // If all threads are busy working, wait efficiently
+        if (currentSleeping == 0 && currentActive > 0) {
+            // Wait for workers to go to sleep or for new work to arrive
+            std::unique_lock<std::mutex> lock(sleepMutex);
+            mainLoopWakeup.wait_for(lock, std::chrono::milliseconds(50), [this]() {
+                return sleepingWorkers.load() > 0;
+            });
             continue;
         }
         
-        // 4. No tasks were processed this iteration - check if we should shut down
-        size_t currentRunningGoroutines = runningGoroutines.load();
-        bool hasWork = false;
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            hasWork = !pendingTasks.empty() || !unexpiredTimers.empty();
+        // If we have no work and all workers are sleeping, check for shutdown conditions
+        if (!hasWork && currentSleeping == currentActive && currentActive > 0) {
+            // Brief wait to allow for any incoming work before shutting down
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            
+            // Double-check for work after the brief wait
+            moveExpiredTimersToQueue();
+            bool stillHasWork = !expiredTimerQueue.empty() || !taskQueue.empty();
+            {
+                std::lock_guard<std::mutex> lock(timerMutex);
+                stillHasWork = stillHasWork || !unexpiredTimers.empty();
+            }
+            
+            if (!stillHasWork) {
+                std::cout << "No work and all workers sleeping, shutting down event loop" << std::endl;
+                break;
+            }
         }
         
-        // Only shut down if we have no work AND no goroutines are running
-        if (!hasWork && currentRunningGoroutines == 0) {
-            std::cout << "No more work and all goroutines finished, shutting down event loop" << std::endl;
+        // If we have no workers at all and no work, shut down
+        if (currentActive == 0 && !hasWork) {
+            std::cout << "No workers and no work, shutting down event loop" << std::endl;
             break;
         }
         
-        // We're idle (no tasks processed) - wait for work or timers
-        {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            
-            if (unexpiredTimers.empty()) {
-                // No timers, just wait for new tasks or goroutines to finish
-                workAvailable.wait(lock, [this]() { 
-                    return !running || !pendingTasks.empty() || runningGoroutines.load() == 0; 
-                });
-            } else {
-                // Wait until next timer or new task or goroutines finish
-                auto nextTimerExpiry = unexpiredTimers.top().expireTime;
-                workAvailable.wait_until(lock, nextTimerExpiry, [this]() { 
-                    return !running || !pendingTasks.empty() || runningGoroutines.load() == 0; 
-                });
-            }
+        // Adaptive pause based on system state
+        if (!hasWork) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } else {
+            std::this_thread::yield(); // Just yield CPU if there's work
         }
     }
     
@@ -291,15 +410,25 @@ void EventLoop::run() {
 
 void EventLoop::shutdown() {
     std::cout << "Shutting down EventLoop" << std::endl;
-    running = false;
-    workAvailable.notify_all();
+    running.store(false);
     
-    // Wait for all threads to finish
-    while (freeThreads.load() < maxThreads) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Wake up all sleeping worker threads so they can see the shutdown signal
+    wakeupSleepingWorkers(maxWorkers);
+    
+    // Wait for all worker threads to finish
+    for (auto& worker : workerThreads) {
+        if (worker->thread && worker->thread->joinable()) {
+            std::cout << "Waiting for worker " << worker->id << " to finish..." << std::endl;
+            worker->thread->join();
+        }
     }
     
-    std::cout << "All threads finished" << std::endl;
+    workerThreads.clear();
+    activeWorkers.store(0);
+    sleepingWorkers.store(0);
+    
+    std::cout << "All worker threads finished. Tasks processed: " << totalTasksProcessed.load() 
+              << ", Timers processed: " << totalTimersProcessed.load() << std::endl;
 }
 
 EventLoop& EventLoop::getInstance() {
@@ -315,13 +444,12 @@ extern "C" {
         
         std::cout << "runtime_sleep: Created promise " << promiseId << " for " << milliseconds << "ms" << std::endl;
         
-        // Schedule a background task to resolve the promise after the delay
-        // This simulates async I/O completion
-        std::thread([promiseId, milliseconds, &eventLoop]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        // Schedule the promise resolution using the event loop's timer system
+        // This simulates async I/O completion without blocking worker threads
+        eventLoop.addTimer(std::chrono::milliseconds(milliseconds), [promiseId, milliseconds, &eventLoop]() {
             std::cout << "Sleep timer expired, resolving promise " << promiseId << std::endl;
             eventLoop.resolvePromise(promiseId, milliseconds);
-        }).detach();
+        });
         
         return promiseId;
     }

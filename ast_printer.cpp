@@ -106,6 +106,27 @@ void printAST(ASTNode* node, int indent) {
         case AstNodeType::PRINT_STMT: std::cout << "PRINT"; break;
         case AstNodeType::GO_STMT: std::cout << "GO"; break;
         case AstNodeType::SETTIMEOUT_STMT: std::cout << "SETTIMEOUT"; break;
+        case AstNodeType::FOR_STMT: std::cout << "FOR_STMT"; break;
+        case AstNodeType::LET_DECL: {
+            auto* let = static_cast<LetDeclNode*>(node);
+            std::cout << "LET " << let->varName;
+            break;
+        }
+        case AstNodeType::BINARY_EXPR: {
+            auto* binary = static_cast<BinaryExprNode*>(node);
+            std::cout << "BINARY_EXPR (" << binary->operator_type << ")";
+            break;
+        }
+        case AstNodeType::UNARY_EXPR: {
+            auto* unary = static_cast<UnaryExprNode*>(node);
+            std::cout << "UNARY_EXPR (" << unary->operator_type << ")";
+            break;
+        }
+        case AstNodeType::BLOCK_STMT: {
+            auto* scope = static_cast<LexicalScopeNode*>(node);
+            std::cout << "BLOCK_STMT(depth=" << scope->depth << ")";
+            break;
+        }
     }
     std::cout << "\n";
     

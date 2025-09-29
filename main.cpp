@@ -11,12 +11,15 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
     std::string code = R"(
-async function test() {
-    var x: int64 = 42;
-    var millis: int64 = await sleep(1000);
-    print(x);
+let i: int64 = 5;
+{
+    let j: int64 = 1;
+    print(i)
+    print(j)
+    {
+        print(i)
+    }
 }
-test()
 )";
     std::cout << "=== Running simple test program ===\n";
 
