@@ -8,8 +8,8 @@
 uint64_t Goroutine::nextId = 0;
 uint64_t EventLoop::nextPromiseId = 1;
 
-// Current executing goroutine (thread-local)
-thread_local std::shared_ptr<Goroutine> currentExecutingGoroutine = nullptr;
+// Current task being processed by this worker thread (thread-local)
+thread_local std::shared_ptr<Goroutine> currentTask = nullptr;
 
 // Goroutine implementation
 void Goroutine::run() {
@@ -50,8 +50,8 @@ void Goroutine::resume(int64_t resolvedValue) {
     promiseResolvedValue = resolvedValue;
     awaitingPromiseId = 0;
     state = GoroutineState::READY;
-    // Use lock-free queue for efficient re-scheduling
-    EventLoop::getInstance().taskQueue.enqueue(new std::shared_ptr<Goroutine>(shared_from_this()));
+    // Note: Goroutine is re-enqueued directly by EventLoop::resolvePromise()
+    // No need to enqueue here - keeps promise resolution and task queueing unified
 }
 
 // EventLoop implementation
@@ -72,7 +72,7 @@ void EventLoop::spawnGoroutine(std::function<void()> entryPoint) {
         // No sleeping workers, add to lock-free task queue
         taskQueue.enqueue(new std::shared_ptr<Goroutine>(goroutine));
         
-        // Create worker thread if we need more capacity
+        // Create worker thread if we need more capacity and assign it this task
         createWorkerIfNeeded();
         
         // Wake up sleeping workers
@@ -107,7 +107,6 @@ void EventLoop::moveExpiredTimersToQueue() {
         
         // Move callback to expired timer queue for processing
         expiredTimerQueue.enqueue(new ExpiredTimer(std::move(const_cast<TimerTask&>(timer).callback)));
-        totalTimersProcessed.fetch_add(1, std::memory_order_relaxed);
         
         unexpiredTimers.pop();
     }
@@ -135,10 +134,24 @@ void EventLoop::createWorkerIfNeeded() {
     
     // Only create new worker if all workers are busy/sleeping and we haven't hit the limit
     if (currentSleeping == currentActive && currentActive < maxWorkers) {
+        // First, try to get a task from the queue to assign to the new worker
+        auto taskPtr = taskQueue.dequeue();
+        if (!taskPtr) {
+            return; // No task available, don't create worker
+        }
+        
+        std::shared_ptr<Goroutine> task = *taskPtr;
+        delete taskPtr;
+        
         // Try to atomically increment activeWorkers
         if (activeWorkers.compare_exchange_strong(currentActive, currentActive + 1)) {
             uint32_t workerId = static_cast<uint32_t>(currentActive);
             auto worker = std::make_unique<WorkerThread>(workerId);
+            
+            // Assign the task to the new worker BEFORE starting it
+            worker->assignedTask = task;
+            // Set state to RUNNING since we're about to start it with a task
+            worker->state.store(WorkerState::RUNNING, std::memory_order_release);
             
             // Create the worker thread
             worker->thread = std::make_unique<std::thread>([this, workerId]() {
@@ -146,7 +159,10 @@ void EventLoop::createWorkerIfNeeded() {
             });
             
             workerThreads.push_back(std::move(worker));
-            std::cout << "Created worker thread " << workerId << " (total: " << (currentActive + 1) << ")" << std::endl;
+            std::cout << "Created worker thread " << workerId << " with assigned task (total: " << (currentActive + 1) << ")" << std::endl;
+        } else {
+            // Failed to create worker, put task back in queue
+            taskQueue.enqueue(new std::shared_ptr<Goroutine>(task));
         }
     }
 }
@@ -167,8 +183,11 @@ bool EventLoop::assignTaskToSleepingWorker(std::shared_ptr<Goroutine> task) {
     // Find a sleeping worker to assign the task to
     for (auto& worker : workerThreads) {
         if (worker->state.load() == WorkerState::SLEEPING && worker->assignedTask == nullptr) {
-            // Assign task and wake up this specific worker
+            // Assign task and update state synchronously BEFORE waking worker
             worker->assignedTask = task;
+            worker->state.store(WorkerState::RUNNING, std::memory_order_release);
+            // Decrement sleepingWorkers count atomically when assigning task
+            sleepingWorkers.fetch_sub(1, std::memory_order_release);
             workerWakeup.notify_one();
             return true;
         }
@@ -179,59 +198,46 @@ bool EventLoop::assignTaskToSleepingWorker(std::shared_ptr<Goroutine> task) {
 void EventLoop::workerThreadFunction(uint32_t workerId) {
     std::cout << "Worker " << workerId << " started" << std::endl;
     
-    std::shared_ptr<Goroutine> task = nullptr;
+    // Get the initial task that was assigned to this worker
+    currentTask = workerThreads[workerId]->assignedTask;
+    workerThreads[workerId]->assignedTask = nullptr; // Clear assignment
     
-    // Get initial task from queues
-    task = checkExpiredTimers();
-    if (task == nullptr) {
-        auto taskPtr = taskQueue.dequeue();
-        if (taskPtr) {
-            task = *taskPtr;
-            delete taskPtr;
-        }
+    if (!currentTask) {
+        std::cerr << "ERROR: Worker " << workerId << " started without assigned task!" << std::endl;
+        return;
     }
     
-    // High-performance loop: while (task != null) { run, check, sleep if needed }
-    while (task != nullptr) {
-        // Mark worker as running for monitoring
-        if (workerId < workerThreads.size()) {
-            workerThreads[workerId]->state = WorkerState::RUNNING;
-        }
+    // High-performance loop: while we have a goroutine to execute
+    while (currentTask != nullptr) {
         
-        // Set this goroutine as the current executing context
-        currentExecutingGoroutine = task;
+        // Execute the goroutine (it's already set as current executing context)
+        currentTask->run();
         
-        // Execute the goroutine
-        task->run();
-        totalTasksProcessed.fetch_add(1, std::memory_order_relaxed);
+        // Clear current goroutine context after execution
+        currentTask = nullptr;
         
-        // Clear current goroutine context
-        currentExecutingGoroutine = nullptr;
-        task = nullptr; // Clear the task reference
-        
-        // Check for more work - expired timers first (higher priority)
-        task = checkExpiredTimers();
-        if (task != nullptr) {
+        // Check for more work AFTER completing the task
+        // Check expired timers first (higher priority)
+        currentTask = checkExpiredTimers();
+        if (currentTask != nullptr) {
             continue; // Found timer task, continue loop
         }
         
         // Check global task queue for more work
         auto taskPtr = taskQueue.dequeue();
         if (taskPtr) {
-            task = *taskPtr;
+            currentTask = *taskPtr;
             delete taskPtr;
             continue; // Found task, continue loop
         }
         
         // No work found - go to sleep and wait for main thread to assign task
-        if (workerId < workerThreads.size()) {
-            workerThreads[workerId]->state = WorkerState::SLEEPING;
-        }
+        workerThreads[workerId]->state.store(WorkerState::SLEEPING, std::memory_order_release);
         
-        sleepingWorkers.fetch_add(1, std::memory_order_acq_rel);
         
         {
             std::unique_lock<std::mutex> lock(sleepMutex);
+            sleepingWorkers.fetch_add(1, std::memory_order_acq_rel);
             
             // Notify main loop that we're going to sleep
             mainLoopWakeup.notify_one();
@@ -239,20 +245,15 @@ void EventLoop::workerThreadFunction(uint32_t workerId) {
             // Wait for main thread to assign us a task and wake us up
             workerWakeup.wait(lock, [this, workerId]() {
                 // Wake up if we have an assigned task or shutdown
-                return (workerId < workerThreads.size() && 
-                        workerThreads[workerId]->assignedTask != nullptr);
+                return workerThreads[workerId]->assignedTask != nullptr || !running.load();
             });
         }
         
-        sleepingWorkers.fetch_sub(1, std::memory_order_acq_rel);
-        
         // Get the task assigned by main thread (or nullptr for shutdown)
-        if (workerId < workerThreads.size()) {
-            task = workerThreads[workerId]->assignedTask;
-            workerThreads[workerId]->assignedTask = nullptr; // Clear assignment
-        }
+        currentTask = workerThreads[workerId]->assignedTask;
+        workerThreads[workerId]->assignedTask = nullptr; // Clear assignment
         
-        // Continue loop with assigned task (or exit if task == nullptr)
+        // Continue loop with assigned task (or exit if nullptr)
     }
     
     std::cout << "Worker " << workerId << " shutting down" << std::endl;
@@ -265,6 +266,11 @@ uint64_t EventLoop::createPromise() {
     std::cout << "Created promise " << promiseId << std::endl;
     return promiseId;
 }
+
+// Promise resolution is unified with the task queue:
+// - Pending promises are stored in the promises map for O(1) lookup by ID
+// - When resolved, the waiting goroutine is enqueued directly to taskQueue
+// - There is no separate "promise queue" - resolved promises ARE tasks
 
 void EventLoop::resolvePromise(uint64_t promiseId, int64_t value) {
     std::shared_ptr<Goroutine> goroutineToResume = nullptr;
@@ -291,9 +297,17 @@ void EventLoop::resolvePromise(uint64_t promiseId, int64_t value) {
         promises.erase(it);
     }
     
-    // Resume the goroutine directly through the task system for unified scheduling
+    // Resume the goroutine and enqueue it directly to the task queue
+    // This unifies the promise system with the task queue - when a promise resolves,
+    // it becomes a task to execute. No separate promise queue needed.
     if (goroutineToResume) {
-        goroutineToResume->resume(value);
+        goroutineToResume->promiseResolvedValue = value;
+        goroutineToResume->awaitingPromiseId = 0;
+        goroutineToResume->state = GoroutineState::READY;
+        
+        // Enqueue directly to task queue - this IS the task queue, unified
+        taskQueue.enqueue(new std::shared_ptr<Goroutine>(goroutineToResume));
+        
         // Wake up a sleeping worker to handle the resumed goroutine
         wakeupSleepingWorkers(1);
     }
@@ -336,6 +350,22 @@ void EventLoop::run() {
     while (true) {
         // Efficiently move expired timers to the expired queue
         moveExpiredTimersToQueue();
+        
+        // Assign expired timer tasks to sleeping workers
+        while (true) {
+            auto timerTask = checkExpiredTimers();
+            if (!timerTask) {
+                break; // No more expired timers
+            }
+            
+            // Try to assign to a sleeping worker
+            if (!assignTaskToSleepingWorker(timerTask)) {
+                // No sleeping workers, put back in queue for workers to pick up
+                // Convert expired timer back to task queue entry
+                taskQueue.enqueue(new std::shared_ptr<Goroutine>(timerTask));
+                break;
+            }
+        }
         
         // Check work availability efficiently 
         bool hasExpiredTimers = !expiredTimerQueue.empty();
@@ -427,8 +457,7 @@ void EventLoop::shutdown() {
     activeWorkers.store(0);
     sleepingWorkers.store(0);
     
-    std::cout << "All worker threads finished. Tasks processed: " << totalTasksProcessed.load() 
-              << ", Timers processed: " << totalTimersProcessed.load() << std::endl;
+    std::cout << "All worker threads finished." << std::endl;
 }
 
 EventLoop& EventLoop::getInstance() {
@@ -457,10 +486,10 @@ extern "C" {
     int64_t runtime_await_promise(uint64_t promiseId) {
         std::cout << "runtime_await_promise: Awaiting promise " << promiseId << std::endl;
         
-        // Get the current executing goroutine
-        auto currentGoroutine = currentExecutingGoroutine;
+        // Get the current task on this worker thread
+        auto currentGoroutine = currentTask;
         if (!currentGoroutine) {
-            throw std::runtime_error("runtime_await_promise: No current goroutine context");
+            throw std::runtime_error("runtime_await_promise: No current task context");
         }
         
         return EventLoop::getInstance().awaitPromise(promiseId, currentGoroutine);

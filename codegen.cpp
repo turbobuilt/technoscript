@@ -173,9 +173,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
 void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     std::cout << "Allocating scope of size: " << scope->totalSize << " bytes" << std::endl;
 
-    // push r14 to stack
+    // Save parent scope register (r14) - r15 doesn't need to be saved since its value goes into r14
     cb->push(x86::r14);
-    // copy r15 to r14
+    // Set r14 to current r15 (the new scope's parent will be the current scope)
     cb->mov(x86::r14, x86::r15);
     
     // save all 6 registers
@@ -536,9 +536,6 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     cb->push(x86::rbp);
     cb->mov(x86::rbp, x86::rsp);
     
-    // Save r15 (current scope pointer) - this will become the parent scope
-    cb->push(x86::r15);
-    
     // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
     x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
     const int maxRegParams = 6;
@@ -560,9 +557,6 @@ void CodeGenerator::generateFunctionEpilogue(FunctionDeclNode* funcDecl) {
     
     // Use generic scope epilogue to free scope and restore parent scope pointer
     generateScopeEpilogue(funcDecl);
-    
-    // Restore r14
-    cb->pop(x86::r14);
     
     // Standard function epilogue
     cb->mov(x86::rsp, x86::rbp);
@@ -748,8 +742,11 @@ void CodeGenerator::generateScopeEpilogue(LexicalScopeNode* scope) {
     cb->mov(x86::rax, freeAddr);
     cb->call(x86::rax);
     
-    // Restore r15 to the parent scope
+    // Restore r15 to the parent scope (from r14)
     cb->mov(x86::r15, x86::r14);
+    
+    // Restore r14 from the stack (the old parent)
+    cb->pop(x86::r14);
 }
 
 void CodeGenerator::generateBlockStmt(BlockStmtNode* blockStmt) {

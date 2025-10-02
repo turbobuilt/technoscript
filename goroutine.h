@@ -105,10 +105,6 @@ private:
     std::condition_variable mainLoopWakeup;   // Wake up main loop when workers sleep
     std::atomic<bool> running{true};
     
-    // Performance metrics
-    std::atomic<uint64_t> totalTasksProcessed{0};
-    std::atomic<uint64_t> totalTimersProcessed{0};
-    
     // Internal methods for performance optimization
     void moveExpiredTimersToQueue();  // Move expired timers from priority queue to expired queue
     std::shared_ptr<Goroutine> checkExpiredTimers();  // Get next expired timer as goroutine
@@ -136,9 +132,7 @@ public:
     void run();
     void shutdown();
     
-    // Performance metrics and monitoring
-    uint64_t getTotalTasksProcessed() const { return totalTasksProcessed.load(); }
-    uint64_t getTotalTimersProcessed() const { return totalTimersProcessed.load(); }
+    // Worker monitoring
     size_t getActiveWorkers() const { return activeWorkers.load(); }
     size_t getSleepingWorkers() const { return sleepingWorkers.load(); }
     bool isEmpty() const { 
