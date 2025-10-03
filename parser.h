@@ -8,7 +8,7 @@ enum class TokenType {
     ASSIGN, SEMICOLON, LPAREN, RPAREN, LBRACE, RBRACE, 
     COLON, COMMA, STRING, PRINT, SETTIMEOUT, DOT, 
     ASYNC, AWAIT, PROMISE, SLEEP, FOR, LET, LESS_THAN, 
-    PLUS_PLUS, EOF_TOKEN
+    PLUS_PLUS, CLASS, NEW, EOF_TOKEN
 };
 
 struct Token {
@@ -24,6 +24,7 @@ private:
     int currentDepth = 0;
     LexicalScopeNode* currentLexicalScope = nullptr;  // Track current lexical scope during parsing
     LexicalScopeNode* currentFunctionScope = nullptr; // Track current function scope during parsing
+    std::map<std::string, ClassDeclNode*> classRegistry; // Global registry of all classes
     
     Token& current() { return tokens[pos]; }
     void advance() { if (pos < tokens.size() - 1) pos++; }
@@ -48,7 +49,10 @@ private:
     std::unique_ptr<ForStmtNode> parseForStmt();
     std::unique_ptr<BlockStmtNode> parseBlockStmt();
     std::unique_ptr<ASTNode> parseExpression();  // For parsing expressions like i < 2, ++i
+    std::unique_ptr<ClassDeclNode> parseClassDecl();
+    std::unique_ptr<ASTNode> parsePrimaryExpression(); // For parsing identifiers, member access, new expressions
     
 public:
     std::unique_ptr<FunctionDeclNode> parse(const std::string& code);
+    const std::map<std::string, ClassDeclNode*>& getClassRegistry() const { return classRegistry; }
 };

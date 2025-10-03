@@ -11,15 +11,12 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
     std::string code = R"(
-let i: int64 = 5;
-{
-    let j: int64 = 1;
-    print(i)
-    print(j)
-    {
-        print(i)
-    }
+class Dog {
+    age: int64;
 }
+var fido: Dog = new Dog();
+fido.age = 3;
+print(fido.age);
 )";
     std::cout << "=== Running simple test program ===\n";
 
@@ -33,7 +30,7 @@ let i: int64 = 5;
     std::cout << "DEBUG: Parsing completed successfully" << std::endl;
     
     std::cout << "DEBUG: Starting analysis..." << std::endl;
-    analyzer.analyze(ast.get());
+    analyzer.analyze(ast.get(), parser.getClassRegistry());
     std::cout << "DEBUG: Analysis completed successfully" << std::endl;
     
     // Debug: Check what address print_int64 actually has

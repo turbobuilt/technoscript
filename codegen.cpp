@@ -161,6 +161,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::BLOCK_STMT:
             generateBlockStmt(static_cast<BlockStmtNode*>(node));
             break;
+        case AstNodeType::MEMBER_ASSIGN:
+            generateMemberAssign(static_cast<MemberAssignNode*>(node));
+            break;
         default:
             // For other nodes, just visit children
             for (auto& child : node->children) {
@@ -284,6 +287,16 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
         case AstNodeType::SLEEP_CALL: {
             // Handle sleep call
             generateSleepCall(valueNode, destReg);
+            break;
+        }
+        case AstNodeType::NEW_EXPR: {
+            // Handle new expression
+            generateNewExpr(static_cast<NewExprNode*>(valueNode), destReg);
+            break;
+        }
+        case AstNodeType::MEMBER_ACCESS: {
+            // Handle member access
+            generateMemberAccess(static_cast<MemberAccessNode*>(valueNode), destReg);
             break;
         }
         default:
@@ -1065,4 +1078,126 @@ void CodeGenerator::generateSleepCall(ASTNode* sleepCall, x86::Gp destReg) {
     }
     
     std::cout << "Generated sleep call - promise ID returned" << std::endl;
+}
+
+void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
+    std::cout << "Generating new expression for class: " << newExpr->className << std::endl;
+    
+    // Verify that the class reference was set during analysis
+    if (!newExpr->classRef) {
+        throw std::runtime_error("Class reference not set for new expression: " + newExpr->className);
+    }
+    
+    ClassDeclNode* classDecl = newExpr->classRef;
+    
+    // Calculate total object size using header constants
+    int totalObjectSize = ObjectLayout::HEADER_SIZE + classDecl->totalSize;
+    
+    std::cout << "DEBUG generateNewExpr: Allocating object of size " << totalObjectSize 
+              << " (header=" << ObjectLayout::HEADER_SIZE << ", fields=" << classDecl->totalSize << ")" << std::endl;
+    
+    // Call calloc to allocate and zero-initialize object
+    // mov rdi, 1 (number of elements)
+    cb->mov(x86::rdi, 1);
+    // mov rsi, totalObjectSize (size of each element)
+    cb->mov(x86::rsi, totalObjectSize);
+    
+    // Call calloc
+    uint64_t callocAddr = reinterpret_cast<uint64_t>(&calloc_wrapper);
+    cb->mov(x86::rax, callocAddr);
+    cb->call(x86::rax);
+    
+    // Object pointer is now in rax
+    // We need to initialize the object header
+    
+    // Store flags at offset 0 (currently 0, zero-initialized by calloc)
+    // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET), 0);  // Not needed, calloc already zeroed
+    
+    // Store class reference at offset 8
+    uint64_t classRefAddr = reinterpret_cast<uint64_t>(classDecl);
+    cb->mov(x86::r10, classRefAddr);
+    cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::CLASS_REF_OFFSET), x86::r10);
+    
+    // Store dynamic vars map placeholder at offset 16 (0 for now)
+    // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::DYNAMIC_VARS_OFFSET), 0);  // Not needed, calloc already zeroed
+    
+    // The object data starts at ObjectLayout::FIELDS_OFFSET
+    // Fields are already zero-initialized by calloc
+    
+    std::cout << "DEBUG generateNewExpr: Object allocated at runtime, class ref stored at offset " 
+              << ObjectLayout::CLASS_REF_OFFSET << std::endl;
+    
+    // Move result to destination register if different
+    if (destReg.id() != x86::rax.id()) {
+        cb->mov(destReg, x86::rax);
+    }
+    
+    std::cout << "Generated new expression - object pointer returned" << std::endl;
+}
+
+void CodeGenerator::generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp destReg) {
+    std::cout << "Generating member access for member: " << memberAccess->memberName << std::endl;
+    
+    // Verify that the class reference and member offset were set during analysis
+    if (!memberAccess->classRef) {
+        throw std::runtime_error("Class reference not set for member access: " + memberAccess->memberName);
+    }
+    
+    std::cout << "DEBUG generateMemberAccess: Accessing member '" << memberAccess->memberName 
+              << "' at offset " << memberAccess->memberOffset << " in class '" 
+              << memberAccess->classRef->className << "'" << std::endl;
+    
+    // Load the object pointer into a temporary register
+    // The object could be an identifier (variable) or another expression
+    x86::Gp objectPtrReg = x86::r10;
+    loadValue(memberAccess->object.get(), objectPtrReg);
+    
+    // Calculate actual offset: header + field offset
+    int actualOffset = ObjectLayout::FIELDS_OFFSET + memberAccess->memberOffset;
+    
+    std::cout << "DEBUG generateMemberAccess: Loading from object pointer + " << actualOffset 
+              << " (header=" << ObjectLayout::FIELDS_OFFSET << ", field offset=" << memberAccess->memberOffset << ")" << std::endl;
+    
+    // Load the field value from [objectPtrReg + actualOffset] into destReg
+    cb->mov(destReg, x86::qword_ptr(objectPtrReg, actualOffset));
+    
+    std::cout << "Generated member access - field value loaded" << std::endl;
+}
+
+void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
+    std::cout << "Generating member assignment" << std::endl;
+    
+    if (!memberAssign->member) {
+        throw std::runtime_error("Member assignment has no member access node");
+    }
+    
+    MemberAccessNode* member = memberAssign->member.get();
+    
+    // Verify that the class reference and member offset were set during analysis
+    if (!member->classRef) {
+        throw std::runtime_error("Class reference not set for member assignment: " + member->memberName);
+    }
+    
+    std::cout << "DEBUG generateMemberAssign: Assigning to member '" << member->memberName 
+              << "' at offset " << member->memberOffset << " in class '" 
+              << member->classRef->className << "'" << std::endl;
+    
+    // Load the object pointer into a temporary register
+    x86::Gp objectPtrReg = x86::r10;
+    loadValue(member->object.get(), objectPtrReg);
+    
+    // Load the value to assign into another register
+    x86::Gp valueReg = x86::rax;
+    loadValue(memberAssign->value.get(), valueReg);
+    
+    // Calculate actual offset: header + field offset
+    int actualOffset = ObjectLayout::FIELDS_OFFSET + member->memberOffset;
+    
+    std::cout << "DEBUG generateMemberAssign: Storing to object pointer + " << actualOffset 
+              << " (header=" << ObjectLayout::FIELDS_OFFSET << ", field offset=" << member->memberOffset << ")" << std::endl;
+    
+    // Store the value to [objectPtrReg + actualOffset]
+    cb->mov(x86::qword_ptr(objectPtrReg, actualOffset), valueReg);
+    
+    std::cout << "Generated member assignment - field value stored" << std::endl;
 }

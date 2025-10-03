@@ -10,6 +10,21 @@
 
 using namespace asmjit;
 
+// Object memory layout constants
+namespace ObjectLayout {
+    constexpr int FLAGS_OFFSET = 0;
+    constexpr int FLAGS_SIZE = 8;
+    
+    constexpr int CLASS_REF_OFFSET = 8;
+    constexpr int CLASS_REF_SIZE = 8;
+    
+    constexpr int DYNAMIC_VARS_OFFSET = 16;
+    constexpr int DYNAMIC_VARS_SIZE = 8;
+    
+    constexpr int FIELDS_OFFSET = 24;  // 8 + 8 + 8
+    constexpr int HEADER_SIZE = 24;    // Total size of object header
+}
+
 class CodeGenerator {
 public:
     CodeGenerator();
@@ -48,6 +63,9 @@ private:
     void generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt);
     void generateAwaitExpr(ASTNode* awaitExpr, x86::Gp destReg);
     void generateSleepCall(ASTNode* sleepCall, x86::Gp destReg);
+    void generateNewExpr(NewExprNode* newExpr, x86::Gp destReg);
+    void generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp destReg);
+    void generateMemberAssign(MemberAssignNode* memberAssign);
     
     // Function-related utilities
     void createFunctionLabel(FunctionDeclNode* funcDecl);

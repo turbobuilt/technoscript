@@ -37,6 +37,8 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             else if (word == "sleep") result.emplace_back(TokenType::SLEEP);
             else if (word == "for") result.emplace_back(TokenType::FOR);
             else if (word == "let") result.emplace_back(TokenType::LET);
+            else if (word == "class") result.emplace_back(TokenType::CLASS);
+            else if (word == "new") result.emplace_back(TokenType::NEW);
             else result.emplace_back(TokenType::IDENTIFIER, word);
         }
         else if (std::isdigit(code[i])) {
@@ -161,6 +163,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
            current().type != TokenType::FOR &&     // Add FOR token
            current().type != TokenType::LET &&     // Add LET token
            current().type != TokenType::LBRACE &&  // Add LBRACE for block statements
+           current().type != TokenType::CLASS &&   // Add CLASS token
            current().type != TokenType::IDENTIFIER &&
            current().type != TokenType::RBRACE) { // Allow } to end blocks naturally
         
@@ -175,6 +178,10 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
     if (match(TokenType::VAR)) {
         std::cout << "DEBUG parseStatement: parsing VAR" << std::endl;
         return parseVarDecl();
+    }
+    if (match(TokenType::CLASS)) {
+        std::cout << "DEBUG parseStatement: parsing CLASS" << std::endl;
+        return parseClassDecl();
     }
     if (match(TokenType::LET)) {
         std::cout << "DEBUG parseStatement: parsing LET" << std::endl;
@@ -248,6 +255,44 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
         // Look ahead to see if this is a function call
         else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN) {
             return parseFunctionCall();
+        }
+        // Check for member access (obj.member or obj.member = value)
+        else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::DOT) {
+            std::string objName = current().value;
+            advance(); // consume identifier
+            expect(TokenType::DOT);
+            
+            std::string memberName = current().value;
+            expect(TokenType::IDENTIFIER);
+            
+            // Check if this is an assignment
+            if (match(TokenType::ASSIGN)) {
+                advance(); // consume =
+                
+                auto memberAssign = std::make_unique<MemberAssignNode>();
+                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+                memberAccess->object = std::make_unique<IdentifierNode>(objName);
+                memberAssign->member = std::move(memberAccess);
+                
+                // Parse the value being assigned
+                if (match(TokenType::LITERAL)) {
+                    memberAssign->value = std::make_unique<LiteralNode>(current().value);
+                    advance();
+                } else if (match(TokenType::IDENTIFIER)) {
+                    memberAssign->value = std::make_unique<IdentifierNode>(current().value);
+                    advance();
+                } else {
+                    throw std::runtime_error("Expected value after assignment");
+                }
+                
+                expect(TokenType::SEMICOLON);
+                return memberAssign;
+            } else {
+                // Just member access (for reading)
+                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+                memberAccess->object = std::make_unique<IdentifierNode>(objName);
+                return memberAccess;
+            }
         } else {
             // Just return an identifier node
             auto identifier = std::make_unique<IdentifierNode>(current().value);
@@ -265,20 +310,37 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     expect(TokenType::COLON);
     
     DataType varType;
+    std::string customTypeName; // For object types
+    
     if (match(TokenType::INT32_TYPE)) {
         varType = DataType::INT32;
         advance();
     } else if (match(TokenType::INT64_TYPE)) {
         varType = DataType::INT64;
         advance();
+    } else if (match(TokenType::IDENTIFIER)) {
+        // Custom type (class name)
+        varType = DataType::OBJECT;
+        customTypeName = current().value;
+        advance();
     } else {
         throw std::runtime_error("Expected type");
     }
     
     expect(TokenType::ASSIGN);
-    auto varDecl = std::make_unique<VarDeclNode>(name, varType);
+    auto varDecl = std::make_unique<VarDeclNode>(name, varType, customTypeName);
     
-    if (match(TokenType::LITERAL)) {
+    if (match(TokenType::NEW)) {
+        // Parse new expression
+        advance(); // consume NEW
+        std::string className = current().value;
+        expect(TokenType::IDENTIFIER);
+        expect(TokenType::LPAREN);
+        expect(TokenType::RPAREN); // For now, no constructor arguments
+        
+        auto newExpr = std::make_unique<NewExprNode>(className);
+        varDecl->children.push_back(std::move(newExpr));
+    } else if (match(TokenType::LITERAL)) {
         varDecl->children.push_back(std::make_unique<LiteralNode>(current().value));
         advance();
     } else if (match(TokenType::AWAIT)) {
@@ -337,6 +399,8 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     // Set size based on type
     if (varType == DataType::INT32) {
         varInfo.size = 4;
+    } else if (varType == DataType::OBJECT) {
+        varInfo.size = 8; // Pointer to heap-allocated object
     } else {
         varInfo.size = 8; // INT64 and other types
     }
@@ -564,8 +628,22 @@ std::unique_ptr<ASTNode> Parser::parsePrintStmt() {
             print->children.push_back(std::make_unique<LiteralNode>(current().value));
             advance();
         } else if (match(TokenType::IDENTIFIER)) {
-            print->children.push_back(std::make_unique<IdentifierNode>(current().value));
-            advance();
+            // Check for member access (obj.member)
+            if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::DOT) {
+                std::string objName = current().value;
+                advance(); // consume identifier
+                expect(TokenType::DOT);
+                
+                std::string memberName = current().value;
+                expect(TokenType::IDENTIFIER);
+                
+                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+                memberAccess->object = std::make_unique<IdentifierNode>(objName);
+                print->children.push_back(std::move(memberAccess));
+            } else {
+                print->children.push_back(std::make_unique<IdentifierNode>(current().value));
+                advance();
+            }
         }
         if (match(TokenType::COMMA)) advance();
     }
@@ -705,6 +783,64 @@ std::unique_ptr<BlockStmtNode> Parser::parseBlockStmt() {
     return blockStmt;
 }
 
+std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
+    expect(TokenType::CLASS);
+    std::string className = current().value;
+    expect(TokenType::IDENTIFIER);
+    
+    // Check for duplicate class names
+    if (classRegistry.find(className) != classRegistry.end()) {
+        throw std::runtime_error("Duplicate class definition: class '" + className + "' is already defined");
+    }
+    
+    expect(TokenType::LBRACE);
+    
+    auto classDecl = std::make_unique<ClassDeclNode>(className);
+    
+    // Parse field declarations
+    while (!match(TokenType::RBRACE) && current().type != TokenType::EOF_TOKEN) {
+        std::string fieldName = current().value;
+        expect(TokenType::IDENTIFIER);
+        expect(TokenType::COLON);
+        
+        DataType fieldType;
+        int fieldSize = 8; // default size
+        
+        if (match(TokenType::INT32_TYPE)) {
+            fieldType = DataType::INT32;
+            fieldSize = 4;
+            advance();
+        } else if (match(TokenType::INT64_TYPE)) {
+            fieldType = DataType::INT64;
+            fieldSize = 8;
+            advance();
+        } else {
+            throw std::runtime_error("Expected type for field");
+        }
+        
+        // Create VariableInfo for the field
+        VariableInfo fieldInfo;
+        fieldInfo.type = fieldType;
+        fieldInfo.name = fieldName;
+        fieldInfo.size = fieldSize;
+        fieldInfo.offset = 0; // Will be set during packing
+        
+        classDecl->fields[fieldName] = fieldInfo;
+        expect(TokenType::SEMICOLON);
+    }
+    
+    expect(TokenType::RBRACE);
+    
+    // Pack the class fields to calculate offsets and total size
+    classDecl->pack();
+    
+    // Register the class in the global registry
+    classRegistry[className] = classDecl.get();
+    
+    std::cout << "DEBUG parseClassDecl: Parsed class '" << className << "' with " << classDecl->fields.size() << " fields, total size: " << classDecl->totalSize << std::endl;
+    return classDecl;
+}
+
 bool Parser::synchronizeToNextStatement() {
     std::cout << "DEBUG: Attempting to synchronize from position " << pos << std::endl;
     
@@ -783,6 +919,8 @@ std::string Parser::tokenTypeToString(TokenType type) {
         case TokenType::LET: return "LET";
         case TokenType::LESS_THAN: return "LESS_THAN (<)";
         case TokenType::PLUS_PLUS: return "PLUS_PLUS (++)";
+        case TokenType::CLASS: return "CLASS";
+        case TokenType::NEW: return "NEW";
         case TokenType::EOF_TOKEN: return "EOF";
         default: return "UNKNOWN";
     }

@@ -127,6 +127,33 @@ void printAST(ASTNode* node, int indent) {
             std::cout << "BLOCK_STMT(depth=" << scope->depth << ")";
             break;
         }
+        case AstNodeType::CLASS_DECL: {
+            auto* classDecl = static_cast<ClassDeclNode*>(node);
+            std::cout << "CLASS " << classDecl->className << " (size=" << classDecl->totalSize << ") {";
+            for (const auto& [fieldName, fieldInfo] : classDecl->fields) {
+                std::cout << " " << fieldName << ":";
+                if (fieldInfo.type == DataType::INT32) std::cout << "int32";
+                else if (fieldInfo.type == DataType::INT64) std::cout << "int64";
+                else if (fieldInfo.type == DataType::OBJECT) std::cout << "object";
+                std::cout << "@" << fieldInfo.offset;
+            }
+            std::cout << " }";
+            break;
+        }
+        case AstNodeType::NEW_EXPR: {
+            auto* newExpr = static_cast<NewExprNode*>(node);
+            std::cout << "NEW " << newExpr->className;
+            break;
+        }
+        case AstNodeType::MEMBER_ACCESS: {
+            auto* memberAccess = static_cast<MemberAccessNode*>(node);
+            std::cout << "MEMBER_ACCESS ." << memberAccess->memberName;
+            break;
+        }
+        case AstNodeType::MEMBER_ASSIGN: {
+            std::cout << "MEMBER_ASSIGN";
+            break;
+        }
     }
     std::cout << "\n";
     

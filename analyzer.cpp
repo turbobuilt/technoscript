@@ -1,7 +1,8 @@
 #include "analyzer.h"
 #include <iostream>
 
-void Analyzer::analyze(LexicalScopeNode* root) {
+void Analyzer::analyze(LexicalScopeNode* root, const std::map<std::string, ClassDeclNode*>& classes) {
+    classRegistry = &classes;
     std::cout << "DEBUG Analyzer: Starting single-pass analysis..." << std::endl;
     analyzeNodeSinglePass(root, nullptr, 0);
     std::cout << "DEBUG Analyzer: Single-pass analysis completed" << std::endl;
@@ -26,6 +27,22 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         std::string typeStr = (node->type == AstNodeType::FUNCTION_DECL) ? "FUNCTION" : 
                              (node->type == AstNodeType::FOR_STMT) ? "FOR" : "BLOCK";
         std::cout << "DEBUG: Setup scope at depth " << depth << " (type: " << typeStr << ")" << std::endl;
+    }
+    
+    // Step 1.5: Resolve class references for VarDecl nodes with custom types
+    if (node->type == AstNodeType::VAR_DECL) {
+        auto varDecl = static_cast<VarDeclNode*>(node);
+        if (varDecl->varType == DataType::OBJECT && !varDecl->customTypeName.empty()) {
+            // Find the variable in the current scope and set its classNode
+            if (currentScope) {
+                auto varIt = currentScope->variables.find(varDecl->varName);
+                if (varIt != currentScope->variables.end()) {
+                    varIt->second.classNode = findClass(varDecl->customTypeName);
+                    std::cout << "DEBUG: Resolved class '" << varDecl->customTypeName 
+                              << "' for variable '" << varDecl->varName << "'" << std::endl;
+                }
+            }
+        }
     }
     
     // Step 2: Analyze current node for variable references
@@ -90,6 +107,58 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         auto unaryExpr = static_cast<UnaryExprNode*>(node);
         if (unaryExpr->operand) {
             analyzeNodeSinglePass(unaryExpr->operand.get(), currentScope, depth + 1);
+        }
+    } else if (node->type == AstNodeType::NEW_EXPR) {
+        // Handle new expressions - resolve the class reference
+        auto newExpr = static_cast<NewExprNode*>(node);
+        newExpr->classRef = findClass(newExpr->className);
+        std::cout << "DEBUG: Resolved NEW_EXPR for class '" << newExpr->className << "'" << std::endl;
+    } else if (node->type == AstNodeType::MEMBER_ACCESS) {
+        // Handle member access - resolve class and field offset
+        auto memberAccess = static_cast<MemberAccessNode*>(node);
+        
+        // First analyze the object expression
+        analyzeNodeSinglePass(memberAccess->object.get(), currentScope, depth + 1);
+        
+        // Get the object's type to find the class
+        ASTNode* objectNode = memberAccess->object.get();
+        ClassDeclNode* objectClass = nullptr;
+        
+        if (objectNode->type == AstNodeType::IDENTIFIER) {
+            auto identifier = static_cast<IdentifierNode*>(objectNode);
+            if (identifier->varRef && identifier->varRef->type == DataType::OBJECT) {
+                objectClass = identifier->varRef->classNode;
+            }
+        }
+        
+        if (!objectClass) {
+            throw std::runtime_error("Cannot resolve class for member access on: " + memberAccess->memberName);
+        }
+        
+        // Find the field in the class
+        auto fieldIt = objectClass->fields.find(memberAccess->memberName);
+        if (fieldIt == objectClass->fields.end()) {
+            throw std::runtime_error("Field '" + memberAccess->memberName + "' not found in class '" + objectClass->className + "'");
+        }
+        
+        memberAccess->classRef = objectClass;
+        memberAccess->memberOffset = fieldIt->second.offset;
+        
+        std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
+                  << "' at offset " << memberAccess->memberOffset 
+                  << " in class '" << objectClass->className << "'" << std::endl;
+    } else if (node->type == AstNodeType::MEMBER_ASSIGN) {
+        // Handle member assignment
+        auto memberAssign = static_cast<MemberAssignNode*>(node);
+        
+        // Analyze the member access part
+        if (memberAssign->member) {
+            analyzeNodeSinglePass(memberAssign->member.get(), currentScope, depth + 1);
+        }
+        
+        // Analyze the value expression
+        if (memberAssign->value) {
+            analyzeNodeSinglePass(memberAssign->value.get(), currentScope, depth + 1);
         }
     }
     
@@ -172,6 +241,19 @@ VariableInfo* Analyzer::findVariable(const std::string& name, LexicalScopeNode* 
     }
     
     return &defScope->variables[name];
+}
+
+ClassDeclNode* Analyzer::findClass(const std::string& className) {
+    if (!classRegistry) {
+        throw std::runtime_error("Class registry not initialized");
+    }
+    
+    auto it = classRegistry->find(className);
+    if (it == classRegistry->end()) {
+        throw std::runtime_error("Class '" + className + "' not found");
+    }
+    
+    return it->second;
 }
 
 // Helper methods for dependency tracking

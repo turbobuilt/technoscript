@@ -20,14 +20,16 @@ enum class AstNodeType {
     VAR_DECL, FUNCTION_DECL, FUNCTION_CALL, 
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT, SETTIMEOUT_STMT, 
     AWAIT_EXPR, SLEEP_CALL, FOR_STMT, LET_DECL, 
-    BINARY_EXPR, UNARY_EXPR, BLOCK_STMT
+    BINARY_EXPR, UNARY_EXPR, BLOCK_STMT,
+    CLASS_DECL, NEW_EXPR, MEMBER_ACCESS, MEMBER_ASSIGN
 };
 
-enum class DataType { INT32, INT64, CLOSURE, PROMISE };
+enum class DataType { INT32, INT64, CLOSURE, PROMISE, OBJECT };
 
 // Forward declarations
 class FunctionDeclNode;
 class LexicalScopeNode;
+class ClassDeclNode;
 
 // New structure for unified parameter information
 struct ParameterInfo {
@@ -44,10 +46,46 @@ struct VariableInfo {
     DataType type;
     std::string name;
     int offset = 0;  // Offset from R15 where this variable/parameter is stored
-    int size = 8;    // Size in bytes: 8 for regular vars, correct closure size for closures
+    int size = 8;    // Size in bytes: 8 for regular vars, correct closure size for closures, calculated for objects
     LexicalScopeNode* definedIn = nullptr;
     FunctionDeclNode* funcNode = nullptr; // For closures: back-reference to function
+    ClassDeclNode* classNode = nullptr; // For objects: pointer to class definition
 };
+
+// Shared packing utility for both lexical scopes and classes
+namespace VariablePacking {
+    // Get size for a type (without closure/object special handling)
+    inline int getBaseTypeSize(DataType type) {
+        switch (type) {
+            case DataType::INT32: return 4;
+            case DataType::INT64: return 8;
+            case DataType::CLOSURE: return 8; // Base pointer size, actual size calculated elsewhere
+            case DataType::PROMISE: return 8;
+            case DataType::OBJECT: return 8; // Base pointer size, actual size calculated elsewhere
+            default: return 8;
+        }
+    }
+    
+    // Pack a collection of variables, returns total size
+    inline int packVariables(std::vector<VariableInfo*>& vars) {
+        // Sort by size (biggest first) for optimal packing
+        std::sort(vars.begin(), vars.end(), [](const VariableInfo* a, const VariableInfo* b) {
+            return a->size > b->size;
+        });
+        
+        int offset = 0;
+        for (auto* var : vars) {
+            int size = var->size;
+            int align = (var->type == DataType::CLOSURE || var->type == DataType::OBJECT) ? 8 : size;
+            offset = (offset + align - 1) & ~(align - 1); // Align
+            var->offset = offset;
+            offset += size;
+        }
+        
+        // Return 8-byte aligned total size
+        return (offset + 7) & ~7;
+    }
+}
 
 // Structure to track closure creation and patching
 struct ClosurePatchInfo {
@@ -119,9 +157,10 @@ class VarDeclNode : public ASTNode {
 public:
     std::string varName;
     DataType varType;
+    std::string customTypeName; // For OBJECT type, the class name
     
-    VarDeclNode(const std::string& name, DataType type) 
-        : ASTNode(AstNodeType::VAR_DECL), varName(name), varType(type) {}
+    VarDeclNode(const std::string& name, DataType type, const std::string& customType = "") 
+        : ASTNode(AstNodeType::VAR_DECL), varName(name), varType(type), customTypeName(customType) {}
 };
 
 class FunctionDeclNode : public LexicalScopeNode {
@@ -292,6 +331,62 @@ public:
         : ASTNode(AstNodeType::UNARY_EXPR), operator_type(op) {}
 };
 
+// Class-related nodes
+class ClassDeclNode : public ASTNode {
+public:
+    std::string className;
+    std::map<std::string, VariableInfo> fields; // field name -> VariableInfo with offset, size, etc.
+    int totalSize = 0; // Total packed size of the class
+    
+    ClassDeclNode(const std::string& name) 
+        : ASTNode(AstNodeType::CLASS_DECL), className(name) {}
+    
+    // Pack class fields using the shared packing algorithm
+    void pack() {
+        std::vector<VariableInfo*> fieldVars;
+        for (auto& [name, fieldInfo] : fields) {
+            fieldVars.push_back(&fieldInfo);
+        }
+        
+        totalSize = VariablePacking::packVariables(fieldVars);
+        
+        printf("DEBUG ClassDeclNode::pack: Class '%s' packed with total size %d\n", 
+               className.c_str(), totalSize);
+        for (const auto& [name, fieldInfo] : fields) {
+            printf("DEBUG ClassDeclNode::pack:   Field '%s' at offset %d (size=%d)\n", 
+                   name.c_str(), fieldInfo.offset, fieldInfo.size);
+        }
+    }
+};
+
+class NewExprNode : public ASTNode {
+public:
+    std::string className;
+    ClassDeclNode* classRef = nullptr; // Set during analysis
+    
+    NewExprNode(const std::string& name) 
+        : ASTNode(AstNodeType::NEW_EXPR), className(name) {}
+};
+
+class MemberAccessNode : public ASTNode {
+public:
+    std::unique_ptr<ASTNode> object;  // The object being accessed (identifier or expression)
+    std::string memberName;
+    ClassDeclNode* classRef = nullptr; // Set during analysis
+    int memberOffset = 0; // Byte offset of the field in the object
+    
+    MemberAccessNode(const std::string& member) 
+        : ASTNode(AstNodeType::MEMBER_ACCESS), memberName(member) {}
+};
+
+class MemberAssignNode : public ASTNode {
+public:
+    std::unique_ptr<MemberAccessNode> member;
+    std::unique_ptr<ASTNode> value;
+    
+    MemberAssignNode() : ASTNode(AstNodeType::MEMBER_ASSIGN) {}
+};
+
 // Implementation of getTypeSize after all classes are defined
 inline int LexicalScopeNode::getTypeSize(const VariableInfo& var) {
     // Use the precomputed size field for fast access
@@ -382,11 +477,6 @@ inline void LexicalScopeNode::pack() {
         }
     }
     
-    // Sort regular variables by type size (biggest first)
-    std::sort(vars.begin(), vars.end(), [](const auto& a, const auto& b) {
-        return a.second->size > b.second->size;
-    });
-    
     int offset = 0;
     
     FunctionDeclNode* funcDecl = nullptr;
@@ -400,17 +490,18 @@ inline void LexicalScopeNode::pack() {
     
     // Pack regular parameters first (only for functions)
     if (funcDecl) {
+        std::vector<VariableInfo*> paramVars;
         for (auto& [name, var] : params) {
-            int size = var->size;
-            int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
-            offset = (offset + align - 1) & ~(align - 1); // Align
-            var->offset = offset;
-            printf("DEBUG pack: Parameter '%s' assigned offset %d (size=%d)\n", name.c_str(), offset, size);
-            
-            // Store in paramsInfo for unified access
+            paramVars.push_back(var);
+        }
+        
+        // Use shared packing for parameters
+        offset = VariablePacking::packVariables(paramVars);
+        
+        // Store in paramsInfo for unified access
+        for (auto& [name, var] : params) {
+            printf("DEBUG pack: Parameter '%s' assigned offset %d (size=%d)\n", name.c_str(), var->offset, var->size);
             funcDecl->paramsInfo.push_back(*var);
-            
-            offset += size; // Use actual parameter size
         }
     }
     
@@ -435,14 +526,24 @@ inline void LexicalScopeNode::pack() {
         }
     }
     
-    // Then pack regular variables after parameters
-    for (auto& [name, var] : vars) {
-        int size = var->size; // Use the size field instead of getTypeSize
-        int align = var->type == DataType::CLOSURE ? 8 : size; // Closures are pointer-aligned
-        offset = (offset + align - 1) & ~(align - 1); // Align
-        var->offset = offset;
-        printf("DEBUG pack: Variable '%s' assigned offset %d (size=%d)\n", name.c_str(), offset, size);
-        offset += size;
+    // Then pack regular variables after parameters using shared packing algorithm
+    if (!vars.empty()) {
+        std::vector<VariableInfo*> varPtrs;
+        for (auto& [name, var] : vars) {
+            varPtrs.push_back(var);
+        }
+        
+        // Adjust offsets to account for parameters/hidden params that came before
+        int startOffset = offset;
+        int varsSize = VariablePacking::packVariables(varPtrs);
+        
+        // Adjust all variable offsets by the starting offset
+        for (auto* var : varPtrs) {
+            var->offset += startOffset;
+            printf("DEBUG pack: Variable '%s' assigned offset %d (size=%d)\n", var->name.c_str(), var->offset, var->size);
+        }
+        
+        offset = startOffset + varsSize;
     }
     
     // Ensure total size is 8-byte aligned
