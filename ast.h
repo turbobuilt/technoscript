@@ -477,8 +477,8 @@ inline void LexicalScopeNode::pack() {
         }
     }
     
-    // Start at offset 8 to reserve first 8 bytes for flags
-    int offset = 8;
+    // Start at offset 16 to reserve first 8 bytes for flags and 8 bytes for metadata pointer
+    int offset = 16;
     
     FunctionDeclNode* funcDecl = nullptr;
     

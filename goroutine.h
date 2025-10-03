@@ -10,6 +10,7 @@
 #include <memory>
 #include <csetjmp>
 #include <map>
+#include <unordered_set>
 #include <array>
 #include <iostream>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 // Forward declarations
 class Goroutine;
 class EventLoop;
+struct GoroutineGCState;
 
 // Promise system for async/await
 struct Promise {
@@ -66,10 +68,10 @@ public:
     uint64_t awaitingPromiseId = 0;  // 0 means not awaiting any promise
     int64_t promiseResolvedValue = 0; // Value from resolved promise
     
-    Goroutine(std::function<void()> entry) 
-        : id(++nextId), state(GoroutineState::READY), entryPoint(std::move(entry)) {
-        context = std::make_unique<GoroutineContext>();
-    }
+    // Garbage collection state
+    std::unique_ptr<GoroutineGCState> gcState;
+    
+    Goroutine(std::function<void()> entry);
     
     void run();
     void suspend(uint64_t promiseId);
@@ -92,6 +94,10 @@ private:
     std::map<uint64_t, Promise> promises;
     std::mutex promisesMutex;  // Separate lock for promise operations
     static uint64_t nextPromiseId;
+    
+    // Goroutine registry for GC (all live goroutines)
+    std::unordered_set<std::shared_ptr<Goroutine>> allGoroutines;
+    std::mutex goroutineRegistryMutex;
     
     // Thread pool management
     std::vector<std::unique_ptr<WorkerThread>> workerThreads;
@@ -143,6 +149,12 @@ public:
         // Only check unexpired timers if other queues are empty (minimize lock contention)
         std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(timerMutex));
         return unexpiredTimers.empty();
+    }
+    
+    // Goroutine registry access (for GC)
+    std::vector<std::shared_ptr<Goroutine>> getAllGoroutines() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(goroutineRegistryMutex));
+        return std::vector<std::shared_ptr<Goroutine>>(allGoroutines.begin(), allGoroutines.end());
     }
     
     // Singleton access

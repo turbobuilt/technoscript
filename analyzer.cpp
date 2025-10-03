@@ -75,6 +75,14 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         if (setTimeoutStmt->delay) {
             analyzeNodeSinglePass(setTimeoutStmt->delay.get(), currentScope, depth + 1);
         }
+    } else if (node->type == AstNodeType::GO_STMT) {
+        // Analyze go statement - need to resolve the function call
+        auto goStmt = static_cast<GoStmtNode*>(node);
+        
+        // Analyze the function call (this will resolve varRef)
+        if (goStmt->functionCall) {
+            analyzeNodeSinglePass(goStmt->functionCall.get(), currentScope, depth + 1);
+        }
     } else if (node->type == AstNodeType::FOR_STMT) {
         // Special handling for for loop - need to analyze init, condition, update in the for loop's scope
         auto forStmt = static_cast<ForStmtNode*>(node);

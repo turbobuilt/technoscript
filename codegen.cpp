@@ -1,4 +1,5 @@
 #include "codegen.h"
+#include "gc.h"
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
@@ -212,7 +213,66 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     // Store the allocated memory address in r15
     cb->mov(x86::r15, x86::rax);
     
+    // Create and store scope metadata
+    ScopeMetadata* metadata = static_cast<ScopeMetadata*>(createScopeMetadata(scope));
+    
+    // Store metadata pointer at offset 8 in the scope
+    cb->mov(x86::r11, reinterpret_cast<uint64_t>(metadata));
+    cb->mov(x86::qword_ptr(x86::r15, ScopeLayout::METADATA_OFFSET), x86::r11);
+    
+    // Track scope in GC (push scope to roots)
+    cb->push(x86::rdi);  // Save rdi
+    cb->mov(x86::rdi, x86::r15);  // First argument: scope pointer
+    uint64_t gcPushScopeAddr = reinterpret_cast<uint64_t>(&gc_push_scope);
+    cb->mov(x86::r11, gcPushScopeAddr);
+    cb->call(x86::r11);
+    cb->pop(x86::rdi);  // Restore rdi
+    
     currentScope = scope;
+}
+
+void* CodeGenerator::createScopeMetadata(LexicalScopeNode* scope) {
+    if (!scope) return nullptr;
+    
+    // Count variables that need GC tracking (objects and closures)
+    std::vector<VarMetadata> trackedVars;
+    
+    for (const auto& [varName, varInfo] : scope->variables) {
+        // Only track object references and closures (anything that could point to heap objects)
+        if (varInfo.type == DataType::OBJECT || varInfo.type == DataType::CLOSURE) {
+            void* typeInfo = nullptr;
+            
+            // For objects, get the class metadata from the registry
+            if (varInfo.type == DataType::OBJECT && varInfo.classNode) {
+                typeInfo = MetadataRegistry::getInstance().getClassMetadata(varInfo.classNode->className);
+            }
+            
+            std::cout << "  - Tracking variable '" << varName << "' of type " 
+                      << (varInfo.type == DataType::OBJECT ? "OBJECT" : "CLOSURE")
+                      << " at offset " << varInfo.offset << std::endl;
+            
+            // Note: offset in VariableInfo is already adjusted for ScopeLayout::DATA_OFFSET
+            // But we need the offset relative to data start for the metadata
+            trackedVars.emplace_back(varInfo.offset, varInfo.type, typeInfo);
+        }
+    }
+    
+    // Allocate metadata structure
+    ScopeMetadata* metadata = new ScopeMetadata();
+    metadata->numVars = trackedVars.size();
+    
+    if (metadata->numVars > 0) {
+        metadata->vars = new VarMetadata[metadata->numVars];
+        for (int i = 0; i < metadata->numVars; i++) {
+            metadata->vars[i] = trackedVars[i];
+        }
+    } else {
+        metadata->vars = nullptr;
+    }
+    
+    std::cout << "Created scope metadata with " << metadata->numVars << " tracked variables" << std::endl;
+    
+    return metadata;
 }
 
 void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
@@ -750,6 +810,11 @@ void CodeGenerator::generateScopePrologue(LexicalScopeNode* scope) {
 void CodeGenerator::generateScopeEpilogue(LexicalScopeNode* scope) {
     std::cout << "Generating scope epilogue for scope at depth: " << scope->depth << std::endl;
     
+    // Pop scope from GC roots before freeing
+    uint64_t gcPopScopeAddr = reinterpret_cast<uint64_t>(&gc_pop_scope);
+    cb->mov(x86::rax, gcPopScopeAddr);
+    cb->call(x86::rax);
+    
     // Free the current scope memory
     cb->mov(x86::rdi, x86::r15);  // scope pointer to free
     uint64_t freeAddr = reinterpret_cast<uint64_t>(&free_wrapper);
@@ -1114,9 +1179,13 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     // Store flags at offset 0 (currently 0, zero-initialized by calloc)
     // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET), 0);  // Not needed, calloc already zeroed
     
-    // Store class reference at offset 8
-    uint64_t classRefAddr = reinterpret_cast<uint64_t>(classDecl);
-    cb->mov(x86::r10, classRefAddr);
+    // Get class metadata from registry and store at offset 8
+    ClassMetadata* metadata = MetadataRegistry::getInstance().getClassMetadata(classDecl->className);
+    if (!metadata) {
+        throw std::runtime_error("Class metadata not found for: " + classDecl->className);
+    }
+    uint64_t metadataAddr = reinterpret_cast<uint64_t>(metadata);
+    cb->mov(x86::r10, metadataAddr);
     cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::CLASS_REF_OFFSET), x86::r10);
     
     // Store dynamic vars map placeholder at offset 16 (0 for now)
@@ -1125,8 +1194,16 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     // The object data starts at ObjectLayout::FIELDS_OFFSET
     // Fields are already zero-initialized by calloc
     
-    std::cout << "DEBUG generateNewExpr: Object allocated at runtime, class ref stored at offset " 
+    std::cout << "DEBUG generateNewExpr: Object allocated at runtime, class metadata stored at offset " 
               << ObjectLayout::CLASS_REF_OFFSET << std::endl;
+    
+    // Track object in GC (save rax first since it contains the object pointer)
+    cb->push(x86::rax);
+    cb->mov(x86::rdi, x86::rax);  // First argument: object pointer
+    uint64_t gcTrackAddr = reinterpret_cast<uint64_t>(&gc_track_object);
+    cb->mov(x86::r11, gcTrackAddr);
+    cb->call(x86::r11);
+    cb->pop(x86::rax);  // Restore object pointer
     
     // Move result to destination register if different
     if (destReg.id() != x86::rax.id()) {
@@ -1199,6 +1276,28 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
     
     // Store the value to [objectPtrReg + actualOffset]
     cb->mov(x86::qword_ptr(objectPtrReg, actualOffset), valueReg);
+    
+    // Check if we're assigning an object reference
+    // We need to check the field type in the class definition
+    if (member->classRef) {
+        auto it = member->classRef->fields.find(member->memberName);
+        if (it != member->classRef->fields.end() && it->second.type == DataType::OBJECT) {
+            // This is an object assignment, track it for GC resurrection detection
+            // Save registers we need
+            cb->push(x86::rdi);
+            cb->push(x86::rax);
+            
+            // Call gc_handle_assignment with the value being assigned (the object reference)
+            cb->mov(x86::rdi, valueReg);  // First argument: object pointer being assigned
+            uint64_t gcHandleAssignAddr = reinterpret_cast<uint64_t>(&gc_handle_assignment);
+            cb->mov(x86::r11, gcHandleAssignAddr);
+            cb->call(x86::r11);
+            
+            // Restore registers
+            cb->pop(x86::rax);
+            cb->pop(x86::rdi);
+        }
+    }
     
     std::cout << "Generated member assignment - field value stored" << std::endl;
 }

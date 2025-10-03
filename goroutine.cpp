@@ -1,5 +1,6 @@
 #include "goroutine.h"
 #include "lockfree_queue.h"
+#include "gc.h"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -8,10 +9,16 @@
 uint64_t Goroutine::nextId = 0;
 uint64_t EventLoop::nextPromiseId = 1;
 
-// Current task being processed by this worker thread (thread-local)
+// Thread-local current task being processed by this worker thread (thread-local)
 thread_local std::shared_ptr<Goroutine> currentTask = nullptr;
 
 // Goroutine implementation
+Goroutine::Goroutine(std::function<void()> entry) 
+    : id(++nextId), state(GoroutineState::READY), entryPoint(std::move(entry)) {
+    context = std::make_unique<GoroutineContext>();
+    gcState = std::make_unique<GoroutineGCState>();
+}
+
 void Goroutine::run() {
     if (state != GoroutineState::READY && state != GoroutineState::AWAITING_PROMISE) {
         return;
@@ -66,6 +73,12 @@ EventLoop::~EventLoop() {
 
 void EventLoop::spawnGoroutine(std::function<void()> entryPoint) {
     auto goroutine = std::make_shared<Goroutine>(std::move(entryPoint));
+    
+    // Register goroutine in the global registry for GC
+    {
+        std::lock_guard<std::mutex> lock(goroutineRegistryMutex);
+        allGoroutines.insert(goroutine);
+    }
     
     // Try to assign to a sleeping worker first
     if (!assignTaskToSleepingWorker(goroutine)) {
@@ -212,6 +225,12 @@ void EventLoop::workerThreadFunction(uint32_t workerId) {
         
         // Execute the goroutine (it's already set as current executing context)
         currentTask->run();
+        
+        // If goroutine finished, remove it from registry
+        if (currentTask->isFinished()) {
+            std::lock_guard<std::mutex> lock(goroutineRegistryMutex);
+            allGoroutines.erase(currentTask);
+        }
         
         // Clear current goroutine context after execution
         currentTask = nullptr;

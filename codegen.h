@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ast.h"
+#include "gc.h"  // Must be before goroutine.h since goroutine uses GoroutineGCState
 #include "library.h"
 #include "goroutine.h"
 #include <asmjit/asmjit.h>
@@ -9,6 +10,10 @@
 #include <unordered_map>
 
 using namespace asmjit;
+
+// Metadata structures forward declarations (defined in gc.h)
+class ScopeMetadata;
+class ClassMetadata;
 
 // Object memory layout constants
 namespace ObjectLayout {
@@ -29,7 +34,9 @@ namespace ObjectLayout {
 namespace ScopeLayout {
     constexpr int FLAGS_OFFSET = 0;
     constexpr int FLAGS_SIZE = 8;
-    constexpr int DATA_OFFSET = 8;     // Parameters/variables start after flags
+    constexpr int METADATA_OFFSET = 8;
+    constexpr int METADATA_SIZE = 8;
+    constexpr int DATA_OFFSET = 16;     // Parameters/variables start after flags + metadata (was 8)
 }
 
 class CodeGenerator {
@@ -83,6 +90,10 @@ private:
     // Generic scope management utilities (shared by functions and blocks)
     void generateScopePrologue(LexicalScopeNode* scope);
     void generateScopeEpilogue(LexicalScopeNode* scope);
+    
+    // Metadata generation for GC (scope metadata created on-the-fly, class metadata from registry)
+    // Note: Returns void* to avoid circular include dependencies
+    void* createScopeMetadata(LexicalScopeNode* scope);
     
     // Block statement utilities
     void generateBlockStmt(BlockStmtNode* blockStmt);
