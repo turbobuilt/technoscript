@@ -4,6 +4,9 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <asmjit/asmjit.h>
+#include <mutex>
 
 // Static member initialization
 uint64_t Goroutine::nextId = 0;
@@ -513,12 +516,267 @@ extern "C" {
         
         return EventLoop::getInstance().awaitPromise(promiseId, currentGoroutine);
     }
+
+    // Trampoline function generation and caching
+    namespace {
+        // Cache for generated trampoline functions
+        std::array<void(*)(void*, void**), 8> trampolines = {nullptr};
+        std::once_flag trampolinesInitialized;
+        asmjit::JitRuntime trampolineRuntime;  // Persistent runtime for all trampolines
+        
+        // Generate a trampoline function for a specific parameter count
+        void* generateTrampoline(size_t paramCount) {
+            using namespace asmjit;
+            
+            CodeHolder code;
+            code.init(trampolineRuntime.environment());
+            x86::Assembler a(&code);
+            
+            // Function signature: void trampoline(void* funcPtr, void** paramArray)
+            // rdi = funcPtr, rsi = paramArray
+            
+            // Save frame pointer
+            a.push(x86::rbp);
+            a.mov(x86::rbp, x86::rsp);
+            
+            // Save callee-saved registers we might use
+            a.push(x86::rbx);
+            a.push(x86::r12);
+            a.push(x86::r13);
+            a.push(x86::r14);
+            a.push(x86::r15);
+            
+            // Save function pointer and param array
+            a.mov(x86::rbx, x86::rdi);  // rbx = funcPtr
+            a.mov(x86::r12, x86::rsi); // r12 = paramArray
+            
+            // x86-64 calling convention: rdi, rsi, rdx, rcx, r8, r9, then stack
+            x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
+            const size_t maxRegParams = 6;
+            
+            // Load register parameters (up to 6)
+            for (size_t i = 0; i < std::min(paramCount, maxRegParams); i++) {
+                // Load paramArray[i] into appropriate register
+                a.mov(paramRegs[i], x86::qword_ptr(x86::r12, i * 8));
+            }
+            
+            // Handle stack parameters (if paramCount > 6)
+            if (paramCount > maxRegParams) {
+                // Calculate stack space needed (aligned to 16 bytes)
+                size_t stackParams = paramCount - maxRegParams;
+                size_t stackSpace = ((stackParams + 1) / 2) * 16; // Align to 16 bytes
+                
+                // Allocate stack space
+                a.sub(x86::rsp, stackSpace);
+                
+                // Push parameters in reverse order (rightmost first for correct stack layout)
+                for (size_t i = paramCount - 1; i >= maxRegParams; i--) {
+                    size_t stackOffset = (i - maxRegParams) * 8;
+                    a.mov(x86::r13, x86::qword_ptr(x86::r12, i * 8));
+                    a.mov(x86::qword_ptr(x86::rsp, stackOffset), x86::r13);
+                }
+            }
+            
+            // Call the function
+            a.call(x86::rbx);
+            
+            // Clean up stack if we used it
+            if (paramCount > maxRegParams) {
+                size_t stackParams = paramCount - maxRegParams;
+                size_t stackSpace = ((stackParams + 1) / 2) * 16;
+                a.add(x86::rsp, stackSpace);
+            }
+            
+            // Restore callee-saved registers
+            a.pop(x86::r15);
+            a.pop(x86::r14);
+            a.pop(x86::r13);
+            a.pop(x86::r12);
+            a.pop(x86::rbx);
+            
+            // Restore frame and return
+            a.pop(x86::rbp);
+            a.ret();
+            
+            // Compile and return function pointer
+            void* func;
+            Error err = trampolineRuntime.add(&func, &code);
+            if (err) {
+                throw std::runtime_error("Failed to generate trampoline: " + std::string(DebugUtils::errorAsString(err)));
+            }
+            
+            return func;
+        }
+        
+        // Generate a generic trampoline for arbitrary parameter counts (7+)
+        void* generateGenericTrampoline() {
+            using namespace asmjit;
+            
+            CodeHolder code;
+            code.init(trampolineRuntime.environment());
+            x86::Assembler a(&code);
+            
+            // Function signature: void genericTrampoline(void* funcPtr, void** paramArray, size_t paramCount)
+            // rdi = funcPtr, rsi = paramArray, rdx = paramCount
+            
+            // Save frame pointer
+            a.push(x86::rbp);
+            a.mov(x86::rbp, x86::rsp);
+            
+            // Save callee-saved registers
+            a.push(x86::rbx);
+            a.push(x86::r12);
+            a.push(x86::r13);
+            a.push(x86::r14);
+            a.push(x86::r15);
+            
+            // Save inputs: rbx = funcPtr, r12 = paramArray, r13 = paramCount
+            a.mov(x86::rbx, x86::rdi);
+            a.mov(x86::r12, x86::rsi);
+            a.mov(x86::r13, x86::rdx);
+            
+            // x86-64 calling convention registers
+            x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
+            const size_t maxRegParams = 6;
+            
+            // Load register parameters (up to 6)
+            Label skipRegLoop = a.newLabel();
+            a.cmp(x86::r13, 0);
+            a.je(skipRegLoop);
+            
+            for (size_t i = 0; i < maxRegParams; i++) {
+                Label nextParam = a.newLabel();
+                a.cmp(x86::r13, i + 1);
+                a.jl(skipRegLoop);
+                a.mov(paramRegs[i], x86::qword_ptr(x86::r12, i * 8));
+            }
+            a.bind(skipRegLoop);
+            
+            // Handle stack parameters (paramCount > 6)
+            Label skipStackParams = a.newLabel();
+            a.cmp(x86::r13, maxRegParams);
+            a.jle(skipStackParams);
+            
+            // Calculate stack space: (paramCount - 6) aligned to 16 bytes
+            a.mov(x86::r14, x86::r13);
+            a.sub(x86::r14, maxRegParams);  // r14 = stackParams
+            a.add(x86::r14, 1);             // r14 = stackParams + 1
+            a.shr(x86::r14, 1);             // r14 = (stackParams + 1) / 2
+            a.shl(x86::r14, 4);             // r14 = ((stackParams + 1) / 2) * 16
+            a.sub(x86::rsp, x86::r14);      // Allocate stack space
+            
+            // Copy stack parameters
+            a.mov(x86::r15, x86::r13);      // r15 = paramCount (loop counter)
+            a.sub(x86::r15, 1);             // r15 = paramCount - 1 (start from last param)
+            
+            Label stackLoop = a.newLabel();
+            Label stackDone = a.newLabel();
+            
+            a.bind(stackLoop);
+            a.cmp(x86::r15, maxRegParams - 1);  // Compare with 5 (last reg param index)
+            a.jle(stackDone);
+            
+            // Calculate stack offset: (paramIndex - 6) * 8
+            a.mov(x86::rax, x86::r15);
+            a.sub(x86::rax, maxRegParams);
+            a.shl(x86::rax, 3);  // * 8
+            
+            // Copy parameter: stack[offset] = paramArray[paramIndex]
+            a.mov(x86::r11, x86::qword_ptr(x86::r12, x86::r15, 3));  // r11 = paramArray[r15]
+            a.mov(x86::qword_ptr(x86::rsp, x86::rax), x86::r11);
+            
+            a.sub(x86::r15, 1);
+            a.jmp(stackLoop);
+            
+            a.bind(stackDone);
+            a.bind(skipStackParams);
+            
+            // Call the function
+            a.call(x86::rbx);
+            
+            // Clean up stack if we used it
+            Label skipStackCleanup = a.newLabel();
+            a.cmp(x86::r13, maxRegParams);
+            a.jle(skipStackCleanup);
+            
+            // Restore stack: same calculation as allocation
+            a.mov(x86::r14, x86::r13);
+            a.sub(x86::r14, maxRegParams);
+            a.add(x86::r14, 1);
+            a.shr(x86::r14, 1);
+            a.shl(x86::r14, 4);
+            a.add(x86::rsp, x86::r14);
+            
+            a.bind(skipStackCleanup);
+            
+            // Restore callee-saved registers
+            a.pop(x86::r15);
+            a.pop(x86::r14);
+            a.pop(x86::r13);
+            a.pop(x86::r12);
+            a.pop(x86::rbx);
+            
+            // Restore frame and return
+            a.pop(x86::rbp);
+            a.ret();
+            
+            // Compile and return function pointer
+            void* func;
+            Error err = trampolineRuntime.add(&func, &code);
+            if (err) {
+                throw std::runtime_error("Failed to generate generic trampoline: " + std::string(DebugUtils::errorAsString(err)));
+            }
+            
+            return func;
+        }
+        
+        // Initialize all trampolines at startup
+        void initializeTrampolines() {
+            std::cout << "Initializing goroutine trampolines..." << std::endl;
+            
+            // Generate optimized trampolines for 0-6 parameters
+            for (size_t i = 0; i < 7; i++) {
+                trampolines[i] = reinterpret_cast<void(*)(void*, void**)>(generateTrampoline(i));
+                std::cout << "Generated trampoline for " << i << " parameters" << std::endl;
+            }
+            
+            // Generate generic trampoline for 7+ parameters (stored at index 7)
+            trampolines[7] = reinterpret_cast<void(*)(void*, void**)>(generateGenericTrampoline());
+            std::cout << "Generated generic trampoline for 7+ parameters" << std::endl;
+        }
+        
+        void(*getTrampoline(size_t paramCount))(void*, void**) {
+            // Initialize trampolines once
+            std::call_once(trampolinesInitialized, initializeTrampolines);
+            
+            // Return appropriate trampoline (use generic for 7+)
+            if (paramCount < 7) {
+                return trampolines[paramCount];
+            } else {
+                return trampolines[7];  // Generic trampoline
+            }
+        }
+    }
     
-    void runtime_spawn_goroutine(void (*func)(void*), void* args, size_t argsSize) {
+    void goroutine_execute(void* funcPtr, void** paramArray, size_t paramCount) {
+        // Get the appropriate trampoline and call it
+        auto trampoline = getTrampoline(paramCount);
+        
+        if (paramCount < 7) {
+            // Use direct trampoline for 0-6 parameters
+            trampoline(funcPtr, paramArray);
+        } else {
+            // For 7+ parameters, we need to cast to the generic signature
+            auto genericTrampoline = reinterpret_cast<void(*)(void*, void**, size_t)>(trampolines[7]);
+            genericTrampoline(funcPtr, paramArray, paramCount);
+        }
+    }
+    
+    void runtime_spawn_goroutine(void* funcPtr, void** paramArray, size_t paramCount) {
         // Create a lambda that captures the function and arguments
-        auto entryPoint = [func, args, argsSize]() {
-            // Call the function with arguments
-            func(args);
+        auto entryPoint = [funcPtr, paramArray, paramCount]() {
+            goroutine_execute(funcPtr, paramArray, paramCount);
+            free(paramArray);  // Free parameter array after execution
         };
         
         EventLoop::getInstance().spawnGoroutine(std::move(entryPoint));

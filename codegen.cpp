@@ -220,6 +220,14 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     cb->mov(x86::r11, reinterpret_cast<uint64_t>(metadata));
     cb->mov(x86::qword_ptr(x86::r15, ScopeLayout::METADATA_OFFSET), x86::r11);
     
+    // Track scope as an allocated object for GC
+    cb->push(x86::rdi);  // Save rdi
+    cb->mov(x86::rdi, x86::r15);  // First argument: scope pointer
+    uint64_t gcTrackAddr = reinterpret_cast<uint64_t>(&gc_track_object);
+    cb->mov(x86::r11, gcTrackAddr);
+    cb->call(x86::r11);
+    cb->pop(x86::rdi);  // Restore rdi
+    
     // Track scope in GC (push scope to roots)
     cb->push(x86::rdi);  // Save rdi
     cb->mov(x86::rdi, x86::r15);  // First argument: scope pointer
@@ -810,16 +818,15 @@ void CodeGenerator::generateScopePrologue(LexicalScopeNode* scope) {
 void CodeGenerator::generateScopeEpilogue(LexicalScopeNode* scope) {
     std::cout << "Generating scope epilogue for scope at depth: " << scope->depth << std::endl;
     
-    // Pop scope from GC roots before freeing
+    // Pop scope from GC roots - this removes it from the active scope stack
+    // but does NOT free the memory. The GC will handle scope destruction later.
     uint64_t gcPopScopeAddr = reinterpret_cast<uint64_t>(&gc_pop_scope);
     cb->mov(x86::rax, gcPopScopeAddr);
     cb->call(x86::rax);
     
-    // Free the current scope memory
-    cb->mov(x86::rdi, x86::r15);  // scope pointer to free
-    uint64_t freeAddr = reinterpret_cast<uint64_t>(&free_wrapper);
-    cb->mov(x86::rax, freeAddr);
-    cb->call(x86::rax);
+    // DO NOT call free() here! Scopes should only be destroyed by the garbage collector.
+    // The scope is now out of scope (removed from GC roots) but the memory remains
+    // until the GC determines it's safe to free.
     
     // Restore r15 to the parent scope (from r14)
     cb->mov(x86::r15, x86::r14);
@@ -963,14 +970,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
 void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
     std::cout << "Generating GO statement for function: " << goStmt->functionCall->value << std::endl;
     
-    // For now, we'll create a simple wrapper function that calls the target function
-    // and pass it to runtime_spawn_goroutine
-    
     FunctionCallNode* funcCall = goStmt->functionCall.get();
-    
-    // We need to create a closure that captures the function call
-    // For simplicity, we'll generate code that calls the function directly
-    // In a more complete implementation, we'd need to capture arguments and scope
     
     // Find the target function
     if (!funcCall->varRef) {
@@ -981,14 +981,35 @@ void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
         throw std::runtime_error("Go statement target is not a function: " + funcCall->value);
     }
     
-    // Get the function address from the closure
-    x86::Gp funcPtrReg = x86::rdi;  // First argument to runtime_spawn_goroutine
-    loadVariableAddress(funcCall, funcPtrReg, 0); // Load closure address
-    cb->mov(funcPtrReg, x86::qword_ptr(funcPtrReg)); // Dereference to get function pointer
+    size_t regularArgCount = funcCall->args.size();
+    size_t hiddenParamCount = funcCall->varRef->funcNode->allNeeded.size();
+    size_t totalParamCount = regularArgCount + hiddenParamCount;
     
-    // For now, pass NULL for args and 0 for argsSize (no argument support yet)
-    cb->mov(x86::rsi, 0);  // args = NULL  
-    cb->mov(x86::rdx, 0);  // argsSize = 0
+    // Allocate param array on heap
+    cb->mov(x86::rdi, totalParamCount * 8);
+    uint64_t mallocAddr = reinterpret_cast<uint64_t>(&malloc);
+    cb->mov(x86::rax, mallocAddr);
+    cb->call(x86::rax);
+    cb->mov(x86::r12, x86::rax);  // r12 = param array
+    
+    // Store regular args
+    for (size_t i = 0; i < regularArgCount; i++) {
+        loadValue(funcCall->args[i].get(), x86::r11);
+        cb->mov(x86::qword_ptr(x86::r12, i * 8), x86::r11);
+    }
+    
+    // Store hidden params from closure
+    loadVariableAddress(funcCall, x86::rbx);  // closure address
+    for (size_t i = 0; i < hiddenParamCount; i++) {
+        int closureOffset = 16 + (i * 8);
+        cb->mov(x86::r11, x86::qword_ptr(x86::rbx, closureOffset));
+        cb->mov(x86::qword_ptr(x86::r12, (regularArgCount + i) * 8), x86::r11);
+    }
+    
+    // Get function pointer from closure
+    cb->mov(x86::rdi, x86::qword_ptr(x86::rbx, 0));  // func ptr
+    cb->mov(x86::rsi, x86::r12);  // param array
+    cb->mov(x86::rdx, totalParamCount);  // count
     
     // Save registers before calling runtime function
     cb->push(x86::rax);
@@ -998,8 +1019,7 @@ void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
     cb->push(x86::r10);
     cb->push(x86::r11);
     
-    // Call runtime_spawn_goroutine(func, args, argsSize)
-    // Load the function address into rax first
+    // Call runtime_spawn_goroutine(funcPtr, paramArray, paramCount)
     uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_spawn_goroutine);
     cb->mov(x86::rax, runtimeAddr);
     cb->call(x86::rax);
