@@ -25,6 +25,13 @@ namespace ObjectLayout {
     constexpr int HEADER_SIZE = 24;    // Total size of object header
 }
 
+// Lexical Scope memory layout constants
+namespace ScopeLayout {
+    constexpr int FLAGS_OFFSET = 0;
+    constexpr int FLAGS_SIZE = 8;
+    constexpr int DATA_OFFSET = 8;     // Parameters/variables start after flags
+}
+
 class CodeGenerator {
 public:
     CodeGenerator();

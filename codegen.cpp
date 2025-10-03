@@ -725,7 +725,8 @@ void CodeGenerator::generateScopePrologue(LexicalScopeNode* scope) {
             
             int paramIndex = it->second;
             // For blocks, we use a simple offset calculation since we don't have real parameters
-            int offset = 0 + (scopeIndex * 8); // Start at offset 0 for parent scope pointers
+            // Start at offset 8 to skip the flags field
+            int offset = 8 + (scopeIndex * 8);
             
             std::cout << "  Parent scope at depth " << neededDepth << " -> block scope[" << offset << "]" << std::endl;
 

@@ -477,7 +477,8 @@ inline void LexicalScopeNode::pack() {
         }
     }
     
-    int offset = 0;
+    // Start at offset 8 to reserve first 8 bytes for flags
+    int offset = 8;
     
     FunctionDeclNode* funcDecl = nullptr;
     
@@ -546,8 +547,13 @@ inline void LexicalScopeNode::pack() {
         offset = startOffset + varsSize;
     }
     
-    // Ensure total size is 8-byte aligned
+    // Ensure total size is 8-byte aligned and includes the 8-byte flags header
     totalSize = (offset + 7) & ~7;
+    
+    // Ensure minimum size is at least FLAGS_SIZE (8 bytes) even for empty scopes
+    if (totalSize < 8) {
+        totalSize = 8;
+    }
 }
 
 // Implementation of FunctionDeclNode helper methods
