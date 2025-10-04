@@ -645,7 +645,6 @@ extern "C" {
             a.je(skipRegLoop);
             
             for (size_t i = 0; i < maxRegParams; i++) {
-                Label nextParam = a.newLabel();
                 a.cmp(x86::r13, i + 1);
                 a.jl(skipRegLoop);
                 a.mov(paramRegs[i], x86::qword_ptr(x86::r12, i * 8));
@@ -767,7 +766,12 @@ extern "C" {
             trampoline(funcPtr, paramArray);
         } else {
             // For 7+ parameters, we need to cast to the generic signature
+            // The generic trampoline actually has signature void(*)(void*, void**, size_t)
+            // but is stored in the array with the base signature for simplicity
+            #pragma GCC diagnostic push
+            #pragma GCC diagnostic ignored "-Wcast-function-type"
             auto genericTrampoline = reinterpret_cast<void(*)(void*, void**, size_t)>(trampolines[7]);
+            #pragma GCC diagnostic pop
             genericTrampoline(funcPtr, paramArray, paramCount);
         }
     }

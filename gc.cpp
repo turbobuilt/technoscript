@@ -158,7 +158,7 @@ void GarbageCollector::gcThreadFunction() {
         try {
             phase1_initialMarkSweep();
             
-            if (!suspectedDead.empty()) {
+            if (!suspectedDead.empty() || !suspectedDeadScopes.empty()) {
                 phase2_setFlagMonitoring();
                 phase3_secondMarkSweep();
                 phase4_cleanup();
@@ -169,6 +169,9 @@ void GarbageCollector::gcThreadFunction() {
         
         // Clear state for next cycle
         suspectedDead.clear();
+        suspectedDeadScopes.clear();
+        objectsToFree.clear();
+        scopesToFree.clear();
         markedObjects.clear();
         markedScopes.clear();
     }
@@ -199,6 +202,24 @@ std::vector<void*> GarbageCollector::collectAllAllocatedObjects() {
     return allObjects;
 }
 
+std::vector<void*> GarbageCollector::collectAllAllocatedScopes() {
+    std::vector<void*> allScopes;
+    
+    // Get all goroutines from EventLoop
+    auto allGoroutines = EventLoop::getInstance().getAllGoroutines();
+    
+    for (auto& goroutine : allGoroutines) {
+        if (goroutine && goroutine->gcState) {
+            std::lock_guard<std::mutex> lock(goroutine->gcState->allocationMutex);
+            allScopes.insert(allScopes.end(), 
+                           goroutine->gcState->allocatedScopes.begin(),
+                           goroutine->gcState->allocatedScopes.end());
+        }
+    }
+    
+    return allScopes;
+}
+
 std::vector<void*> GarbageCollector::collectAllRoots() {
     std::vector<void*> allRoots;
     
@@ -223,14 +244,16 @@ std::vector<void*> GarbageCollector::collectAllRoots() {
 void GarbageCollector::phase1_initialMarkSweep() {
     std::lock_guard<std::mutex> lock(gcMutex);
     
-    // Step 1: Snapshot all allocated objects
+    // Step 1: Snapshot all allocated objects and scopes
     std::vector<void*> allObjects = collectAllAllocatedObjects();
+    std::vector<void*> allScopes = collectAllAllocatedScopes();
     
-    if (allObjects.empty()) {
+    if (allObjects.empty() && allScopes.empty()) {
         return; // Nothing to collect
     }
     
-    std::cout << "GC Phase 1: Mark-Sweep on " << allObjects.size() << " objects" << std::endl;
+    std::cout << "GC Phase 1: Mark-Sweep on " << allObjects.size() << " objects and " 
+              << allScopes.size() << " scopes" << std::endl;
     
     // Step 2: Clear mark bits
     markedObjects.clear();
@@ -246,7 +269,7 @@ void GarbageCollector::phase1_initialMarkSweep() {
         }
     }
     
-    // Step 4: Find unreachable objects (suspected dead)
+    // Step 4: Find unreachable objects and scopes (suspected dead)
     suspectedDead.clear();
     for (void* obj : allObjects) {
         if (markedObjects.find(obj) == markedObjects.end()) {
@@ -254,7 +277,15 @@ void GarbageCollector::phase1_initialMarkSweep() {
         }
     }
     
-    std::cout << "  - Found " << suspectedDead.size() << " suspected dead objects" << std::endl;
+    suspectedDeadScopes.clear();
+    for (void* scope : allScopes) {
+        if (markedScopes.find(scope) == markedScopes.end()) {
+            suspectedDeadScopes.push_back(scope);
+        }
+    }
+    
+    std::cout << "  - Found " << suspectedDead.size() << " suspected dead objects and " 
+              << suspectedDeadScopes.size() << " suspected dead scopes" << std::endl;
 }
 
 void GarbageCollector::phase2_setFlagMonitoring() {
@@ -270,17 +301,34 @@ void GarbageCollector::phase2_setFlagMonitoring() {
     for (void* obj : suspectedDead) {
         ObjectHeader* header = static_cast<ObjectHeader*>(obj);
         
-        // Set needs_set_flag = 1, set_flag = 0
-        uint64_t flags = header->flags;
-        flags |= ObjectFlags::NEEDS_SET_FLAG;
-        flags &= ~ObjectFlags::SET_FLAG;
-        header->flags = flags;
+        // Set needs_set_flag = 1, set_flag = 0 atomically
+        uint64_t expected = header->flags.load(std::memory_order_acquire);
+        uint64_t desired;
+        do {
+            desired = expected | ObjectFlags::NEEDS_SET_FLAG;
+            desired &= ~ObjectFlags::SET_FLAG;
+        } while (!header->flags.compare_exchange_weak(expected, desired, 
+                                                       std::memory_order_release,
+                                                       std::memory_order_acquire));
     }
     
-    // Memory fence to ensure visibility
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // For each suspected dead scope, set needs_set_flag and clear set_flag
+    for (void* scope : suspectedDeadScopes) {
+        ScopeHeader* header = static_cast<ScopeHeader*>(scope);
+        
+        // Set needs_set_flag = 1, set_flag = 0 atomically
+        uint64_t expected = header->flags.load(std::memory_order_acquire);
+        uint64_t desired;
+        do {
+            desired = expected | ScopeFlags::NEEDS_SET_FLAG;
+            desired &= ~ScopeFlags::SET_FLAG;
+        } while (!header->flags.compare_exchange_weak(expected, desired,
+                                                       std::memory_order_release,
+                                                       std::memory_order_acquire));
+    }
     
-    std::cout << "  - Monitoring " << suspectedDead.size() << " objects for resurrection" << std::endl;
+    std::cout << "  - Monitoring " << suspectedDead.size() << " objects and " 
+              << suspectedDeadScopes.size() << " scopes for resurrection" << std::endl;
     
     // Wait a bit for program to potentially create new references
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -288,9 +336,6 @@ void GarbageCollector::phase2_setFlagMonitoring() {
 
 void GarbageCollector::phase3_secondMarkSweep() {
     std::cout << "GC Phase 3: Second Mark-Sweep" << std::endl;
-    
-    // Memory fence to read latest set_flag values
-    std::atomic_thread_fence(std::memory_order_seq_cst);
     
     // Exit GC mode and reset phase 2 markers
     gcMode.store(false, std::memory_order_release);
@@ -304,23 +349,71 @@ void GarbageCollector::phase3_secondMarkSweep() {
         ObjectHeader* header = static_cast<ObjectHeader*>(obj);
         
         // Check if set_flag was set (meaning new reference was created)
-        if (header->flags & ObjectFlags::SET_FLAG) {
+        if (header->flags.load(std::memory_order_acquire) & ObjectFlags::SET_FLAG) {
             resurrected.push_back(obj);
         } else {
             trulyDead.push_back(obj);
         }
     }
     
-    std::cout << "  - Resurrected: " << resurrected.size() << ", Truly dead: " << trulyDead.size() << std::endl;
+    // Check each suspected dead scope
+    std::vector<void*> resurrectedScopes;
+    std::vector<void*> trulyDeadScopes;
     
-    // For resurrected objects, mark them and their descendants as live
+    for (void* scope : suspectedDeadScopes) {
+        ScopeHeader* header = static_cast<ScopeHeader*>(scope);
+        
+        // Check if set_flag was set (meaning new reference was created)
+        if (header->flags.load(std::memory_order_acquire) & ScopeFlags::SET_FLAG) {
+            resurrectedScopes.push_back(scope);
+        } else {
+            trulyDeadScopes.push_back(scope);
+        }
+    }
+    
+    std::cout << "  - Objects - Resurrected: " << resurrected.size() << ", Truly dead: " << trulyDead.size() << std::endl;
+    std::cout << "  - Scopes - Resurrected: " << resurrectedScopes.size() << ", Truly dead: " << trulyDeadScopes.size() << std::endl;
+    
+    // For resurrected objects and scopes, mark them and their descendants as live
     markedObjects.clear();
+    markedScopes.clear();  // Also clear marked scopes to properly track resurrected scope references
     for (void* obj : resurrected) {
         markObject(obj);
     }
+    for (void* scope : resurrectedScopes) {
+        markScope(scope);
+    }
     
-    // Remove resurrected objects from suspected dead
-    suspectedDead = trulyDead;
+    // Filter out any descendants of resurrected objects from trulyDead
+    // (descendants were marked recursively but don't have SET_FLAG set themselves)
+    objectsToFree.clear();
+    objectsToFree.reserve(trulyDead.size());  // Pre-allocate to avoid reallocations
+    for (void* obj : trulyDead) {
+        if (markedObjects.find(obj) == markedObjects.end()) {
+            // Object was not marked as a descendant of resurrected objects
+            objectsToFree.push_back(obj);
+        }
+    }
+    
+    // Filter out any descendants of resurrected scopes from trulyDeadScopes
+    scopesToFree.clear();
+    scopesToFree.reserve(trulyDeadScopes.size());  // Pre-allocate to avoid reallocations
+    for (void* scope : trulyDeadScopes) {
+        if (markedScopes.find(scope) == markedScopes.end()) {
+            // Scope was not marked as a descendant of resurrected items
+            scopesToFree.push_back(scope);
+        }
+    }
+    
+    int objectDescendantsSaved = trulyDead.size() - objectsToFree.size();
+    int scopeDescendantsSaved = trulyDeadScopes.size() - scopesToFree.size();
+    if (objectDescendantsSaved > 0 || scopeDescendantsSaved > 0) {
+        std::cout << "  - Saved " << objectDescendantsSaved << " object descendants and " 
+                  << scopeDescendantsSaved << " scope descendants of resurrected items" << std::endl;
+    }
+    
+    std::cout << "  - Final truly dead to free: " << objectsToFree.size() << " objects, " 
+              << scopesToFree.size() << " scopes" << std::endl;
 }
 
 void GarbageCollector::phase4_cleanup() {
@@ -330,11 +423,11 @@ void GarbageCollector::phase4_cleanup() {
     auto allGoroutines = EventLoop::getInstance().getAllGoroutines();
     
     // Free all truly dead objects
-    for (void* obj : suspectedDead) {
+    for (void* obj : objectsToFree) {
         ObjectHeader* header = static_cast<ObjectHeader*>(obj);
         
         // Clear flags to indicate object is being freed
-        header->flags = 0;
+        header->flags.store(0, std::memory_order_release);
         header->classMetadata = nullptr;
         
         // Remove from all goroutines' allocation lists
@@ -348,7 +441,27 @@ void GarbageCollector::phase4_cleanup() {
         free(obj);
     }
     
-    std::cout << "  - Freed " << suspectedDead.size() << " objects" << std::endl;
+    // Free all truly dead scopes
+    for (void* scope : scopesToFree) {
+        ScopeHeader* header = static_cast<ScopeHeader*>(scope);
+        
+        // Clear flags to indicate scope is being freed
+        header->flags.store(0, std::memory_order_release);
+        header->scopeMetadata = nullptr;
+        
+        // Remove from all goroutines' allocation lists
+        for (auto& goroutine : allGoroutines) {
+            if (goroutine && goroutine->gcState) {
+                goroutine->gcState->removeScope(scope);
+            }
+        }
+        
+        // Free the memory
+        free(scope);
+    }
+    
+    std::cout << "  - Freed " << objectsToFree.size() << " objects and " 
+              << scopesToFree.size() << " scopes" << std::endl;
 }
 
 void GarbageCollector::markObject(void* obj) {
@@ -483,6 +596,14 @@ extern "C" {
         }
     }
     
+    void gc_track_scope(void* scope) {
+        if (!scope) return;
+        
+        if (currentTask && currentTask->gcState) {
+            currentTask->gcState->addScope(scope);
+        }
+    }
+    
     void gc_push_scope(void* scope) {
         if (!scope) return;
         
@@ -497,20 +618,41 @@ extern "C" {
         }
     }
     
+    // NOTE: gc_handle_assignment and gc_handle_scope_assignment are now inlined
+    // directly in the generated assembly code for better performance.
+    // The inline version does:
+    //   1. Load flags from object header
+    //   2. Test if NEEDS_SET_FLAG is set
+    //   3. If set, atomically OR the SET_FLAG bit using LOCK OR instruction
+    // This avoids the function call overhead while maintaining thread safety.
+    
+    /*
     void gc_handle_assignment(void* targetObj) {
         if (!targetObj) return;
         
         ObjectHeader* header = static_cast<ObjectHeader*>(targetObj);
         
         // Check if needs_set_flag is set
-        if (header->flags & ObjectFlags::NEEDS_SET_FLAG) {
+        uint64_t flags = header->flags.load(std::memory_order_acquire);
+        if (flags & ObjectFlags::NEEDS_SET_FLAG) {
             // Set the set_flag to indicate a new reference was created
-            header->flags |= ObjectFlags::SET_FLAG;
-            
-            // Memory fence to ensure visibility
-            std::atomic_thread_fence(std::memory_order_release);
+            header->flags.fetch_or(ObjectFlags::SET_FLAG, std::memory_order_release);
         }
     }
+    
+    void gc_handle_scope_assignment(void* targetScope) {
+        if (!targetScope) return;
+        
+        ScopeHeader* header = static_cast<ScopeHeader*>(targetScope);
+        
+        // Check if needs_set_flag is set
+        uint64_t flags = header->flags.load(std::memory_order_acquire);
+        if (flags & ScopeFlags::NEEDS_SET_FLAG) {
+            // Set the set_flag to indicate a new reference was created
+            header->flags.fetch_or(ScopeFlags::SET_FLAG, std::memory_order_release);
+        }
+    }
+    */
     
     void gc_collect() {
         GarbageCollector::getInstance().requestCollection();

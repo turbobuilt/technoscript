@@ -68,14 +68,16 @@ namespace ObjectFlags {
 
 // Scope header flags (bit positions in the FLAGS field at offset 0)
 namespace ScopeFlags {
-    constexpr uint64_t GC_MARKED = 1ULL << 0;       // Bit 0: Marked as reachable during GC
+    constexpr uint64_t NEEDS_SET_FLAG = 1ULL << 0;  // Bit 0: Scope is suspected dead, track new refs
+    constexpr uint64_t SET_FLAG = 1ULL << 1;        // Bit 1: New reference was created during GC
+    constexpr uint64_t GC_MARKED = 1ULL << 2;       // Bit 2: Marked as reachable during GC
 }
 
 // Object header structure (must match ObjectLayout in codegen.h)
 struct ObjectHeader {
-    uint64_t flags;           // Offset 0: GC flags
-    void* classMetadata;      // Offset 8: Pointer to ClassMetadata (was classRef)
-    void* dynamicVars;        // Offset 16: Dynamic variables (unused for now)
+    std::atomic<uint64_t> flags;  // Offset 0: GC flags (atomic for thread safety)
+    void* classMetadata;          // Offset 8: Pointer to ClassMetadata (was classRef)
+    void* dynamicVars;            // Offset 16: Dynamic variables (unused for now)
     // Fields start at offset 24
     
     ClassMetadata* getClassMetadata() const { 
@@ -94,8 +96,8 @@ struct ObjectHeader {
 
 // Scope header structure (must match ScopeLayout in codegen.h)
 struct ScopeHeader {
-    uint64_t flags;           // Offset 0: GC flags
-    void* scopeMetadata;      // Offset 8: Pointer to ScopeMetadata
+    std::atomic<uint64_t> flags;  // Offset 0: GC flags (atomic for thread safety)
+    void* scopeMetadata;          // Offset 8: Pointer to ScopeMetadata
     // Variables/parameters start at offset 16 (was 8)
     
     ScopeMetadata* getScopeMetadata() const {
@@ -110,8 +112,9 @@ struct ScopeHeader {
 // Per-goroutine GC state
 struct GoroutineGCState {
     std::vector<void*> allocatedObjects;  // All objects allocated by this goroutine
+    std::vector<void*> allocatedScopes;   // All scopes allocated by this goroutine
     std::vector<void*> scopeStack;        // Stack of active lexical scopes (roots)
-    std::mutex allocationMutex;           // Protects allocatedObjects list
+    std::mutex allocationMutex;           // Protects allocatedObjects and allocatedScopes lists
     size_t gcPhase2StackSize = 0;         // Size of scope stack when phase 2 started
     bool isInGCPhase2 = false;            // True when in GC phase 2
     
@@ -125,6 +128,19 @@ struct GoroutineGCState {
         auto it = std::find(allocatedObjects.begin(), allocatedObjects.end(), obj);
         if (it != allocatedObjects.end()) {
             allocatedObjects.erase(it);
+        }
+    }
+    
+    void addScope(void* scope) {
+        std::lock_guard<std::mutex> lock(allocationMutex);
+        allocatedScopes.push_back(scope);
+    }
+    
+    void removeScope(void* scope) {
+        std::lock_guard<std::mutex> lock(allocationMutex);
+        auto it = std::find(allocatedScopes.begin(), allocatedScopes.end(), scope);
+        if (it != allocatedScopes.end()) {
+            allocatedScopes.erase(it);
         }
     }
     
@@ -156,7 +172,10 @@ private:
     std::mutex gcMutex;
     
     // GC cycle state
-    std::vector<void*> suspectedDead;
+    std::vector<void*> suspectedDead;      // Objects suspected dead after phase 1
+    std::vector<void*> suspectedDeadScopes; // Scopes suspected dead after phase 1
+    std::vector<void*> objectsToFree;      // Final list of truly dead objects to free in phase 4
+    std::vector<void*> scopesToFree;       // Final list of truly dead scopes to free in phase 4
     std::unordered_set<void*> markedObjects;
     std::unordered_set<void*> markedScopes;
     
@@ -176,6 +195,7 @@ private:
     void traceObject(void* obj);
     void traceScope(void* scope);
     std::vector<void*> collectAllAllocatedObjects();
+    std::vector<void*> collectAllAllocatedScopes();
     std::vector<void*> collectAllRoots();
     
     // Main GC loop
@@ -200,12 +220,17 @@ extern "C" {
     // Track object allocation (called after malloc in generated code)
     void gc_track_object(void* obj);
     
+    // Track scope allocation (called after scope allocation in generated code)
+    void gc_track_scope(void* scope);
+    
     // Push/Pop scope from GC roots (called on scope entry/exit)
     void gc_push_scope(void* scope);
     void gc_pop_scope();
     
-    // Handle object assignment (checks set flags)
-    void gc_handle_assignment(void* targetObj);
+    // NOTE: gc_handle_assignment and gc_handle_scope_assignment are now inlined
+    // directly in generated assembly code for performance. See codegen.cpp.
+    // void gc_handle_assignment(void* targetObj);
+    // void gc_handle_scope_assignment(void* targetScope);
     
     // Manual GC trigger
     void gc_collect();

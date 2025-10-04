@@ -290,11 +290,13 @@ void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
         throw std::runtime_error("Variable declaration without assignment not supported");
     }
     
+    ASTNode* valueNode = varDecl->children[0].get();
+    
     // Load the value into a register
-    loadValue(varDecl->children[0].get(), x86::rax);
+    loadValue(valueNode, x86::rax);
     
     // Store the value in the current scope
-    storeVariableInScope(varDecl->varName, x86::rax, currentScope);
+    storeVariableInScope(varDecl->varName, x86::rax, currentScope, valueNode);
 }
 
 void CodeGenerator::generateLetDecl(LetDeclNode* letDecl) {
@@ -306,11 +308,13 @@ void CodeGenerator::generateLetDecl(LetDeclNode* letDecl) {
         throw std::runtime_error("Let declaration without assignment not supported");
     }
     
+    ASTNode* valueNode = letDecl->children[0].get();
+    
     // Load the value into a register
-    loadValue(letDecl->children[0].get(), x86::rax);
+    loadValue(valueNode, x86::rax);
     
     // Store the value in the current scope
-    storeVariableInScope(letDecl->varName, x86::rax, currentScope);
+    storeVariableInScope(letDecl->varName, x86::rax, currentScope, valueNode);
 }
 
 void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
@@ -318,7 +322,7 @@ void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
     loadValue(value, x86::rax);
     
     // Store in the lexical scope at the variable's offset
-    storeVariableInScope(varDecl->varName, x86::rax, currentScope);
+    storeVariableInScope(varDecl->varName, x86::rax, currentScope, value);
 }
 
 void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
@@ -373,7 +377,7 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
     }
 }
 
-void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope) {
+void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope, ASTNode* valueNode) {
     // Find the variable in the scope
     auto it = scope->variables.find(varName);
     if (it == scope->variables.end()) {
@@ -385,6 +389,33 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
     
     // Store the value at [r15 + offset]
     cb->mov(x86::ptr(x86::r15, offset), valueReg);
+    
+    // If this is an object-typed variable and not a NEW expression, handle GC write barrier inline
+    if (it->second.type == DataType::OBJECT && valueNode && valueNode->type != AstNodeType::NEW_EXPR) {
+        // Inline GC write barrier - check needs_set_flag and atomically set set_flag if needed
+        // This is much faster than a function call
+        
+        // Load flags from object header (at offset 0)
+        // flags is at [valueReg + 0]
+        cb->mov(x86::rcx, x86::qword_ptr(valueReg, 0));  // Load flags
+        
+        // Test if NEEDS_SET_FLAG (bit 0) is set
+        cb->test(x86::rcx, ObjectFlags::NEEDS_SET_FLAG);
+        
+        // Create a label for skipping if not needed
+        Label skipWriteBarrier = cb->newLabel();
+        cb->jz(skipWriteBarrier);  // Jump if zero (NEEDS_SET_FLAG not set)
+        
+        // NEEDS_SET_FLAG is set, so OR the SET_FLAG bit (no LOCK needed - idempotent)
+        // Using non-locked OR is safe because we're only setting a bit to 1
+        cb->or_(x86::qword_ptr(valueReg, 0), ObjectFlags::SET_FLAG);
+        
+        // Memory fence to ensure write visibility to GC thread
+        // This guarantees the set_flag write is visible before GC reads it in phase 3
+        cb->mfence();
+        
+        cb->bind(skipWriteBarrier);
+    }
 }
 
 void CodeGenerator::loadParameterIntoRegister(int paramIndex, x86::Gp destReg, x86::Gp scopeReg) {
@@ -1302,20 +1333,32 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
     if (member->classRef) {
         auto it = member->classRef->fields.find(member->memberName);
         if (it != member->classRef->fields.end() && it->second.type == DataType::OBJECT) {
-            // This is an object assignment, track it for GC resurrection detection
-            // Save registers we need
-            cb->push(x86::rdi);
-            cb->push(x86::rax);
-            
-            // Call gc_handle_assignment with the value being assigned (the object reference)
-            cb->mov(x86::rdi, valueReg);  // First argument: object pointer being assigned
-            uint64_t gcHandleAssignAddr = reinterpret_cast<uint64_t>(&gc_handle_assignment);
-            cb->mov(x86::r11, gcHandleAssignAddr);
-            cb->call(x86::r11);
-            
-            // Restore registers
-            cb->pop(x86::rax);
-            cb->pop(x86::rdi);
+            // Skip write barrier for NEW expressions - they can't be suspected dead yet
+            if (memberAssign->value->type != AstNodeType::NEW_EXPR) {
+                // Inline GC write barrier - check needs_set_flag and atomically set set_flag if needed
+                // This is much faster than a function call
+                
+                // Load flags from object header (at offset 0)
+                // flags is at [valueReg + 0]
+                cb->mov(x86::rcx, x86::qword_ptr(valueReg, 0));  // Load flags
+                
+                // Test if NEEDS_SET_FLAG (bit 0) is set
+                cb->test(x86::rcx, ObjectFlags::NEEDS_SET_FLAG);
+                
+                // Create a label for skipping if not needed
+                Label skipWriteBarrier = cb->newLabel();
+                cb->jz(skipWriteBarrier);  // Jump if zero (NEEDS_SET_FLAG not set)
+                
+                // NEEDS_SET_FLAG is set, so OR the SET_FLAG bit (no LOCK needed - idempotent)
+                // Using non-locked OR is safe because we're only setting a bit to 1
+                cb->or_(x86::qword_ptr(valueReg, 0), ObjectFlags::SET_FLAG);
+                
+                // Memory fence to ensure write visibility to GC thread
+                // This guarantees the set_flag write is visible before GC reads it in phase 3
+                cb->mfence();
+                
+                cb->bind(skipWriteBarrier);
+            }
         }
     }
     
