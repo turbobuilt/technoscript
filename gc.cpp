@@ -6,9 +6,27 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <signal.h>
+#include <pthread.h>
 
 // Thread-local current goroutine (defined in goroutine.cpp)
 extern thread_local std::shared_ptr<Goroutine> currentTask;
+
+// Signal handler for GC memory fence checkpoint
+extern "C" void gc_checkpoint_signal_handler(int sig) {
+    // The signal itself creates a memory fence - all pending writes
+    // must be visible before the handler executes (OS guarantees this)
+    
+    if (currentTask && currentTask->gcState) {
+        // Increment checkpoint counter atomically
+        // GC thread will wait for this to confirm the goroutine has reached the checkpoint
+        currentTask->gcState->checkpointCounter.fetch_add(1, std::memory_order_seq_cst);
+    }
+    
+    // Execute explicit memory fence for extra safety
+    // This ensures all prior writes are globally visible
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
 
 // MetadataRegistry implementation
 MetadataRegistry& MetadataRegistry::getInstance() {
@@ -20,7 +38,37 @@ MetadataRegistry::~MetadataRegistry() {
     // Clean up all allocated metadata
     for (auto& [name, metadata] : classMetadata) {
         if (metadata) {
+            // Free field metadata
             delete[] metadata->fields;
+            
+            // Free method closures
+            if (metadata->methodClosures) {
+                for (int i = 0; i < metadata->numMethods; i++) {
+                    if (metadata->methodClosures[i]) {
+                        delete[] reinterpret_cast<uint8_t*>(metadata->methodClosures[i]);
+                    }
+                }
+                delete[] metadata->methodClosures;
+            }
+            
+            // Free parent info
+            if (metadata->parentNames) {
+                for (int i = 0; i < metadata->numParents; i++) {
+                    if (metadata->parentNames[i]) {
+                        free(const_cast<char*>(metadata->parentNames[i]));
+                    }
+                }
+                delete[] metadata->parentNames;
+            }
+            if (metadata->parentOffsets) {
+                delete[] metadata->parentOffsets;
+            }
+            
+            // Free class name
+            if (metadata->className) {
+                free(const_cast<char*>(metadata->className));
+            }
+            
             delete metadata;
         }
     }
@@ -32,48 +80,128 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
     std::cout << "Building class metadata for " << classRegistry.size() << " classes" << std::endl;
     
     for (const auto& [className, classDecl] : classRegistry) {
-        // Count fields that need GC tracking (objects and closures)
-        std::vector<VarMetadata> trackedFields;
+        // Build comprehensive field list (all fields for dynamic access)
+        std::vector<VarMetadata> allFields;
         
-        for (const auto& [fieldName, fieldInfo] : classDecl->fields) {
-            if (fieldInfo.type == DataType::OBJECT || fieldInfo.type == DataType::CLOSURE) {
+        // Add parent class fields first (in inheritance order)
+        for (ClassDeclNode* parent : classDecl->parentRefs) {
+            int parentOffset = classDecl->parentOffsets[parent->className];
+            for (const auto& [fieldName, fieldInfo] : parent->fields) {
                 void* typeInfo = nullptr;
-                
-                // For objects, we'll set typeInfo to point to the class metadata
-                // This will be resolved in a second pass
                 if (fieldInfo.type == DataType::OBJECT && fieldInfo.classNode) {
-                    typeInfo = fieldInfo.classNode; // Temporary: store ClassDeclNode, will resolve later
+                    typeInfo = fieldInfo.classNode; // Temp: will resolve to ClassMetadata later
                 }
                 
-                trackedFields.emplace_back(fieldInfo.offset, fieldInfo.type, typeInfo);
+                std::string fullFieldName = parent->className + "::" + fieldName;
+                // Field offset = header + field offset (no method closures in instance, just pointers)
+                // Actually, instances have closure POINTERS, not embedded closures
+                // So the offset calculation needs to account for method closure pointers
+                int absoluteOffset = 16 + (classDecl->vtable.size() * 8) + parentOffset + fieldInfo.offset;
+                allFields.emplace_back(
+                    absoluteOffset, 
+                    fieldInfo.type, 
+                    typeInfo,
+                    strdup(fullFieldName.c_str())  // Allocate permanent storage for name
+                );
             }
         }
         
-        // Allocate and populate metadata
-        ClassMetadata* metadata = new ClassMetadata();
-        metadata->className = classDecl->className.c_str();
-        metadata->numFields = trackedFields.size();
-        metadata->totalSize = classDecl->totalSize;
-        
-        if (metadata->numFields > 0) {
-            metadata->fields = new VarMetadata[metadata->numFields];
-            for (int i = 0; i < metadata->numFields; i++) {
-                metadata->fields[i] = trackedFields[i];
+        // Add own fields
+        for (const auto& [fieldName, fieldInfo] : classDecl->fields) {
+            void* typeInfo = nullptr;
+            if (fieldInfo.type == DataType::OBJECT && fieldInfo.classNode) {
+                typeInfo = fieldInfo.classNode; // Temp: will resolve to ClassMetadata later
             }
-        } else {
-            metadata->fields = nullptr;
+            
+            // Field offset = header + closure pointers + field offset
+            int absoluteOffset = 16 + (classDecl->vtable.size() * 8) + fieldInfo.offset;
+            allFields.emplace_back(
+                absoluteOffset, 
+                fieldInfo.type, 
+                typeInfo,
+                strdup(fieldName.c_str())  // Allocate permanent storage for name
+            );
         }
+        
+        // Build simple method closure array
+        Closure** methodClosures = nullptr;
+        if (!classDecl->vtable.empty()) {
+            methodClosures = new Closure*[classDecl->vtable.size()];
+            
+            for (size_t i = 0; i < classDecl->vtable.size(); i++) {
+                const auto& vtEntry = classDecl->vtable[i];
+                
+                // Calculate closure size: size field + func_addr + scope pointers
+                size_t closureSize = 16; // size field + func_addr
+                if (vtEntry.method && vtEntry.method->allNeeded.size() > 0) {
+                    closureSize += vtEntry.method->allNeeded.size() * 8;
+                }
+                
+                // Allocate closure
+                uint8_t* closureData = new uint8_t[closureSize];
+                memset(closureData, 0, closureSize);
+                
+                Closure* closure = reinterpret_cast<Closure*>(closureData);
+                closure->size = closureSize;
+                closure->funcAddr = nullptr; // Will be patched during codegen
+                
+                methodClosures[i] = closure;
+                
+                std::cout << "    - Method '" << vtEntry.methodName << "' closure size: " 
+                          << closureSize << " bytes (needs " 
+                          << (vtEntry.method ? vtEntry.method->allNeeded.size() : 0) 
+                          << " scopes)" << std::endl;
+            }
+        }
+        
+        // Build parent info
+        const char** parentNames = nullptr;
+        int* parentOffsets = nullptr;
+        int numParents = classDecl->parentRefs.size();
+        if (numParents > 0) {
+            parentNames = new const char*[numParents];
+            parentOffsets = new int[numParents];
+            for (size_t i = 0; i < classDecl->parentRefs.size(); i++) {
+                parentNames[i] = strdup(classDecl->parentRefs[i]->className.c_str());
+                parentOffsets[i] = classDecl->parentOffsets[classDecl->parentRefs[i]->className];
+            }
+        }
+        
+        // Allocate and populate field metadata array
+        VarMetadata* fieldsArray = nullptr;
+        if (!allFields.empty()) {
+            fieldsArray = new VarMetadata[allFields.size()];
+            for (size_t i = 0; i < allFields.size(); i++) {
+                fieldsArray[i] = allFields[i];
+            }
+        }
+        
+        // Create ClassMetadata with simple closure array
+        ClassMetadata* metadata = new ClassMetadata(
+            strdup(classDecl->className.c_str()),
+            allFields.size(),
+            fieldsArray,
+            classDecl->totalSize,
+            classDecl->vtable.size(),
+            methodClosures,
+            numParents,
+            parentNames,
+            parentOffsets
+        );
         
         classMetadata[className] = metadata;
-        std::cout << "  - Created metadata for class '" << className << "' with " 
-                  << metadata->numFields << " tracked fields" << std::endl;
+        classDecl->runtimeMetadata = metadata;  // Link back to AST
+        
+        std::cout << "  - Created metadata for class '" << className 
+                  << "' with " << allFields.size() << " fields, " 
+                  << classDecl->vtable.size() << " methods, " 
+                  << numParents << " parents" << std::endl;
     }
     
     // Second pass: resolve ClassDeclNode pointers to ClassMetadata pointers
     for (auto& [className, metadata] : classMetadata) {
         for (int i = 0; i < metadata->numFields; i++) {
             if (metadata->fields[i].type == DataType::OBJECT && metadata->fields[i].typeInfo) {
-                // typeInfo currently points to ClassDeclNode, resolve to ClassMetadata
                 ClassDeclNode* classDecl = static_cast<ClassDeclNode*>(metadata->fields[i].typeInfo);
                 auto it = classMetadata.find(classDecl->className);
                 if (it != classMetadata.end()) {
@@ -94,11 +222,15 @@ ClassMetadata* MetadataRegistry::getClassMetadata(const std::string& className) 
 
 // GoroutineGCState methods
 void GoroutineGCState::pushScope(void* scope) {
+    // Lock to prevent race with GC thread reading scopeStack
+    std::lock_guard<std::mutex> lock(scopeStackMutex);
     // Always push scopes - we need to track the current scope stack
     scopeStack.push_back(scope);
 }
 
 void GoroutineGCState::popScope() {
+    // Lock to prevent race with GC thread reading scopeStack
+    std::lock_guard<std::mutex> lock(scopeStackMutex);
     // Always pop scopes - we need to maintain accurate scope stack
     if (!scopeStack.empty()) {
         scopeStack.pop_back();
@@ -113,7 +245,7 @@ void GoroutineGCState::popScope() {
 
 // GarbageCollector implementation
 GarbageCollector::GarbageCollector() {
-    std::cout << "GarbageCollector initialized" << std::endl;
+    std::cout << "GarbageCollector initialized with signal-based checkpointing" << std::endl;
 }
 
 GarbageCollector::~GarbageCollector() {
@@ -229,6 +361,9 @@ std::vector<void*> GarbageCollector::collectAllRoots() {
     
     for (auto& goroutine : allGoroutines) {
         if (goroutine && goroutine->gcState) {
+            // Lock to prevent race with pushScope/popScope modifying scopeStack
+            std::lock_guard<std::mutex> lock(goroutine->gcState->scopeStackMutex);
+            
             size_t limitSize = gcMode.load() ? goroutine->gcState->gcPhase2StackSize 
                                              : goroutine->gcState->scopeStack.size();
             
@@ -341,75 +476,214 @@ void GarbageCollector::phase3_secondMarkSweep() {
     gcMode.store(false, std::memory_order_release);
     resetAllGoroutinesPhase2();
     
-    // Check each suspected dead object
-    std::vector<void*> resurrected;
-    std::vector<void*> trulyDead;
+    // STEP 1: Perform a full mark-sweep from roots to catch any new references
+    // that were created during phase 2 (even those that didn't trigger the write barrier)
+    std::cout << "  - Performing second mark-sweep from roots..." << std::endl;
+    markedObjects.clear();
+    markedScopes.clear();
+    
+    std::vector<void*> roots = collectAllRoots();
+    for (void* root : roots) {
+        if (root) {
+            markScope(root);
+        }
+    }
+    
+    // STEP 2: Remove any suspected dead objects/scopes that are now reachable from roots
+    std::vector<void*> stillSuspectedDead;
+    std::vector<void*> stillSuspectedDeadScopes;
     
     for (void* obj : suspectedDead) {
-        ObjectHeader* header = static_cast<ObjectHeader*>(obj);
-        
-        // Check if set_flag was set (meaning new reference was created)
-        if (header->flags.load(std::memory_order_acquire) & ObjectFlags::SET_FLAG) {
-            resurrected.push_back(obj);
+        if (markedObjects.find(obj) != markedObjects.end()) {
+            // Object was found to be reachable - it's alive!
+            // (descendants already marked recursively, so they're safe too)
         } else {
-            trulyDead.push_back(obj);
+            // Still not reachable from roots
+            stillSuspectedDead.push_back(obj);
         }
     }
-    
-    // Check each suspected dead scope
-    std::vector<void*> resurrectedScopes;
-    std::vector<void*> trulyDeadScopes;
     
     for (void* scope : suspectedDeadScopes) {
-        ScopeHeader* header = static_cast<ScopeHeader*>(scope);
-        
-        // Check if set_flag was set (meaning new reference was created)
-        if (header->flags.load(std::memory_order_acquire) & ScopeFlags::SET_FLAG) {
-            resurrectedScopes.push_back(scope);
+        if (markedScopes.find(scope) != markedScopes.end()) {
+            // Scope was found to be reachable - it's alive!
+            // (descendants already marked recursively, so they're safe too)
         } else {
-            trulyDeadScopes.push_back(scope);
+            // Still not reachable from roots
+            stillSuspectedDeadScopes.push_back(scope);
         }
     }
     
-    std::cout << "  - Objects - Resurrected: " << resurrected.size() << ", Truly dead: " << trulyDead.size() << std::endl;
-    std::cout << "  - Scopes - Resurrected: " << resurrectedScopes.size() << ", Truly dead: " << trulyDeadScopes.size() << std::endl;
+    int objectsSavedFromRoots = suspectedDead.size() - stillSuspectedDead.size();
+    int scopesSavedFromRoots = suspectedDeadScopes.size() - stillSuspectedDeadScopes.size();
     
-    // For resurrected objects and scopes, mark them and their descendants as live
-    markedObjects.clear();
-    markedScopes.clear();  // Also clear marked scopes to properly track resurrected scope references
-    for (void* obj : resurrected) {
-        markObject(obj);
-    }
-    for (void* scope : resurrectedScopes) {
-        markScope(scope);
+    std::cout << "  - Saved from roots: " << objectsSavedFromRoots << " objects, " 
+              << scopesSavedFromRoots << " scopes" << std::endl;
+    
+    // STEP 3: Iteratively check write barrier flags and mark resurrected items
+    // Loop until we reach a "quiet" state where no new set_flags are found
+    // This handles the case where resurrected objects create references to other
+    // suspected-dead objects during the resurrection process
+    
+    int iteration = 0;
+    bool foundNewResurrections = true;
+    
+    // Keep track of all items we've already resurrected across iterations
+    std::set<void*> allResurrectedObjects;
+    std::set<void*> allResurrectedScopes;
+    
+    while (foundNewResurrections) {
+        iteration++;
+        foundNewResurrections = false;
+        
+        std::cout << "  - Resurrection iteration " << iteration << std::endl;
+        
+        // Check flags on objects that haven't been resurrected yet
+        std::vector<void*> newlyResurrected;
+        for (void* obj : stillSuspectedDead) {
+            // Skip if already resurrected
+            if (allResurrectedObjects.find(obj) != allResurrectedObjects.end()) {
+                continue;
+            }
+            
+            ObjectHeader* header = static_cast<ObjectHeader*>(obj);
+            
+            // Check if set_flag was set (meaning new reference was created)
+            if (header->flags.load(std::memory_order_acquire) & ObjectFlags::SET_FLAG) {
+                newlyResurrected.push_back(obj);
+                allResurrectedObjects.insert(obj);
+                foundNewResurrections = true;
+            }
+        }
+        
+        // Check flags on scopes that haven't been resurrected yet
+        std::vector<void*> newlyResurrectedScopes;
+        for (void* scope : stillSuspectedDeadScopes) {
+            // Skip if already resurrected
+            if (allResurrectedScopes.find(scope) != allResurrectedScopes.end()) {
+                continue;
+            }
+            
+            ScopeHeader* header = static_cast<ScopeHeader*>(scope);
+            
+            // Check if set_flag was set (meaning new reference was created)
+            if (header->flags.load(std::memory_order_acquire) & ScopeFlags::SET_FLAG) {
+                newlyResurrectedScopes.push_back(scope);
+                allResurrectedScopes.insert(scope);
+                foundNewResurrections = true;
+            }
+        }
+        
+        if (newlyResurrected.empty() && newlyResurrectedScopes.empty()) {
+            std::cout << "    - No new resurrections found (quiet state reached)" << std::endl;
+            break;
+        }
+        
+        std::cout << "    - Found " << newlyResurrected.size() << " new resurrected objects, "
+                  << newlyResurrectedScopes.size() << " new resurrected scopes" << std::endl;
+        
+        // Mark all newly resurrected objects/scopes and their descendants
+        // This will also set flags on any suspected-dead items they reference
+        markedObjects.clear();
+        markedScopes.clear();
+        
+        for (void* obj : newlyResurrected) {
+            markObject(obj);
+        }
+        for (void* scope : newlyResurrectedScopes) {
+            markScope(scope);
+        }
+        
+        // The descendants are now marked - add them to the resurrected set
+        for (void* obj : stillSuspectedDead) {
+            if (markedObjects.find(obj) != markedObjects.end()) {
+                allResurrectedObjects.insert(obj);
+            }
+        }
+        for (void* scope : stillSuspectedDeadScopes) {
+            if (markedScopes.find(scope) != markedScopes.end()) {
+                allResurrectedScopes.insert(scope);
+            }
+        }
+        
+        // Small delay to allow any cascading write barriers to trigger
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     
-    // Filter out any descendants of resurrected objects from trulyDead
-    // (descendants were marked recursively but don't have SET_FLAG set themselves)
+    std::cout << "  - Resurrection loop complete after " << iteration << " iterations" << std::endl;
+    std::cout << "  - Total resurrected: " << allResurrectedObjects.size() << " objects, "
+              << allResurrectedScopes.size() << " scopes" << std::endl;
+    
+    // STEP 4: Final verification using signal-based memory fence
+    // This ensures all goroutines have completed any pending write barrier operations
+    // and all set_flag writes are globally visible
+    std::cout << "  - Performing final signal-based memory fence..." << std::endl;
+    ensureAllWriteBarriersComplete();
+    
+    // After the fence, do ONE final check for any late set_flags
+    std::cout << "  - Final post-fence check for late resurrections..." << std::endl;
+    int lateResurrections = 0;
+    
+    for (void* obj : stillSuspectedDead) {
+        if (allResurrectedObjects.find(obj) != allResurrectedObjects.end()) {
+            continue;
+        }
+        
+        ObjectHeader* header = static_cast<ObjectHeader*>(obj);
+        if (header->flags.load(std::memory_order_acquire) & ObjectFlags::SET_FLAG) {
+            allResurrectedObjects.insert(obj);
+            lateResurrections++;
+            
+            // Mark descendants too
+            markedObjects.clear();
+            markObject(obj);
+            for (void* descObj : stillSuspectedDead) {
+                if (markedObjects.find(descObj) != markedObjects.end()) {
+                    allResurrectedObjects.insert(descObj);
+                }
+            }
+        }
+    }
+    
+    for (void* scope : stillSuspectedDeadScopes) {
+        if (allResurrectedScopes.find(scope) != allResurrectedScopes.end()) {
+            continue;
+        }
+        
+        ScopeHeader* header = static_cast<ScopeHeader*>(scope);
+        if (header->flags.load(std::memory_order_acquire) & ScopeFlags::SET_FLAG) {
+            allResurrectedScopes.insert(scope);
+            lateResurrections++;
+            
+            // Mark descendants too
+            markedScopes.clear();
+            markScope(scope);
+            for (void* descScope : stillSuspectedDeadScopes) {
+                if (markedScopes.find(descScope) != markedScopes.end()) {
+                    allResurrectedScopes.insert(descScope);
+                }
+            }
+        }
+    }
+    
+    if (lateResurrections > 0) {
+        std::cout << "    - Caught " << lateResurrections << " late resurrections after fence!" << std::endl;
+    } else {
+        std::cout << "    - No late resurrections (fence verification passed)" << std::endl;
+    }
+    
+    // STEP 5: Build the final list of truly dead items (those not resurrected)
     objectsToFree.clear();
-    objectsToFree.reserve(trulyDead.size());  // Pre-allocate to avoid reallocations
-    for (void* obj : trulyDead) {
-        if (markedObjects.find(obj) == markedObjects.end()) {
-            // Object was not marked as a descendant of resurrected objects
+    for (void* obj : stillSuspectedDead) {
+        if (allResurrectedObjects.find(obj) == allResurrectedObjects.end()) {
             objectsToFree.push_back(obj);
         }
     }
     
-    // Filter out any descendants of resurrected scopes from trulyDeadScopes
     scopesToFree.clear();
-    scopesToFree.reserve(trulyDeadScopes.size());  // Pre-allocate to avoid reallocations
-    for (void* scope : trulyDeadScopes) {
-        if (markedScopes.find(scope) == markedScopes.end()) {
-            // Scope was not marked as a descendant of resurrected items
+    for (void* scope : stillSuspectedDeadScopes) {
+        if (allResurrectedScopes.find(scope) == allResurrectedScopes.end()) {
             scopesToFree.push_back(scope);
         }
-    }
-    
-    int objectDescendantsSaved = trulyDead.size() - objectsToFree.size();
-    int scopeDescendantsSaved = trulyDeadScopes.size() - scopesToFree.size();
-    if (objectDescendantsSaved > 0 || scopeDescendantsSaved > 0) {
-        std::cout << "  - Saved " << objectDescendantsSaved << " object descendants and " 
-                  << scopeDescendantsSaved << " scope descendants of resurrected items" << std::endl;
     }
     
     std::cout << "  - Final truly dead to free: " << objectsToFree.size() << " objects, " 
@@ -490,24 +764,53 @@ void GarbageCollector::traceObject(void* obj) {
         return;
     }
     
+    // NOTE: With the new design, method closures are in metadata and shared
+    // Instances only have POINTERS to these closures
+    // We don't need to trace metadata closures since they're static and don't contain
+    // per-instance data. The closure scope pointers would be filled at instantiation
+    // if methods captured external scopes (currently they don't).
+    
+    // Trace through closure pointers in the object
+    // Layout: [metadata*][flags][closure_ptr1]...[closure_ptrN][fields]
+    Closure** closurePtrs = header->getClosurePtrs();
+    
+    // For each method closure pointer, trace the scopes it captures
+    for (int i = 0; i < metadata->numMethods; i++) {
+        Closure* closure = closurePtrs[i];
+        if (!closure) continue;
+        
+        // Closure layout: [size(8)][func_addr(8)][scope_ptr1(8)][scope_ptr2(8)]...
+        int numScopes = (closure->size - 16) / 8;
+        
+        // Trace each scope pointer in the method closure
+        void** scopePtrs = closure->getScopePtrs();
+        for (int j = 0; j < numScopes; j++) {
+            void* scopePtr = scopePtrs[j];
+            if (scopePtr) {
+                markScope(scopePtr);
+            }
+        }
+    }
+    
     // Trace through object fields using metadata
-    uint8_t* fieldStart = header->getFieldsStart();
+    // Note: field offsets in metadata account for header + closure pointers
+    uint8_t* objectStart = reinterpret_cast<uint8_t*>(obj);
     
     for (int i = 0; i < metadata->numFields; i++) {
         const VarMetadata& field = metadata->fields[i];
         
         // Check if field is an object reference
         if (field.type == DataType::OBJECT) {
-            void* fieldObj = *reinterpret_cast<void**>(fieldStart + field.offset);
+            void* fieldObj = *reinterpret_cast<void**>(objectStart + field.offset);
             if (fieldObj) {
                 markObject(fieldObj);
             }
         }
         // Handle closure fields - trace the scope pointers inside the closure
         else if (field.type == DataType::CLOSURE) {
-            uint8_t* closurePtr = fieldStart + field.offset;
-            // Closure layout: [func_addr(8)][size(8)][scope_ptr1(8)][scope_ptr2(8)]...
-            uint64_t closureSize = *reinterpret_cast<uint64_t*>(closurePtr + 8);
+            uint8_t* closurePtr = objectStart + field.offset;
+            // Closure layout: [size(8)][func_addr(8)][scope_ptr1(8)][scope_ptr2(8)]...
+            uint64_t closureSize = *reinterpret_cast<uint64_t*>(closurePtr);
             int numScopes = (closureSize - 16) / 8;
             
             // Trace each scope pointer in the closure
@@ -584,6 +887,102 @@ void GarbageCollector::resetAllGoroutinesPhase2() {
     }
     
     std::cout << "  - Reset phase 2 for " << allGoroutines.size() << " goroutines" << std::endl;
+}
+
+void GarbageCollector::ensureAllWriteBarriersComplete() {
+    auto allGoroutines = EventLoop::getInstance().getAllGoroutines();
+    
+    if (allGoroutines.empty()) {
+        return; // No goroutines to fence
+    }
+    
+    std::cout << "  - Initiating signal-based memory fence for " << allGoroutines.size() 
+              << " goroutines..." << std::endl;
+    
+    // Step 1: Record current checkpoint values for each goroutine
+    std::vector<uint64_t> initialCheckpoints;
+    initialCheckpoints.reserve(allGoroutines.size());
+    
+    for (auto& g : allGoroutines) {
+        if (g && g->gcState) {
+            initialCheckpoints.push_back(
+                g->gcState->checkpointCounter.load(std::memory_order_acquire)
+            );
+        } else {
+            initialCheckpoints.push_back(0); // No gcState - will skip
+        }
+    }
+    
+    // Step 2: Send SIGUSR1 to all goroutine threads
+    // This interrupts each thread and forces it to execute the signal handler
+    // The signal handler creates a memory fence and increments checkpointCounter
+    for (auto& g : allGoroutines) {
+        if (g && g->gcState) {
+            int result = pthread_kill(g->gcState->threadId, SIGUSR1);
+            if (result != 0) {
+                std::cerr << "    - Warning: Failed to send signal to goroutine (error " 
+                         << result << ")" << std::endl;
+            }
+        }
+    }
+    
+    // Step 3: Wait for all goroutines to acknowledge by changing their counters
+    // We check if the value is DIFFERENT (not specifically +1) to handle wraparound
+    // Use a timeout to avoid hanging forever if a goroutine is stuck
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    bool allAcknowledged = false;
+    int checkCount = 0;
+    
+    while (!allAcknowledged && std::chrono::steady_clock::now() < deadline) {
+        allAcknowledged = true;
+        checkCount++;
+        
+        for (size_t i = 0; i < allGoroutines.size(); i++) {
+            auto& g = allGoroutines[i];
+            if (g && g->gcState) {
+                uint64_t current = g->gcState->checkpointCounter.load(
+                    std::memory_order_acquire
+                );
+                
+                // Check if counter has changed (signal handler ran)
+                // This handles wraparound correctly - we just care that it's different
+                if (current == initialCheckpoints[i]) {
+                    allAcknowledged = false;
+                    break; // Still waiting for this goroutine
+                }
+            }
+        }
+        
+        if (!allAcknowledged) {
+            // Brief sleep before checking again
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+    
+    if (allAcknowledged) {
+        std::cout << "    - All goroutines reached checkpoint (checked " << checkCount 
+                  << " times)" << std::endl;
+        std::cout << "    - Memory fence complete: all write barriers are globally visible" 
+                  << std::endl;
+    } else {
+        std::cerr << "    - Warning: Timeout waiting for goroutines to reach checkpoint" 
+                  << std::endl;
+        std::cerr << "    - Some goroutines may not have completed write barriers" 
+                  << std::endl;
+        
+        // Log which goroutines didn't respond
+        for (size_t i = 0; i < allGoroutines.size(); i++) {
+            auto& g = allGoroutines[i];
+            if (g && g->gcState) {
+                uint64_t current = g->gcState->checkpointCounter.load(
+                    std::memory_order_acquire
+                );
+                if (current == initialCheckpoints[i]) {
+                    std::cerr << "      - Goroutine " << i << " did not respond" << std::endl;
+                }
+            }
+        }
+    }
 }
 
 // Runtime functions

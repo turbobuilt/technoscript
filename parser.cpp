@@ -39,6 +39,8 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             else if (word == "let") result.emplace_back(TokenType::LET);
             else if (word == "class") result.emplace_back(TokenType::CLASS);
             else if (word == "new") result.emplace_back(TokenType::NEW);
+            else if (word == "this") result.emplace_back(TokenType::THIS);
+            else if (word == "extends") result.emplace_back(TokenType::EXTENDS);
             else result.emplace_back(TokenType::IDENTIFIER, word);
         }
         else if (std::isdigit(code[i])) {
@@ -256,7 +258,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
         else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN) {
             return parseFunctionCall();
         }
-        // Check for member access (obj.member or obj.member = value)
+        // Check for member access (obj.member or obj.member = value or obj.method())
         else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::DOT) {
             std::string objName = current().value;
             advance(); // consume identifier
@@ -265,8 +267,43 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
             std::string memberName = current().value;
             expect(TokenType::IDENTIFIER);
             
+            // Check if this is a method call (obj.method(...))
+            if (match(TokenType::LPAREN)) {
+                advance(); // consume (
+                
+                auto methodCall = std::make_unique<MethodCallNode>(memberName);
+                methodCall->object = std::make_unique<IdentifierNode>(objName);
+                
+                // Parse arguments
+                if (!match(TokenType::RPAREN)) {
+                    do {
+                        if (match(TokenType::LITERAL)) {
+                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value));
+                            advance();
+                        } else if (match(TokenType::IDENTIFIER)) {
+                            methodCall->args.push_back(std::make_unique<IdentifierNode>(current().value));
+                            advance();
+                        } else if (match(TokenType::THIS)) {
+                            methodCall->args.push_back(std::make_unique<ThisNode>());
+                            advance();
+                        } else {
+                            throw std::runtime_error("Expected argument in method call");
+                        }
+                        
+                        if (match(TokenType::COMMA)) {
+                            advance();
+                        } else {
+                            break;
+                        }
+                    } while (true);
+                }
+                
+                expect(TokenType::RPAREN);
+                expect(TokenType::SEMICOLON);
+                return methodCall;
+            }
             // Check if this is an assignment
-            if (match(TokenType::ASSIGN)) {
+            else if (match(TokenType::ASSIGN)) {
                 advance(); // consume =
                 
                 auto memberAssign = std::make_unique<MemberAssignNode>();
@@ -280,6 +317,9 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
                     advance();
                 } else if (match(TokenType::IDENTIFIER)) {
                     memberAssign->value = std::make_unique<IdentifierNode>(current().value);
+                    advance();
+                } else if (match(TokenType::THIS)) {
+                    memberAssign->value = std::make_unique<ThisNode>();
                     advance();
                 } else {
                     throw std::runtime_error("Expected value after assignment");
@@ -298,6 +338,25 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
             auto identifier = std::make_unique<IdentifierNode>(current().value);
             advance();
             return identifier;
+        }
+    }
+    // Handle 'this' keyword
+    else if (match(TokenType::THIS)) {
+        advance();
+        
+        // Check for 'this.member' access
+        if (match(TokenType::DOT)) {
+            advance(); // consume '.'
+            std::string memberName = current().value;
+            expect(TokenType::IDENTIFIER);
+            
+            // Create member access with 'this' as the object
+            auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+            memberAccess->object = std::make_unique<ThisNode>();
+            return memberAccess;
+        } else {
+            // Just 'this' by itself
+            return std::make_unique<ThisNode>();
         }
     }
     return nullptr;
@@ -627,6 +686,21 @@ std::unique_ptr<ASTNode> Parser::parsePrintStmt() {
         } else if (match(TokenType::LITERAL)) {
             print->children.push_back(std::make_unique<LiteralNode>(current().value));
             advance();
+        } else if (match(TokenType::THIS)) {
+            // Check for 'this.member' access
+            advance(); // consume 'this'
+            if (match(TokenType::DOT)) {
+                advance(); // consume '.'
+                std::string memberName = current().value;
+                expect(TokenType::IDENTIFIER);
+                
+                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+                memberAccess->object = std::make_unique<ThisNode>();
+                print->children.push_back(std::move(memberAccess));
+            } else {
+                // Just 'this' by itself
+                print->children.push_back(std::make_unique<ThisNode>());
+            }
         } else if (match(TokenType::IDENTIFIER)) {
             // Check for member access (obj.member)
             if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::DOT) {
@@ -793,51 +867,171 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
         throw std::runtime_error("Duplicate class definition: class '" + className + "' is already defined");
     }
     
-    expect(TokenType::LBRACE);
-    
     auto classDecl = std::make_unique<ClassDeclNode>(className);
     
-    // Parse field declarations
+    // Parse inheritance (optional): class Dog extends Animal, Mammal
+    if (match(TokenType::EXTENDS)) {
+        advance(); // consume 'extends'
+        
+        // Parse parent class names
+        do {
+            if (!match(TokenType::IDENTIFIER)) {
+                throw std::runtime_error("Expected parent class name after 'extends'");
+            }
+            std::string parentName = current().value;
+            classDecl->parentClassNames.push_back(parentName);
+            std::cout << "DEBUG parseClassDecl: Class '" << className << "' inherits from '" << parentName << "'" << std::endl;
+            advance();
+            
+            // Check for comma (more parents)
+            if (match(TokenType::COMMA)) {
+                advance();
+            } else {
+                break;
+            }
+        } while (true);
+    }
+    
+    expect(TokenType::LBRACE);
+    
+    // Parse class body (fields and methods)
     while (!match(TokenType::RBRACE) && current().type != TokenType::EOF_TOKEN) {
-        std::string fieldName = current().value;
-        expect(TokenType::IDENTIFIER);
-        expect(TokenType::COLON);
-        
-        DataType fieldType;
-        int fieldSize = 8; // default size
-        
-        if (match(TokenType::INT32_TYPE)) {
-            fieldType = DataType::INT32;
-            fieldSize = 4;
-            advance();
-        } else if (match(TokenType::INT64_TYPE)) {
-            fieldType = DataType::INT64;
-            fieldSize = 8;
-            advance();
+        // Check if this is a method (function keyword) or a field (identifier)
+        if (match(TokenType::FUNCTION)) {
+            // Parse method
+            advance(); // consume 'function'
+            
+            std::string methodName = current().value;
+            expect(TokenType::IDENTIFIER);
+            
+            std::cout << "DEBUG parseClassDecl: Parsing method '" << methodName << "' in class '" << className << "'" << std::endl;
+            
+            // Create a FunctionDeclNode for the method
+            auto method = std::make_unique<FunctionDeclNode>(methodName, currentLexicalScope);
+            method->depth = currentDepth + 1; // Methods are one level deeper than the class scope
+            method->isMethod = true;          // Mark this as a method
+            method->owningClass = classDecl.get(); // Set the owning class
+            
+            expect(TokenType::LPAREN);
+            
+            // Parse parameters
+            if (!match(TokenType::RPAREN)) {
+                do {
+                    std::string paramName = current().value;
+                    expect(TokenType::IDENTIFIER);
+                    expect(TokenType::COLON);
+                    
+                    DataType paramType;
+                    if (match(TokenType::INT32_TYPE)) {
+                        paramType = DataType::INT32;
+                        advance();
+                    } else if (match(TokenType::INT64_TYPE)) {
+                        paramType = DataType::INT64;
+                        advance();
+                    } else {
+                        throw std::runtime_error("Expected type for parameter in method");
+                    }
+                    
+                    method->params.push_back(paramName);
+                    
+                    // Add to paramsInfo (will be properly set up during analysis)
+                    VariableInfo paramInfo;
+                    paramInfo.type = paramType;
+                    paramInfo.name = paramName;
+                    paramInfo.size = (paramType == DataType::INT32) ? 4 : 8;
+                    method->paramsInfo.push_back(paramInfo);
+                    
+                    if (match(TokenType::COMMA)) {
+                        advance();
+                    } else {
+                        break;
+                    }
+                } while (true);
+            }
+            
+            expect(TokenType::RPAREN);
+            
+            // Optional return type
+            if (match(TokenType::COLON)) {
+                advance();
+                if (match(TokenType::INT32_TYPE) || match(TokenType::INT64_TYPE)) {
+                    advance(); // consume return type (we'll handle this properly later)
+                }
+            }
+            
+            // Parse method body
+            expect(TokenType::LBRACE);
+            
+            // Save current scope and set method as current scope
+            LexicalScopeNode* previousScope = currentLexicalScope;
+            LexicalScopeNode* previousFunctionScope = currentFunctionScope;
+            currentLexicalScope = method.get();
+            currentFunctionScope = method.get();
+            currentDepth++;
+            
+            // Parse statements in method body
+            while (!match(TokenType::RBRACE) && current().type != TokenType::EOF_TOKEN) {
+                auto stmt = parseStatement(method.get());
+                if (stmt) {
+                    method->children.push_back(std::move(stmt));
+                }
+            }
+            
+            expect(TokenType::RBRACE);
+            
+            // Restore previous scope
+            currentDepth--;
+            currentLexicalScope = previousScope;
+            currentFunctionScope = previousFunctionScope;
+            
+            std::cout << "DEBUG parseClassDecl: Finished parsing method '" << methodName << "'" << std::endl;
+            
+            // Add method to class
+            classDecl->methods[methodName] = std::move(method);
+            
         } else {
-            throw std::runtime_error("Expected type for field");
+            // Parse field
+            std::string fieldName = current().value;
+            expect(TokenType::IDENTIFIER);
+            expect(TokenType::COLON);
+            
+            DataType fieldType;
+            int fieldSize = 8; // default size
+            
+            if (match(TokenType::INT32_TYPE)) {
+                fieldType = DataType::INT32;
+                fieldSize = 4;
+                advance();
+            } else if (match(TokenType::INT64_TYPE)) {
+                fieldType = DataType::INT64;
+                fieldSize = 8;
+                advance();
+            } else {
+                throw std::runtime_error("Expected type for field");
+            }
+            
+            // Create VariableInfo for the field
+            VariableInfo fieldInfo;
+            fieldInfo.type = fieldType;
+            fieldInfo.name = fieldName;
+            fieldInfo.size = fieldSize;
+            fieldInfo.offset = 0; // Will be set during packing/layout
+            
+            classDecl->fields[fieldName] = fieldInfo;
+            expect(TokenType::SEMICOLON);
         }
-        
-        // Create VariableInfo for the field
-        VariableInfo fieldInfo;
-        fieldInfo.type = fieldType;
-        fieldInfo.name = fieldName;
-        fieldInfo.size = fieldSize;
-        fieldInfo.offset = 0; // Will be set during packing
-        
-        classDecl->fields[fieldName] = fieldInfo;
-        expect(TokenType::SEMICOLON);
     }
     
     expect(TokenType::RBRACE);
     
-    // Pack the class fields to calculate offsets and total size
-    classDecl->pack();
+    // Don't pack here - the analyzer will do it after resolving inheritance and building vtable
     
     // Register the class in the global registry
     classRegistry[className] = classDecl.get();
     
-    std::cout << "DEBUG parseClassDecl: Parsed class '" << className << "' with " << classDecl->fields.size() << " fields, total size: " << classDecl->totalSize << std::endl;
+    std::cout << "DEBUG parseClassDecl: Parsed class '" << className << "' with " 
+              << classDecl->fields.size() << " fields and " << classDecl->methods.size() 
+              << " methods" << std::endl;
     return classDecl;
 }
 
@@ -921,6 +1115,8 @@ std::string Parser::tokenTypeToString(TokenType type) {
         case TokenType::PLUS_PLUS: return "PLUS_PLUS (++)";
         case TokenType::CLASS: return "CLASS";
         case TokenType::NEW: return "NEW";
+        case TokenType::THIS: return "THIS";
+        case TokenType::EXTENDS: return "EXTENDS";
         case TokenType::EOF_TOKEN: return "EOF";
         default: return "UNKNOWN";
     }

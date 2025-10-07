@@ -27,8 +27,8 @@ Codegen::~Codegen() {
     // Function cleanup is handled by asmjit runtime
 }
 
-void Codegen::generateProgram(ASTNode& root) {
-    generatedFunction = generator.generateCode(&root);
+void Codegen::generateProgram(ASTNode& root, const std::map<std::string, ClassDeclNode*>& classRegistry) {
+    generatedFunction = generator.generateCode(&root, classRegistry);
 }
 
 void Codegen::run() {
@@ -61,7 +61,7 @@ CodeGenerator::~CodeGenerator() {
     cs_close(&capstoneHandle);
 }
 
-void* CodeGenerator::generateCode(ASTNode* root) {
+void* CodeGenerator::generateCode(ASTNode* root, const std::map<std::string, ClassDeclNode*>& classRegistry) {
     // Reset and initialize code holder
     code.reset();
     code.init(rt.environment(), rt.cpuFeatures());
@@ -71,7 +71,12 @@ void* CodeGenerator::generateCode(ASTNode* root) {
     
     std::cout << "=== Generated Assembly Code ===" << std::endl;
     
-    // Generate code for the program
+    // Generate code for all classes first (so method labels exist)
+    for (const auto& [className, classDecl] : classRegistry) {
+        generateClassDecl(classDecl);
+    }
+    
+    // Generate code for the program (main function and any top-level functions)
     generateProgram(root);
     
     std::cout << "Code size after program: " << code.codeSize() << std::endl;
@@ -95,6 +100,9 @@ void* CodeGenerator::generateCode(ASTNode* root) {
     }
     
     std::cout << "Successfully generated code, size: " << code.codeSize() << " bytes" << std::endl;
+    
+    // NOW patch the metadata closures with actual function addresses
+    patchMetadataClosures(executableFunc, classRegistry);
     
     // Get the code size for disassembly
     size_t codeSize = code.codeSize();
@@ -153,6 +161,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::FUNCTION_CALL:
             generateFunctionCall(static_cast<FunctionCallNode*>(node));
             break;
+        case AstNodeType::METHOD_CALL:
+            generateFunctionCall(static_cast<MethodCallNode*>(node));
+            break;
         case AstNodeType::GO_STMT:
             generateGoStmt(static_cast<GoStmtNode*>(node));
             break;
@@ -164,6 +175,9 @@ void CodeGenerator::visitNode(ASTNode* node) {
             break;
         case AstNodeType::MEMBER_ASSIGN:
             generateMemberAssign(static_cast<MemberAssignNode*>(node));
+            break;
+        case AstNodeType::CLASS_DECL:
+            generateClassDecl(static_cast<ClassDeclNode*>(node));
             break;
         default:
             // For other nodes, just visit children
@@ -325,7 +339,7 @@ void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
     storeVariableInScope(varDecl->varName, x86::rax, currentScope, value);
 }
 
-void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
+void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourceScopeReg) {
     if (!valueNode) return;
     
     std::cout << "DEBUG loadValue: node type = " << static_cast<int>(valueNode->type) << std::endl;
@@ -338,8 +352,8 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
             break;
         }
         case AstNodeType::IDENTIFIER: {
-            // Load variable from scope
-            loadVariableFromScope(static_cast<IdentifierNode*>(valueNode), destReg);
+            // Load variable from scope (using provided source scope register)
+            loadVariableFromScope(static_cast<IdentifierNode*>(valueNode), destReg, 0, sourceScopeReg);
             break;
         }
         case AstNodeType::FUNCTION_CALL: {
@@ -371,6 +385,28 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg) {
             generateMemberAccess(static_cast<MemberAccessNode*>(valueNode), destReg);
             break;
         }
+        case AstNodeType::THIS_EXPR: {
+            // Handle 'this' expression - load from first parameter
+            // 'this' is always the first parameter in a method
+            // It's stored in the scope like any other variable
+            auto thisNode = static_cast<ThisNode*>(valueNode);
+            
+            // Create a temporary identifier node to load 'this' variable
+            IdentifierNode tempIdentifier("this");
+            tempIdentifier.varRef = nullptr;
+            tempIdentifier.accessedIn = currentScope;
+            
+            // Find 'this' in the current scope
+            auto it = currentScope->variables.find("this");
+            if (it == currentScope->variables.end()) {
+                throw std::runtime_error("'this' not found in method scope");
+            }
+            tempIdentifier.varRef = &it->second;
+            
+            // Load 'this' from scope (using provided source scope register)
+            loadVariableFromScope(&tempIdentifier, destReg, 0, sourceScopeReg);
+            break;
+        }
         default:
             std::cout << "DEBUG loadValue: Unsupported node type " << static_cast<int>(valueNode->type) << std::endl;
             throw std::runtime_error("Unsupported value node type in loadValue");
@@ -395,9 +431,9 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
         // Inline GC write barrier - check needs_set_flag and atomically set set_flag if needed
         // This is much faster than a function call
         
-        // Load flags from object header (at offset 0)
-        // flags is at [valueReg + 0]
-        cb->mov(x86::rcx, x86::qword_ptr(valueReg, 0));  // Load flags
+        // Load flags from object header (at offset 8)
+        // flags is at [valueReg + 8]
+        cb->mov(x86::rcx, x86::qword_ptr(valueReg, ObjectLayout::FLAGS_OFFSET));  // Load flags
         
         // Test if NEEDS_SET_FLAG (bit 0) is set
         cb->test(x86::rcx, ObjectFlags::NEEDS_SET_FLAG);
@@ -408,7 +444,7 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
         
         // NEEDS_SET_FLAG is set, so OR the SET_FLAG bit (no LOCK needed - idempotent)
         // Using non-locked OR is safe because we're only setting a bit to 1
-        cb->or_(x86::qword_ptr(valueReg, 0), ObjectFlags::SET_FLAG);
+        cb->or_(x86::qword_ptr(valueReg, ObjectLayout::FLAGS_OFFSET), ObjectFlags::SET_FLAG);
         
         // Memory fence to ensure write visibility to GC thread
         // This guarantees the set_flag write is visible before GC reads it in phase 3
@@ -473,7 +509,7 @@ x86::Gp CodeGenerator::getParameterByIndex(int paramIndex) {
     }
 }
 
-void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable) {
+void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable, x86::Gp sourceScopeReg) {
     if (!identifier->varRef) {
         throw std::runtime_error("Variable reference not analyzed: " + identifier->value);
     }
@@ -482,21 +518,21 @@ void CodeGenerator::loadVariableFromScope(IdentifierNode* identifier, x86::Gp de
     auto access = identifier->getVariableAccess();
     
     if (access.inCurrentScope) {
-        // Variable is in current scope (r15)
+        // Variable is in current scope (use provided source scope register)
         std::cout << "Loading variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
-        cb->mov(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
+        cb->mov(destReg, x86::ptr(sourceScopeReg, access.offset + offsetInVariable));
     } else {
         // Variable is in a parent scope - load the parent scope pointer from our lexical scope first
         std::cout << "Loading variable '" << identifier->value << "' from parent scope parameter index " << access.scopeParameterIndex << " at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         
         // Load parent scope pointer from our lexical scope into a temporary register
-        loadParameterIntoRegister(access.scopeParameterIndex, x86::rax);
+        loadParameterIntoRegister(access.scopeParameterIndex, x86::rax, sourceScopeReg);
         // Now load the variable from that parent scope
         cb->mov(destReg, x86::ptr(x86::rax, access.offset + offsetInVariable));
     }
 }
 
-void CodeGenerator::loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable) {
+void CodeGenerator::loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable, x86::Gp sourceScopeReg) {
     if (!identifier->varRef) {
         throw std::runtime_error("Variable reference not analyzed: " + identifier->value);
     }
@@ -505,15 +541,15 @@ void CodeGenerator::loadVariableAddress(IdentifierNode* identifier, x86::Gp dest
     auto access = identifier->getVariableAccess();
     
     if (access.inCurrentScope) {
-        // Variable is in current scope (r15) - load address using LEA
+        // Variable is in current scope - load address using LEA (use provided source scope register)
         std::cout << "Loading address of variable '" << identifier->value << "' from current scope at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
-        cb->lea(destReg, x86::ptr(x86::r15, access.offset + offsetInVariable));
+        cb->lea(destReg, x86::ptr(sourceScopeReg, access.offset + offsetInVariable));
     } else {
         // Variable is in a parent scope - load the parent scope pointer from our lexical scope first
         std::cout << "Loading address of variable '" << identifier->value << "' from parent scope parameter index " << access.scopeParameterIndex << " at offset " << access.offset << " with additional offset " << offsetInVariable << std::endl;
         
         // Load parent scope pointer from our lexical scope into a temporary register
-        loadParameterIntoRegister(access.scopeParameterIndex, x86::rax);
+        loadParameterIntoRegister(access.scopeParameterIndex, x86::rax, sourceScopeReg);
         // Now load the address from that parent scope
         cb->lea(destReg, x86::ptr(x86::rax, access.offset + offsetInVariable));
     }
@@ -553,6 +589,57 @@ void CodeGenerator::printInt64(IdentifierNode* identifier) {
     cb->call(x86::rax);
 }
 
+void CodeGenerator::patchMetadataClosures(void* codeBase, const std::map<std::string, ClassDeclNode*>& classRegistry) {
+    std::cout << "\n=== Patching Metadata Closures ===" << std::endl;
+    
+    // Iterate through all classes and patch their method closures
+    for (const auto& [className, classDecl] : classRegistry) {
+        ClassMetadata* metadata = MetadataRegistry::getInstance().getClassMetadata(className);
+        if (!metadata) {
+            std::cout << "WARNING: No metadata found for class " << className << std::endl;
+            continue;
+        }
+        
+        std::cout << "Patching " << metadata->numMethods << " methods for class " << className << std::endl;
+        
+        // Patch each method closure
+        for (size_t i = 0; i < classDecl->vtable.size(); i++) {
+            const auto& vtEntry = classDecl->vtable[i];
+            FunctionDeclNode* method = vtEntry.method;
+            
+            if (!method || !method->asmjitLabel) {
+                std::cout << "WARNING: No label for method " << vtEntry.methodName << std::endl;
+                continue;
+            }
+            
+            // Get the label and resolve its offset
+            Label* label = static_cast<Label*>(method->asmjitLabel);
+            uint32_t labelId = label->id();
+            
+            if (labelId == Globals::kInvalidId) {
+                throw std::runtime_error("Invalid label ID for method: " + vtEntry.methodName);
+            }
+            
+            LabelEntry* labelEntry = code.labelEntry(labelId);
+            if (!labelEntry) {
+                throw std::runtime_error("Label entry not found for method: " + vtEntry.methodName);
+            }
+            
+            size_t labelOffset = labelEntry->offset();
+            void* funcAddr = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(codeBase) + labelOffset);
+            
+            // Patch the closure in metadata
+            Closure* closure = metadata->methodClosures[i];
+            closure->funcAddr = funcAddr;
+            
+            std::cout << "  Patched " << className << "::" << vtEntry.methodName 
+                      << " -> " << funcAddr << " (offset: 0x" << std::hex << labelOffset << std::dec << ")" << std::endl;
+        }
+    }
+    
+    std::cout << "=== Patching Complete ===" << std::endl;
+}
+
 void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
     cs_insn* insn;
     size_t count = cs_disasm(capstoneHandle, 
@@ -578,7 +665,13 @@ void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
 }
 
 void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
-    std::cout << "Generating function: " << funcDecl->funcName << std::endl;
+    if (funcDecl->isMethod) {
+        std::cout << "Generating method: " << funcDecl->funcName 
+                  << " (class: " << (funcDecl->owningClass ? funcDecl->owningClass->className : "unknown") 
+                  << ", params including 'this': " << funcDecl->paramsInfo.size() << ")" << std::endl;
+    } else {
+        std::cout << "Generating function: " << funcDecl->funcName << std::endl;
+    }
     
     Label* funcLabel;
     // The label should already exist from hoisting phase
@@ -648,20 +741,27 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     cb->push(x86::rbp);
     cb->mov(x86::rbp, x86::rsp);
     
-    // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
-    x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
-    const int maxRegParams = 6;
-    
-    // Save register parameters on stack before calling malloc (which clobbers them)
-    int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
-    for (int i = 0; i < regParamCount; i++) {
-        cb->push(paramRegs[i]);
+    // Special case: main function needs to allocate its own scope since it's not called via our convention
+    if (funcDecl->funcName == "main") {
+        std::cout << "Main function - allocating scope in prologue" << std::endl;
+        
+        // Initialize r14 and r15 to nullptr for main (no parent scope)
+        cb->xor_(x86::r14, x86::r14);
+        cb->xor_(x86::r15, x86::r15);
+        
+        // Allocate scope for main
+        allocateScope(funcDecl);
+        
+        // Main has no parameters, so nothing to copy
+        std::cout << "Main scope allocated" << std::endl;
+    } else {
+        // NOTE: For regular functions, scope allocation and parameter copying now happens at the call site!
+        // The function receives r15 already pointing to an allocated scope with parameters populated.
+        // r14 points to the parent scope.
+        // We don't need to save any registers or copy parameters here.
+        
+        std::cout << "Function prologue complete - scope already allocated by caller" << std::endl;
     }
-    
-    // Use generic scope prologue to allocate scope and copy ALL parameters (regular + hidden)
-    generateScopePrologue(funcDecl);
-    
-    // All parameters are now copied - no additional copying needed here
 }
 
 void CodeGenerator::generateFunctionEpilogue(FunctionDeclNode* funcDecl) {
@@ -749,100 +849,47 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
 void CodeGenerator::generateScopePrologue(LexicalScopeNode* scope) {
     std::cout << "Generating scope prologue for scope at depth: " << scope->depth << std::endl;
     
+    // Check if this is a function scope - functions are now handled at call site!
+    if (dynamic_cast<FunctionDeclNode*>(scope)) {
+        throw std::runtime_error("Function scopes should not use generateScopePrologue - scope allocated at call site!");
+    }
+    
+    // This is a block scope - allocate and set up as before
     // Allocate the new scope (this will set r15 to point to the new scope)
     allocateScope(scope);
     
-    // Copy "hidden parameters" (parent scope addresses) to the new scope
-    // For functions, these come from actual parameters passed to the function
-    // For blocks, these come from the current lexical environment
+    // Copy needed parent scope addresses from current lexical environment
+    std::cout << "Setting up block scope with access to " << scope->allNeeded.size() << " parent scopes" << std::endl;
     
-    if (auto funcDecl = dynamic_cast<FunctionDeclNode*>(scope)) {
-        // This is a function scope - copy ALL parameters (regular + hidden) from function arguments
-        size_t totalParams = funcDecl->paramsInfo.size() + funcDecl->hiddenParamsInfo.size();
-        std::cout << "Copying " << totalParams << " total parameters (" << funcDecl->paramsInfo.size() << " regular + " << funcDecl->hiddenParamsInfo.size() << " hidden) to function scope" << std::endl;
-        
-        // System V ABI parameter registers: rdi, rsi, rdx, rcx, r8, r9, then stack
-        x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
-        const int maxRegParams = 6;
-        
-        // First copy regular parameters
-        for (size_t i = 0; i < funcDecl->paramsInfo.size(); i++) {
-            const VariableInfo& param = funcDecl->paramsInfo[i];
-            int offset = param.offset;
-            
-            std::cout << "  Regular parameter " << i << " (" << param.name << ") -> scope[" << offset << "]" << std::endl;
-            
-            if (i < maxRegParams) {
-                // Regular parameter is in register (but was pushed on stack before malloc)
-                // We need to get it from the saved stack location
-                // Stack layout after pushes: [saved_reg_params...][return_addr][saved_rbp][saved_r15][original_stack_params...]
-                int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
-                // The parameters were pushed in order, so param i is at position (regParamCount - 1 - i)
-                int stackPos = regParamCount - 1 - i;
-                int stackOffset = 24 + (stackPos * 8); // 24 = return(8) + rbp(8) + r15(8)
-                cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-                cb->mov(x86::ptr(x86::r15, offset), x86::rax);
-            } else {
-                // Regular parameter is on original stack
-                int regParamCount = std::min((int)funcDecl->paramsInfo.size(), maxRegParams);
-                int originalStackOffset = 24 + (regParamCount * 8) + (i - maxRegParams) * 8;
-                cb->mov(x86::rax, x86::ptr(x86::rbp, originalStackOffset));
-                cb->mov(x86::ptr(x86::r15, offset), x86::rax);
-            }
+    // For each needed parent scope depth, we need to find where to get the scope address from
+    int scopeIndex = 0;
+    for (const auto& neededDepth : scope->allNeeded) {
+        // Calculate offset in the new scope where this parent scope address should be stored
+        auto it = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
+        if (it == scope->scopeDepthToParentParameterIndexMap.end()) {
+            throw std::runtime_error("Needed parent scope not found in parameter mapping: " + std::to_string(neededDepth));
         }
         
-        // Then copy hidden parameters
-        for (size_t i = 0; i < funcDecl->hiddenParamsInfo.size(); i++) {
-            const ParameterInfo& hiddenParam = funcDecl->hiddenParamsInfo[i];
-            size_t paramIndex = funcDecl->paramsInfo.size() + i; // Hidden params come after regular params
-            int offset = hiddenParam.offset;
-            
-            std::cout << "  Hidden parameter " << i << " (depth " << hiddenParam.depth << ") -> scope[" << offset << "]" << std::endl;
-            
-            if (paramIndex < maxRegParams) {
-                // Hidden parameter is in register - get from original register (not saved on stack)
-                cb->mov(x86::ptr(x86::r15, offset), paramRegs[paramIndex]);
-            } else {
-                // Hidden parameter is on original stack
-                int stackOffset = 24 + (paramIndex - maxRegParams) * 8;
-                cb->mov(x86::rax, x86::ptr(x86::rbp, stackOffset));
-                cb->mov(x86::ptr(x86::r15, offset), x86::rax);
-            }
-        }
-    } else {
-        // This is a block scope - copy needed parent scope addresses from current lexical environment
-        std::cout << "Setting up block scope with access to " << scope->allNeeded.size() << " parent scopes" << std::endl;
+        int paramIndex = it->second;
+        // For blocks, we use a simple offset calculation since we don't have real parameters
+        // Start at offset 8 to skip the flags field
+        int offset = 8 + (scopeIndex * 8);
         
-        // For each needed parent scope depth, we need to find where to get the scope address from
-        int scopeIndex = 0;
-        for (const auto& neededDepth : scope->allNeeded) {
-            // Calculate offset in the new scope where this parent scope address should be stored
-            auto it = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
-            if (it == scope->scopeDepthToParentParameterIndexMap.end()) {
-                throw std::runtime_error("Needed parent scope not found in parameter mapping: " + std::to_string(neededDepth));
-            }
-            
-            int paramIndex = it->second;
-            // For blocks, we use a simple offset calculation since we don't have real parameters
-            // Start at offset 8 to skip the flags field
-            int offset = 8 + (scopeIndex * 8);
-            
-            std::cout << "  Parent scope at depth " << neededDepth << " -> block scope[" << offset << "]" << std::endl;
+        std::cout << "  Parent scope at depth " << neededDepth << " -> block scope[" << offset << "]" << std::endl;
 
-            std::cout << "    (paramIndex = " << paramIndex << ")" << std::endl;
-            
-            if (paramIndex == -1) {
-                // Parent scope is current r14 (saved parent scope)
-                cb->mov(x86::ptr(x86::r15, offset), x86::r14);
-            } else {
-                // Parent scope is stored in the current scope as a hidden parameter
-                // Load it from the parent scope (r14) using proper parameter loading
-                loadParameterIntoRegister(paramIndex, x86::rax, x86::r14);
-                cb->mov(x86::ptr(x86::r15, offset), x86::rax); // Store in new scope
-            }
-            
-            scopeIndex++;
+        std::cout << "    (paramIndex = " << paramIndex << ")" << std::endl;
+        
+        if (paramIndex == -1) {
+            // Parent scope is current r14 (saved parent scope)
+            cb->mov(x86::ptr(x86::r15, offset), x86::r14);
+        } else {
+            // Parent scope is stored in the current scope as a hidden parameter
+            // Load it from the parent scope (r14) using proper parameter loading
+            loadParameterIntoRegister(paramIndex, x86::rax, x86::r14);
+            cb->mov(x86::ptr(x86::r15, offset), x86::rax); // Store in new scope
         }
+        
+        scopeIndex++;
     }
 }
 
@@ -891,111 +938,124 @@ void CodeGenerator::generateBlockStmt(BlockStmtNode* blockStmt) {
 void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     std::cout << "Generating function call: " << funcCall->value << std::endl;
     
-    // System V ABI: rdi, rsi, rdx, rcx, r8, r9, then stack
-    x86::Gp paramRegs[] = {x86::rdi, x86::rsi, x86::rdx, x86::rcx, x86::r8, x86::r9};
-    const int maxRegParams = 6;
+    // Check if this is actually a method call
+    MethodCallNode* methodCall = dynamic_cast<MethodCallNode*>(funcCall);
+    bool isMethodCall = (methodCall != nullptr);
     
-    // Calculate total parameters (regular + hidden)
-    size_t regularArgCount = funcCall->args.size();
-    size_t hiddenParamCount = funcCall->varRef->funcNode->allNeeded.size();
-    size_t totalParamCount = regularArgCount + hiddenParamCount;
-    
-    std::cout << "Passing " << regularArgCount << " regular arguments and " << hiddenParamCount << " hidden parameters" << std::endl;
-    
-    // Count total stack parameters for alignment
-    int totalStackParams = 0;
-    if (totalParamCount > maxRegParams) {
-        totalStackParams = totalParamCount - maxRegParams;
+    if (isMethodCall) {
+        std::cout << "  -> This is a method call on object" << std::endl;
     }
     
-    // Ensure stack is 16-byte aligned before call (stack params are 8 bytes each)
-    if (totalStackParams % 2 == 1) {
-        cb->sub(x86::rsp, 8); // Add padding for alignment
-    }
-
-    // Load regular arguments into available registers
-    for (size_t i = 0; i < regularArgCount && i < maxRegParams; i++) {
-        ASTNode* arg = funcCall->args[i].get();
-        
-        std::cout << "  Regular arg " << i << " -> register " << i << std::endl;
-        
-        if (arg->type == AstNodeType::IDENTIFIER) {
-            loadVariableFromScope(static_cast<IdentifierNode*>(arg), paramRegs[i]);
-        } else {
-            loadValue(arg, paramRegs[i]);
-        }
-    }
-
-    // Load the closure address for accessing hidden parameters
-    loadVariableAddress(static_cast<IdentifierNode*>(funcCall), x86::rbx);
+    // Get target function information
+    FunctionDeclNode* targetFunc;
     
-    // Load hidden parameters into remaining available registers
-    for (size_t i = 0; i < hiddenParamCount; i++) {
-        size_t paramIndex = regularArgCount + i;
+    if (isMethodCall) {
+        targetFunc = methodCall->resolvedMethod;
+    } else {
+        targetFunc = funcCall->varRef->funcNode;
+    }
+    
+    if (!targetFunc) {
+        throw std::runtime_error("Cannot resolve target function for call: " + funcCall->value);
+    }
+    
+    std::cout << "Target function has " << targetFunc->paramsInfo.size() << " regular params and " 
+              << targetFunc->hiddenParamsInfo.size() << " hidden params" << std::endl;
+    
+    // Allocate scope for the callee
+    // This will:
+    // - Push r14 (save grandparent scope)
+    // - Set r14 = r15 (current scope becomes parent of new scope)
+    // - Allocate new scope memory
+    // - Set r15 = new scope
+    allocateScope(targetFunc);
+    
+    // Now r15 points to the new (child) scope, r14 points to caller's scope
+    // We need to copy parameters from r14 (caller scope) to r15 (child scope)
+    
+    // Copy regular parameters into the child scope
+    if (isMethodCall) {
+        // First parameter is "this"
+        const VariableInfo& thisParam = targetFunc->paramsInfo[0];
+        std::cout << "  Copying 'this' to scope[" << thisParam.offset << "]" << std::endl;
+        loadValue(methodCall->object.get(), x86::rax, x86::r14);
+        cb->mov(x86::ptr(x86::r15, thisParam.offset), x86::rax);
         
-        if (paramIndex < maxRegParams) {
-            // Hidden parameter fits in register
-            int closureOffset = 16 + (i * 8); // function_address (8) + size (8) + scope_pointers
-            std::cout << "  Hidden param " << i << " (depth " << funcCall->varRef->funcNode->allNeeded[i] << ") -> register " << paramIndex << std::endl;
+        // Then copy explicit method arguments
+        for (size_t i = 0; i < methodCall->args.size(); i++) {
+            const VariableInfo& param = targetFunc->paramsInfo[i + 1];
+            ASTNode* arg = methodCall->args[i].get();
             
-            // Load the scope pointer from closure: [rbx + closureOffset]
-            cb->mov(paramRegs[paramIndex], x86::ptr(x86::rbx, closureOffset));
-        }
-    }
-    
-    // Push stack parameters in reverse order (right to left)
-    // First push hidden stack parameters in reverse order
-    for (int i = hiddenParamCount - 1; i >= 0; i--) {
-        size_t paramIndex = regularArgCount + i;
-        
-        if (paramIndex >= maxRegParams) {
-            // Hidden parameter goes on stack
-            int closureOffset = 16 + (i * 8); // function_address (8) + size (8) + scope_pointers
-            std::cout << "  Hidden param " << i << " (depth " << funcCall->varRef->funcNode->allNeeded[i] << ") -> stack" << std::endl;
+            std::cout << "  Copying method arg " << (i + 1) << " to scope[" << param.offset << "]" << std::endl;
             
-            // Load the scope pointer from closure and push it
-            cb->mov(x86::rax, x86::ptr(x86::rbx, closureOffset));
-            cb->push(x86::rax);
+            if (arg->type == AstNodeType::IDENTIFIER) {
+                // Load from caller's scope (r14) 
+                loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax, 0, x86::r14);
+            } else {
+                loadValue(arg, x86::rax, x86::r14);
+            }
+            cb->mov(x86::ptr(x86::r15, param.offset), x86::rax);
+        }
+    } else {
+        // Regular function call - copy all arguments
+        for (size_t i = 0; i < funcCall->args.size(); i++) {
+            const VariableInfo& param = targetFunc->paramsInfo[i];
+            ASTNode* arg = funcCall->args[i].get();
+            
+            std::cout << "  Copying regular arg " << i << " (" << param.name << ") to scope[" << param.offset << "]" << std::endl;
+            
+            if (arg->type == AstNodeType::IDENTIFIER) {
+                // Load from caller's scope (r14)
+                loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax, 0, x86::r14);
+            } else {
+                loadValue(arg, x86::rax, x86::r14);
+            }
+            cb->mov(x86::ptr(x86::r15, param.offset), x86::rax);
         }
     }
     
-    // Then push regular stack parameters in reverse order
-    for (int i = regularArgCount - 1; i >= maxRegParams; i--) {
-        ASTNode* arg = funcCall->args[i].get();
-        
-        if (arg->type == AstNodeType::IDENTIFIER) {
-            loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax);
-        } else {
-            loadValue(arg, x86::rax);
-        }
-        
-        cb->push(x86::rax);
-        std::cout << "  Regular stack arg " << (i - maxRegParams) << ": pushed" << std::endl;
+    // Load the closure address for accessing hidden parameters (parent scope pointers)
+    // For method calls, load from object; for regular calls, load from variable
+    if (isMethodCall) {
+        // Load object pointer into rbx
+        loadValue(methodCall->object.get(), x86::rbx, x86::r14);
+        // Add offset to get to the method closure in the object
+        int closureOffset = ObjectLayout::HEADER_SIZE + methodCall->methodClosureOffset;
+        std::cout << "  Loading method closure from object at offset " << closureOffset << std::endl;
+        cb->add(x86::rbx, closureOffset);
+    } else {
+        // Load closure address from caller's scope (r14)
+        loadVariableAddress(static_cast<IdentifierNode*>(funcCall), x86::rbx, 0, x86::r14);
     }
-
     
-    // Save current r15 before function call
-    cb->push(x86::r15);
+    // Copy hidden parameters (parent scope pointers) from closure into child scope
+    for (size_t i = 0; i < targetFunc->hiddenParamsInfo.size(); i++) {
+        const ParameterInfo& hiddenParam = targetFunc->hiddenParamsInfo[i];
+        int closureOffset = 16 + (i * 8); // function_address (8) + size (8) + scope_pointers
+        
+        std::cout << "  Copying hidden param " << i << " (depth " << hiddenParam.depth 
+                  << ") to scope[" << hiddenParam.offset << "]" << std::endl;
+        
+        // Load the scope pointer from closure and store in child scope
+        cb->mov(x86::rax, x86::ptr(x86::rbx, closureOffset));
+        cb->mov(x86::ptr(x86::r15, hiddenParam.offset), x86::rax);
+    }
     
-    // Load the function address from closure using loadVariableFromScope
-    loadVariableFromScope(static_cast<IdentifierNode*>(funcCall), x86::rax);
+    // Load the function address from closure
+    // For both method and regular calls, rbx points to the closure
+    cb->mov(x86::rax, x86::ptr(x86::rbx, 0)); // Load function address from closure
     
-    // Indirect call through function address loaded from closure
+    // Make the call - r15 already points to the pre-allocated and populated scope
+    // The callee will use this scope directly
     cb->call(x86::rax);
     
-    // Restore r15 after function call
-    cb->pop(x86::r15);
+    // After call returns, the callee's epilogue has already:
+    // - Freed its scope (called gc_pop_scope)
+    // - Done: mov r15, r14 (restored parent scope, which is our scope)
+    // - Done: pop r14 (restored grandparent scope pointer)
+    // So now r15 points back to our scope and r14 is restored
     
-    // Clean up stack parameters (if any)
-    int totalStackBytes = totalStackParams * 8;
-    if (totalStackParams % 2 == 1) {
-        totalStackBytes += 8; // Include alignment padding
-    }
-    
-    if (totalStackBytes > 0) {
-        cb->add(x86::rsp, totalStackBytes);
-        std::cout << "Cleaned up " << totalStackBytes << " bytes from stack" << std::endl;
-    }
+    std::cout << "Function call complete" << std::endl;
 }
 
 void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
@@ -1207,11 +1267,16 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     
     ClassDeclNode* classDecl = newExpr->classRef;
     
-    // Calculate total object size using header constants
-    int totalObjectSize = ObjectLayout::HEADER_SIZE + classDecl->totalSize;
+    // Calculate total object size: header + closure pointers (8 bytes each) + fields
+    // NOTE: Instances have POINTERS to closures, not embedded closures
+    int numMethods = classDecl->vtable.size();
+    int closurePointersSize = numMethods * 8; // 8 bytes per pointer
+    int totalObjectSize = ObjectLayout::HEADER_SIZE + closurePointersSize + classDecl->totalSize;
     
     std::cout << "DEBUG generateNewExpr: Allocating object of size " << totalObjectSize 
-              << " (header=" << ObjectLayout::HEADER_SIZE << ", fields=" << classDecl->totalSize << ")" << std::endl;
+              << " (header=" << ObjectLayout::HEADER_SIZE 
+              << ", closure pointers=" << closurePointersSize << " (" << numMethods << " methods)"
+              << ", fields=" << classDecl->totalSize << ")" << std::endl;
     
     // Call calloc to allocate and zero-initialize object
     // mov rdi, 1 (number of elements)
@@ -1227,26 +1292,44 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     // Object pointer is now in rax
     // We need to initialize the object header
     
-    // Store flags at offset 0 (currently 0, zero-initialized by calloc)
-    // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET), 0);  // Not needed, calloc already zeroed
-    
-    // Get class metadata from registry and store at offset 8
+    // Get class metadata from registry and store at offset 0
     ClassMetadata* metadata = MetadataRegistry::getInstance().getClassMetadata(classDecl->className);
     if (!metadata) {
         throw std::runtime_error("Class metadata not found for: " + classDecl->className);
     }
     uint64_t metadataAddr = reinterpret_cast<uint64_t>(metadata);
     cb->mov(x86::r10, metadataAddr);
-    cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::CLASS_REF_OFFSET), x86::r10);
+    cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::METADATA_OFFSET), x86::r10);
     
-    // Store dynamic vars map placeholder at offset 16 (0 for now)
-    // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::DYNAMIC_VARS_OFFSET), 0);  // Not needed, calloc already zeroed
+    // Store flags at offset 8 (currently 0, zero-initialized by calloc)
+    // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET), 0);  // Not needed, calloc already zeroed
     
-    // The object data starts at ObjectLayout::FIELDS_OFFSET
-    // Fields are already zero-initialized by calloc
+    // Initialize closure pointers in the object
+    // Each closure pointer at [object + 16 + i*8] points to the closure in metadata
+    for (size_t i = 0; i < classDecl->vtable.size(); i++) {
+        const auto& vtEntry = classDecl->vtable[i];
+        int closurePtrOffset = ObjectLayout::HEADER_SIZE + (i * 8);
+        
+        std::cout << "DEBUG generateNewExpr: Setting closure pointer " << i 
+                  << " ('" << vtEntry.methodName << "') at object offset " << closurePtrOffset << std::endl;
+        
+        // Get the closure from metadata's simple array
+        Closure* metadataClosure = metadata->methodClosures[i];
+        if (!metadataClosure) {
+            throw std::runtime_error("Failed to get closure for method: " + vtEntry.methodName);
+        }
+        
+        uint64_t closureAddr = reinterpret_cast<uint64_t>(metadataClosure);
+        
+        // Store the closure pointer in the object
+        cb->push(x86::rax); // Save object pointer
+        cb->mov(x86::r10, closureAddr);
+        cb->mov(x86::qword_ptr(x86::rax, closurePtrOffset), x86::r10);
+        cb->pop(x86::rax); // Restore object pointer
+    }
     
     std::cout << "DEBUG generateNewExpr: Object allocated at runtime, class metadata stored at offset " 
-              << ObjectLayout::CLASS_REF_OFFSET << std::endl;
+              << ObjectLayout::METADATA_OFFSET << std::endl;
     
     // Track object in GC (save rax first since it contains the object pointer)
     cb->push(x86::rax);
@@ -1281,11 +1364,13 @@ void CodeGenerator::generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp
     x86::Gp objectPtrReg = x86::r10;
     loadValue(memberAccess->object.get(), objectPtrReg);
     
-    // Calculate actual offset: header + field offset
-    int actualOffset = ObjectLayout::FIELDS_OFFSET + memberAccess->memberOffset;
+    // Calculate actual offset: header + method closures + field offset
+    int actualOffset = ObjectLayout::HEADER_SIZE + memberAccess->classRef->totalMethodClosuresSize + memberAccess->memberOffset;
     
     std::cout << "DEBUG generateMemberAccess: Loading from object pointer + " << actualOffset 
-              << " (header=" << ObjectLayout::FIELDS_OFFSET << ", field offset=" << memberAccess->memberOffset << ")" << std::endl;
+              << " (header=" << ObjectLayout::HEADER_SIZE 
+              << ", method closures=" << memberAccess->classRef->totalMethodClosuresSize
+              << ", field offset=" << memberAccess->memberOffset << ")" << std::endl;
     
     // Load the field value from [objectPtrReg + actualOffset] into destReg
     cb->mov(destReg, x86::qword_ptr(objectPtrReg, actualOffset));
@@ -1319,11 +1404,13 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
     x86::Gp valueReg = x86::rax;
     loadValue(memberAssign->value.get(), valueReg);
     
-    // Calculate actual offset: header + field offset
-    int actualOffset = ObjectLayout::FIELDS_OFFSET + member->memberOffset;
+    // Calculate actual offset: header + method closures + field offset
+    int actualOffset = ObjectLayout::HEADER_SIZE + member->classRef->totalMethodClosuresSize + member->memberOffset;
     
     std::cout << "DEBUG generateMemberAssign: Storing to object pointer + " << actualOffset 
-              << " (header=" << ObjectLayout::FIELDS_OFFSET << ", field offset=" << member->memberOffset << ")" << std::endl;
+              << " (header=" << ObjectLayout::HEADER_SIZE 
+              << ", method closures=" << member->classRef->totalMethodClosuresSize
+              << ", field offset=" << member->memberOffset << ")" << std::endl;
     
     // Store the value to [objectPtrReg + actualOffset]
     cb->mov(x86::qword_ptr(objectPtrReg, actualOffset), valueReg);
@@ -1338,9 +1425,9 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
                 // Inline GC write barrier - check needs_set_flag and atomically set set_flag if needed
                 // This is much faster than a function call
                 
-                // Load flags from object header (at offset 0)
-                // flags is at [valueReg + 0]
-                cb->mov(x86::rcx, x86::qword_ptr(valueReg, 0));  // Load flags
+                // Load flags from object header (at offset 8)
+                // flags is at [valueReg + 8]
+                cb->mov(x86::rcx, x86::qword_ptr(valueReg, ObjectLayout::FLAGS_OFFSET));  // Load flags
                 
                 // Test if NEEDS_SET_FLAG (bit 0) is set
                 cb->test(x86::rcx, ObjectFlags::NEEDS_SET_FLAG);
@@ -1351,7 +1438,7 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
                 
                 // NEEDS_SET_FLAG is set, so OR the SET_FLAG bit (no LOCK needed - idempotent)
                 // Using non-locked OR is safe because we're only setting a bit to 1
-                cb->or_(x86::qword_ptr(valueReg, 0), ObjectFlags::SET_FLAG);
+                cb->or_(x86::qword_ptr(valueReg, ObjectLayout::FLAGS_OFFSET), ObjectFlags::SET_FLAG);
                 
                 // Memory fence to ensure write visibility to GC thread
                 // This guarantees the set_flag write is visible before GC reads it in phase 3
@@ -1363,4 +1450,34 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
     }
     
     std::cout << "Generated member assignment - field value stored" << std::endl;
+}
+
+void CodeGenerator::generateClassDecl(ClassDeclNode* classDecl) {
+    std::cout << "Generating class: " << classDecl->className << std::endl;
+    
+    // Get the runtime metadata for this class
+    ClassMetadata* metadata = MetadataRegistry::getInstance().getClassMetadata(classDecl->className);
+    if (!metadata) {
+        throw std::runtime_error("Class metadata not found for: " + classDecl->className);
+    }
+    
+    // Generate code for each method in the class
+    // Methods are just functions with "this" as the first parameter
+    for (size_t i = 0; i < classDecl->vtable.size(); i++) {
+        auto& vtEntry = classDecl->vtable[i];
+        auto& method = vtEntry.method;
+        
+        std::cout << "Generating method: " << vtEntry.methodName << " for class " << classDecl->className << std::endl;
+        
+        // Create a label for this method
+        createFunctionLabel(method);
+        
+        // Generate the method using the standard function generation
+        // The method already has "this" as its first parameter from analysis
+        generateFunctionDecl(method);
+        
+        std::cout << "  Method '" << vtEntry.methodName << "' generated (label will be patched later)" << std::endl;
+    }
+    
+    std::cout << "Class generation complete for: " << classDecl->className << std::endl;
 }

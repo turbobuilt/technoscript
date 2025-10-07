@@ -18,9 +18,10 @@ struct VarMetadata {
     int offset;               // Offset within scope/object data area
     DataType type;            // Type of the variable/field
     void* typeInfo;           // For OBJECT: points to ClassMetadata, nullptr otherwise
+    const char* name;         // Field/var name (for dynamic access like obj["fieldName"])
     
-    VarMetadata(int o = 0, DataType t = DataType::INT64, void* ti = nullptr)
-        : offset(o), type(t), typeInfo(ti) {}
+    VarMetadata(int o = 0, DataType t = DataType::INT64, void* ti = nullptr, const char* n = nullptr)
+        : offset(o), type(t), typeInfo(ti), name(n) {}
 };
 
 struct ScopeMetadata {
@@ -30,14 +31,41 @@ struct ScopeMetadata {
     ScopeMetadata(int n = 0, VarMetadata* v = nullptr) : numVars(n), vars(v) {}
 };
 
+// Closure structure embedded in metadata
+// Layout: [size(8)][func_addr(8)][scope_ptr1(8)]...[scope_ptrN(8)]
+// Note: Size is first so the closure itself knows its size
+struct Closure {
+    size_t size;           // Total size of this closure including size field
+    void* funcAddr;        // Function address
+    // Followed by N scope pointers (variable number)
+    
+    void** getScopePtrs() {
+        return reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(this) + 16);
+    }
+};
+
 struct ClassMetadata {
     const char* className;    // Name of the class
     int numFields;            // Number of fields
-    VarMetadata* fields;      // Array of field metadata
-    int totalSize;            // Total size of object (including header)
+    VarMetadata* fields;      // Array of field metadata (includes inherited fields)
+    int totalSize;            // Total size of object fields (NOT including header)
     
-    ClassMetadata(const char* name = nullptr, int n = 0, VarMetadata* f = nullptr, int size = 0)
-        : className(name), numFields(n), fields(f), totalSize(size) {}
+    // Method closures - simple array of closure pointers (one per method)
+    // Each instance copies these pointers, so all instances share the same closures
+    int numMethods;           // Number of methods
+    Closure** methodClosures; // Array of pointers to method closures
+    
+    // Parent class information for multiple inheritance
+    int numParents;           // Number of parent classes
+    const char** parentNames; // Array of parent class names
+    int* parentOffsets;       // Array of offsets to parent data in object layout
+    
+    ClassMetadata(const char* name = nullptr, int nf = 0, VarMetadata* f = nullptr, int size = 0,
+                  int nm = 0, Closure** mc = nullptr,
+                  int np = 0, const char** pn = nullptr, int* po = nullptr)
+        : className(name), numFields(nf), fields(f), totalSize(size),
+          numMethods(nm), methodClosures(mc),
+          numParents(np), parentNames(pn), parentOffsets(po) {}
 };
 
 // Global class metadata registry
@@ -74,23 +102,33 @@ namespace ScopeFlags {
 }
 
 // Object header structure (must match ObjectLayout in codegen.h)
+// Layout: [classMetadata*][flags][closure_ptr1]...[closure_ptrN][fields...]
+// NOTE: Instances have POINTERS to closures (8 bytes each), which point to closures in ClassMetadata
 struct ObjectHeader {
-    std::atomic<uint64_t> flags;  // Offset 0: GC flags (atomic for thread safety)
-    void* classMetadata;          // Offset 8: Pointer to ClassMetadata (was classRef)
-    void* dynamicVars;            // Offset 16: Dynamic variables (unused for now)
-    // Fields start at offset 24
+    void* classMetadata;          // Offset 0: Pointer to ClassMetadata (includes vtable)
+    std::atomic<uint64_t> flags;  // Offset 8: GC flags (atomic for thread safety)
+    // Closure pointers start at offset 16 (one 8-byte pointer per method)
+    // Fields start after closure pointers (offset = 16 + numMethods * 8)
     
     ClassMetadata* getClassMetadata() const { 
         return static_cast<ClassMetadata*>(classMetadata); 
     }
     
-    // Legacy compatibility - will be removed once codegen is updated
-    ClassDeclNode* getClassDecl() const { 
-        return static_cast<ClassDeclNode*>(classMetadata); 
+    // Get pointer to closure pointer array (starts at offset 16)
+    Closure** getClosurePtrs() { 
+        return reinterpret_cast<Closure**>(reinterpret_cast<uint8_t*>(this) + 16); 
     }
     
-    uint8_t* getFieldsStart() { 
-        return reinterpret_cast<uint8_t*>(this) + 24; 
+    // Get closure pointer for a specific method index
+    Closure* getMethodClosure(int methodIndex) {
+        Closure** ptrs = getClosurePtrs();
+        return ptrs[methodIndex];
+    }
+    
+    // Set closure pointer for a specific method index
+    void setMethodClosure(int methodIndex, Closure* closure) {
+        Closure** ptrs = getClosurePtrs();
+        ptrs[methodIndex] = closure;
     }
 };
 
@@ -115,8 +153,13 @@ struct GoroutineGCState {
     std::vector<void*> allocatedScopes;   // All scopes allocated by this goroutine
     std::vector<void*> scopeStack;        // Stack of active lexical scopes (roots)
     std::mutex allocationMutex;           // Protects allocatedObjects and allocatedScopes lists
+    std::mutex scopeStackMutex;           // Protects scopeStack and phase2 tracking variables
     size_t gcPhase2StackSize = 0;         // Size of scope stack when phase 2 started
     bool isInGCPhase2 = false;            // True when in GC phase 2
+    
+    // Signal-based memory fence support
+    std::atomic<uint64_t> checkpointCounter{0};  // Incremented when signal handler runs
+    pthread_t threadId;                           // Thread ID for sending signals
     
     void addObject(void* obj) {
         std::lock_guard<std::mutex> lock(allocationMutex);
@@ -152,12 +195,14 @@ struct GoroutineGCState {
     
     // Mark the current stack size at start of GC phase 2
     void markGCPhase2Start() {
+        std::lock_guard<std::mutex> lock(scopeStackMutex);
         gcPhase2StackSize = scopeStack.size();
         isInGCPhase2 = true;
     }
     
     // Reset after GC phase 2
     void resetGCPhase2() {
+        std::lock_guard<std::mutex> lock(scopeStackMutex);
         gcPhase2StackSize = 0;
         isInGCPhase2 = false;
     }
@@ -184,6 +229,9 @@ private:
     void phase2_setFlagMonitoring();
     void phase3_secondMarkSweep();
     void phase4_cleanup();
+    
+    // Signal-based memory fence to ensure all write barriers complete
+    void ensureAllWriteBarriersComplete();
     
     // Mark all goroutines for phase 2 start
     void markAllGoroutinesPhase2Start();

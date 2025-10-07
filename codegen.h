@@ -17,17 +17,15 @@ class ClassMetadata;
 
 // Object memory layout constants
 namespace ObjectLayout {
-    constexpr int FLAGS_OFFSET = 0;
+    constexpr int METADATA_OFFSET = 0;
+    constexpr int METADATA_SIZE = 8;
+    
+    constexpr int FLAGS_OFFSET = 8;
     constexpr int FLAGS_SIZE = 8;
     
-    constexpr int CLASS_REF_OFFSET = 8;
-    constexpr int CLASS_REF_SIZE = 8;
-    
-    constexpr int DYNAMIC_VARS_OFFSET = 16;
-    constexpr int DYNAMIC_VARS_SIZE = 8;
-    
-    constexpr int FIELDS_OFFSET = 24;  // 8 + 8 + 8
-    constexpr int HEADER_SIZE = 24;    // Total size of object header
+    constexpr int HEADER_SIZE = 16;    // Metadata + flags
+    // After header: method closures are stored (size varies by class)
+    // Then fields start (offset calculated based on method closures size)
 }
 
 // Lexical Scope memory layout constants
@@ -45,7 +43,7 @@ public:
     ~CodeGenerator();
     
     // Main code generation entry point
-    void* generateCode(ASTNode* root);
+    void* generateCode(ASTNode* root, const std::map<std::string, ClassDeclNode*>& classRegistry);
     
     // Core codegen methods for the basic functionality
     void allocateScope(LexicalScopeNode* scope);
@@ -80,6 +78,10 @@ private:
     void generateNewExpr(NewExprNode* newExpr, x86::Gp destReg);
     void generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp destReg);
     void generateMemberAssign(MemberAssignNode* memberAssign);
+    void generateClassDecl(ClassDeclNode* classDecl);
+    
+    // Patch method addresses into metadata closures after code commit
+    void patchMetadataClosures(void* codeBase, const std::map<std::string, ClassDeclNode*>& classRegistry);
     
     // Function-related utilities
     void createFunctionLabel(FunctionDeclNode* funcDecl);
@@ -101,10 +103,10 @@ private:
     // Code generation utilities
     void setupMainFunction();
     void cleanupMainFunction();
-    void loadValue(ASTNode* valueNode, x86::Gp destReg);
+    void loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourceScopeReg = x86::r15);
     void storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope, ASTNode* valueNode = nullptr);
-    void loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
-    void loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0);
+    void loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0, x86::Gp sourceScopeReg = x86::r15);
+    void loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0, x86::Gp sourceScopeReg = x86::r15);
     void loadParameterIntoRegister(int paramIndex, x86::Gp destReg, x86::Gp scopeReg = x86::r15);
     x86::Gp getParameterByIndex(int paramIndex);
     
@@ -121,7 +123,7 @@ public:
     Codegen();
     ~Codegen();
     
-    void generateProgram(ASTNode& root);
+    void generateProgram(ASTNode& root, const std::map<std::string, ClassDeclNode*>& classRegistry);
     void run();
     
 private:

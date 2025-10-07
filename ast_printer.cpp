@@ -129,13 +129,27 @@ void printAST(ASTNode* node, int indent) {
         }
         case AstNodeType::CLASS_DECL: {
             auto* classDecl = static_cast<ClassDeclNode*>(node);
-            std::cout << "CLASS " << classDecl->className << " (size=" << classDecl->totalSize << ") {";
+            std::cout << "CLASS " << classDecl->className;
+            if (!classDecl->parentClassNames.empty()) {
+                std::cout << " : ";
+                for (size_t i = 0; i < classDecl->parentClassNames.empty(); i++) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << classDecl->parentClassNames[i];
+                }
+            }
+            std::cout << " (size=" << classDecl->totalSize << ") {";
             for (const auto& [fieldName, fieldInfo] : classDecl->fields) {
                 std::cout << " " << fieldName << ":";
                 if (fieldInfo.type == DataType::INT32) std::cout << "int32";
                 else if (fieldInfo.type == DataType::INT64) std::cout << "int64";
                 else if (fieldInfo.type == DataType::OBJECT) std::cout << "object";
                 std::cout << "@" << fieldInfo.offset;
+            }
+            if (!classDecl->methods.empty()) {
+                std::cout << " methods:";
+                for (const auto& [methodName, method] : classDecl->methods) {
+                    std::cout << " " << methodName << "()";
+                }
             }
             std::cout << " }";
             break;
@@ -152,6 +166,20 @@ void printAST(ASTNode* node, int indent) {
         }
         case AstNodeType::MEMBER_ASSIGN: {
             std::cout << "MEMBER_ASSIGN";
+            break;
+        }
+        case AstNodeType::METHOD_CALL: {
+            auto* methodCall = static_cast<MethodCallNode*>(node);
+            std::cout << "METHOD_CALL ." << methodCall->methodName << "(";
+            for (size_t i = 0; i < methodCall->args.size(); i++) {
+                if (i > 0) std::cout << ", ";
+                std::cout << "arg" << i;
+            }
+            std::cout << ")";
+            break;
+        }
+        case AstNodeType::THIS_EXPR: {
+            std::cout << "THIS";
             break;
         }
     }

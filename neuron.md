@@ -18,8 +18,10 @@ So the benefit would be for safety sensitive scenarios, having an ai that can tr
 
 The other benefit is that it could intelligently do what our brains do - create "skip" connections from early layers to later layers enhancing efficiency.
 
-It could also lead to enhanced efficiency where it only makes a few connections that are necessary
+It could also lead to enhanced efficiency where it only makes a few connections that are necessary. It could also choose data types intelligently using high precision floating points for areas that are sensitive and need it, and low precision elsewhere.
 
 By training a network to be able to inspect and make networks, we can get much closer to guaranteeing that networks don't have rogue neorons.
 
 Since networks have billions of neurons, I would guess that it would need to do inspection of neurons at high levels and low levels bit by bit and a ton of work and experimentation on different sections and sort of create a plain text "database" of what sections refer to what, it could make indexes and stuff like that.
+
+Eventually a neural network could be "self compiling" like a language where it doesn't even need a pretraining phase or backprop.

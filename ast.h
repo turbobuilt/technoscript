@@ -21,7 +21,8 @@ enum class AstNodeType {
     IDENTIFIER, LITERAL, PRINT_STMT, GO_STMT, SETTIMEOUT_STMT, 
     AWAIT_EXPR, SLEEP_CALL, FOR_STMT, LET_DECL, 
     BINARY_EXPR, UNARY_EXPR, BLOCK_STMT,
-    CLASS_DECL, NEW_EXPR, MEMBER_ACCESS, MEMBER_ASSIGN
+    CLASS_DECL, NEW_EXPR, MEMBER_ACCESS, MEMBER_ASSIGN,
+    METHOD_CALL, THIS_EXPR
 };
 
 enum class DataType { INT32, INT64, CLOSURE, PROMISE, OBJECT };
@@ -168,6 +169,8 @@ public:
     std::string funcName;
     std::vector<std::string> params;
     void* asmjitLabel = nullptr;   // asmjit::Label for this function (stored as void* to avoid header dependency)
+    bool isMethod = false;          // Set to true if this is a class method
+    ClassDeclNode* owningClass = nullptr; // Set if this is a method - points to the owning class
     
     // NEW: Unified parameter information - single source of truth for all parameter layout
     std::vector<VariableInfo> paramsInfo;        // Regular parameters with calculated offsets
@@ -335,8 +338,38 @@ public:
 class ClassDeclNode : public ASTNode {
 public:
     std::string className;
+    
+    // Inheritance support
+    std::vector<std::string> parentClassNames;  // Names of parent classes (from parsing)
+    std::vector<ClassDeclNode*> parentRefs;     // Resolved parent class pointers (from analysis)
+    
+    // Fields (only this class's own fields)
     std::map<std::string, VariableInfo> fields; // field name -> VariableInfo with offset, size, etc.
-    int totalSize = 0; // Total packed size of the class
+    
+    // Methods as closures
+    std::map<std::string, std::unique_ptr<FunctionDeclNode>> methods;
+    
+    // Layout information (computed during analysis)
+    std::map<std::string, int> parentOffsets;   // parent class name -> offset in object layout
+    std::vector<std::string> allFieldsInOrder;  // All fields (parents + own) in layout order
+    
+    // VTable information (build-time, converted to runtime ClassMetadata)
+    struct VTableEntry {
+        std::string methodName;
+        FunctionDeclNode* method;  // Pointer to the method's FunctionDeclNode (build-time)
+        int thisOffset;            // Offset adjustment needed for this pointer
+        ClassDeclNode* definingClass; // Which class originally defined this method
+        int closureSize = 0;       // Size of the closure for this method
+        int closureOffsetInObject = 0; // Offset in object where this method's closure is stored
+    };
+    std::vector<VTableEntry> vtable;
+    
+    int totalMethodClosuresSize = 0;  // Total size of all method closures in object
+    int totalSize = 0;                 // Total size of all fields (no header, no methods, just data)
+    int totalObjectDataSize = 0;       // Total size including method closures + fields
+    
+    // Runtime metadata (generated after analysis, filled during codegen)
+    void* runtimeMetadata = nullptr;  // Points to ClassMetadata structure
     
     ClassDeclNode(const std::string& name) 
         : ASTNode(AstNodeType::CLASS_DECL), className(name) {}
@@ -350,11 +383,37 @@ public:
         
         totalSize = VariablePacking::packVariables(fieldVars);
         
-        printf("DEBUG ClassDeclNode::pack: Class '%s' packed with total size %d\n", 
-               className.c_str(), totalSize);
+        // Calculate method closure sizes and offsets
+        totalMethodClosuresSize = 0;
+        for (auto& entry : vtable) {
+            // Closure layout: [func_addr(8)][size(8)][scope_ptr1(8)]...[scope_ptrN(8)]
+            int closureSize = 16; // func_addr + size field
+            if (entry.method && entry.method->allNeeded.size() > 0) {
+                closureSize += entry.method->allNeeded.size() * 8;
+            }
+            entry.closureSize = closureSize;
+            entry.closureOffsetInObject = totalMethodClosuresSize;
+            totalMethodClosuresSize += closureSize;
+        }
+        
+        // Total object data = method closures + fields
+        totalObjectDataSize = totalMethodClosuresSize + totalSize;
+        
+        printf("DEBUG ClassDeclNode::pack: Class '%s' packed:\n", className.c_str());
+        printf("  Method closures size: %d bytes\n", totalMethodClosuresSize);
+        printf("  Fields size: %d bytes\n", totalSize);
+        printf("  Total object data size: %d bytes\n", totalObjectDataSize);
+        
+        for (auto& entry : vtable) {
+            printf("  Method '%s' closure at offset %d (size=%d)\n", 
+                   entry.methodName.c_str(), entry.closureOffsetInObject, entry.closureSize);
+        }
+        
         for (const auto& [name, fieldInfo] : fields) {
-            printf("DEBUG ClassDeclNode::pack:   Field '%s' at offset %d (size=%d)\n", 
-                   name.c_str(), fieldInfo.offset, fieldInfo.size);
+            // Fields start after method closures
+            int actualOffset = totalMethodClosuresSize + fieldInfo.offset;
+            printf("  Field '%s' at offset %d (relative to fields start: %d, size=%d)\n", 
+                   name.c_str(), actualOffset, fieldInfo.offset, fieldInfo.size);
         }
     }
 };
@@ -385,6 +444,38 @@ public:
     std::unique_ptr<ASTNode> value;
     
     MemberAssignNode() : ASTNode(AstNodeType::MEMBER_ASSIGN) {}
+};
+
+// Method call node - for calling methods on objects
+// Inherits from FunctionCallNode to reuse function call infrastructure
+class MethodCallNode : public FunctionCallNode {
+public:
+    std::unique_ptr<ASTNode> object;            // The object expression (e.g., IdentifierNode for "dog")
+    std::string methodName;                     // Name of the method to call
+    // args is inherited from FunctionCallNode
+    
+    // Resolved during analysis
+    FunctionDeclNode* resolvedMethod = nullptr; // The actual method function
+    int vtableIndex = -1;                       // Index in the vtable
+    int thisOffset = 0;                         // Offset to adjust this pointer
+    ClassDeclNode* objectClass = nullptr;       // Class of the object
+    int methodClosureOffset = 0;                // Offset in object where method closure is stored
+    
+    MethodCallNode(const std::string& method) 
+        : FunctionCallNode(method), methodName(method) {
+        type = AstNodeType::METHOD_CALL;  // Override to METHOD_CALL
+    }
+};
+
+// This expression - represents 'this' keyword in methods
+class ThisNode : public ASTNode {
+public:
+    ClassDeclNode* classContext = nullptr;  // Set during analysis - which class this method belongs to
+    FunctionDeclNode* methodContext = nullptr; // The method this 'this' appears in
+    
+    ThisNode() : ASTNode(AstNodeType::THIS_EXPR) {
+        value = "this";
+    }
 };
 
 // Implementation of getTypeSize after all classes are defined

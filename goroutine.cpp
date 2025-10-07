@@ -7,6 +7,11 @@
 #include <cstdlib>
 #include <asmjit/asmjit.h>
 #include <mutex>
+#include <pthread.h>
+#include <signal.h>
+
+// Forward declaration of GC signal handler from gc.cpp
+extern "C" void gc_checkpoint_signal_handler(int sig);
 
 // Static member initialization
 uint64_t Goroutine::nextId = 0;
@@ -214,6 +219,18 @@ bool EventLoop::assignTaskToSleepingWorker(std::shared_ptr<Goroutine> task) {
 void EventLoop::workerThreadFunction(uint32_t workerId) {
     std::cout << "Worker " << workerId << " started" << std::endl;
     
+    // Install signal handler for GC checkpoint on this thread
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = gc_checkpoint_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;  // Restart interrupted syscalls
+    
+    if (sigaction(SIGUSR1, &sa, nullptr) == -1) {
+        std::cerr << "Worker " << workerId 
+                  << ": Warning - Failed to install GC checkpoint signal handler" << std::endl;
+    }
+    
     // Get the initial task that was assigned to this worker
     currentTask = workerThreads[workerId]->assignedTask;
     workerThreads[workerId]->assignedTask = nullptr; // Clear assignment
@@ -221,6 +238,11 @@ void EventLoop::workerThreadFunction(uint32_t workerId) {
     if (!currentTask) {
         std::cerr << "ERROR: Worker " << workerId << " started without assigned task!" << std::endl;
         return;
+    }
+    
+    // Set thread ID for GC signal-based checkpointing
+    if (currentTask->gcState) {
+        currentTask->gcState->threadId = pthread_self();
     }
     
     // High-performance loop: while we have a goroutine to execute
@@ -242,6 +264,10 @@ void EventLoop::workerThreadFunction(uint32_t workerId) {
         // Check expired timers first (higher priority)
         currentTask = checkExpiredTimers();
         if (currentTask != nullptr) {
+            // Set thread ID for new task
+            if (currentTask->gcState) {
+                currentTask->gcState->threadId = pthread_self();
+            }
             continue; // Found timer task, continue loop
         }
         
@@ -250,6 +276,10 @@ void EventLoop::workerThreadFunction(uint32_t workerId) {
         if (taskPtr) {
             currentTask = *taskPtr;
             delete taskPtr;
+            // Set thread ID for new task
+            if (currentTask->gcState) {
+                currentTask->gcState->threadId = pthread_self();
+            }
             continue; // Found task, continue loop
         }
         
@@ -274,6 +304,11 @@ void EventLoop::workerThreadFunction(uint32_t workerId) {
         // Get the task assigned by main thread (or nullptr for shutdown)
         currentTask = workerThreads[workerId]->assignedTask;
         workerThreads[workerId]->assignedTask = nullptr; // Clear assignment
+        
+        // Set thread ID for assigned task
+        if (currentTask && currentTask->gcState) {
+            currentTask->gcState->threadId = pthread_self();
+        }
         
         // Continue loop with assigned task (or exit if nullptr)
     }

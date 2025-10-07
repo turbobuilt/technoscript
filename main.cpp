@@ -12,41 +12,15 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
     std::string code = R"(
-class Dog {
-    age: int64;
+var z: int64 = 22;
+function test(x: int64) {
+    print(x);
+    print(z);
 }
-
-function spawnDog1() {
-    var dog1: Dog = new Dog();
-    dog1.age = 10;
-    print(dog1.age);
-}
-
-function spawnDog2() {
-    var dog2: Dog = new Dog();
-    dog2.age = 20;
-    print(dog2.age);
-}
-
-function spawnDog3() {
-    var dog3: Dog = new Dog();
-    dog3.age = 30;
-    print(dog3.age);
-}
-
-function testGoroutineRegistry() {
-    print(1);
-    go spawnDog1();
-    print(2);
-    go spawnDog2();
-    print(3);
-    go spawnDog3();
-    print(4);
-}
-
-testGoroutineRegistry();
+var a: int64 = 42;
+test(a);a
 )";
-    std::cout << "=== Running goroutine registry test program ===\n";
+    std::cout << "=== Testing class method with 'this' ===\n";
 
     
     Parser parser;
@@ -71,7 +45,7 @@ testGoroutineRegistry();
     std::cout << "DEBUG: Actual print_int64 address: 0x" << std::hex << actual_print_addr << std::dec << std::endl;
     
     std::cout << "DEBUG: Starting code generation..." << std::endl;
-    codeGen.generateProgram(*ast);
+    codeGen.generateProgram(*ast, parser.getClassRegistry());
     std::cout << "DEBUG: Code generation completed successfully" << std::endl;
     
     // Start the garbage collector
