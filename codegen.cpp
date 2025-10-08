@@ -27,8 +27,8 @@ Codegen::~Codegen() {
     // Function cleanup is handled by asmjit runtime
 }
 
-void Codegen::generateProgram(ASTNode& root, const std::map<std::string, ClassDeclNode*>& classRegistry) {
-    generatedFunction = generator.generateCode(&root, classRegistry);
+void Codegen::generateProgram(ASTNode& root, const std::map<std::string, ClassDeclNode*>& classRegistry, const std::vector<FunctionDeclNode*>& functionRegistry) {
+    generatedFunction = generator.generateCode(&root, classRegistry, functionRegistry);
 }
 
 void Codegen::run() {
@@ -61,7 +61,7 @@ CodeGenerator::~CodeGenerator() {
     cs_close(&capstoneHandle);
 }
 
-void* CodeGenerator::generateCode(ASTNode* root, const std::map<std::string, ClassDeclNode*>& classRegistry) {
+void* CodeGenerator::generateCode(ASTNode* root, const std::map<std::string, ClassDeclNode*>& classRegistry, const std::vector<FunctionDeclNode*>& functionRegistry) {
     // Reset and initialize code holder
     code.reset();
     code.init(rt.environment(), rt.cpuFeatures());
@@ -71,12 +71,13 @@ void* CodeGenerator::generateCode(ASTNode* root, const std::map<std::string, Cla
     
     std::cout << "=== Generated Assembly Code ===" << std::endl;
     
-    // Generate code for all classes first (so method labels exist)
-    for (const auto& [className, classDecl] : classRegistry) {
-        generateClassDecl(classDecl);
-    }
+    // FIRST PASS: Generate all functions (including methods) upfront
+    std::cout << "\n=== First Pass: Generating All Functions ===" << std::endl;
+    generateAllFunctions(functionRegistry);
     
-    // Generate code for the program (main function and any top-level functions)
+    // SECOND PASS: Generate the main program flow (this traverses the AST normally)
+    // Classes will be emitted as they appear in the AST, creating closures for methods inline
+    std::cout << "\n=== Second Pass: Generating Main Program ===" << std::endl;
     generateProgram(root);
     
     std::cout << "Code size after program: " << code.codeSize() << std::endl;
@@ -120,23 +121,98 @@ void CodeGenerator::declareExternalFunctions() {
     freeLabel = cb->newLabel();
 }
 
+void CodeGenerator::generateAllFunctions(const std::vector<FunctionDeclNode*>& functionRegistry) {
+    std::cout << "Generating " << functionRegistry.size() << " functions from registry" << std::endl;
+    
+    // Create labels for all functions first
+    for (auto* funcDecl : functionRegistry) {
+        if (!funcDecl->asmjitLabel) {
+            createFunctionLabel(funcDecl);
+        }
+    }
+    
+    // Generate code for all functions
+    for (auto* funcDecl : functionRegistry) {
+        if (funcDecl->isMethod) {
+            std::cout << "Generating method from registry: " << funcDecl->funcName 
+                      << " (class: " << (funcDecl->owningClass ? funcDecl->owningClass->className : "unknown") << ")" << std::endl;
+        } else {
+            std::cout << "Generating function from registry: " << funcDecl->funcName << std::endl;
+        }
+        
+        // Generate the function code
+        Label* funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
+        if (!funcLabel) {
+            throw std::runtime_error("Function label not created for: " + funcDecl->funcName);
+        }
+        
+        // Bind the function label
+        cb->bind(*funcLabel);
+        
+        // Generate function prologue
+        generateFunctionPrologue(funcDecl);
+        
+        // Set this function as current scope
+        LexicalScopeNode* previousScope = currentScope;
+        currentScope = funcDecl;
+        
+        // Handle function hoisting - create closures for nested functions in this scope
+        for (const auto& [name, varInfo] : funcDecl->variables) {
+            if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
+                auto childFuncDecl = varInfo.funcNode;
+                // The label should already exist from the first loop above
+                storeFunctionAddressInClosure(childFuncDecl, funcDecl);
+            }
+        }
+        
+        // Process the function body (skip nested functions and classes)
+        for (auto& child : funcDecl->children) {
+            if (child->type != AstNodeType::FUNCTION_DECL && child->type != AstNodeType::CLASS_DECL) {
+                visitNode(child.get());
+            }
+        }
+        
+        // For main function, set return value
+        if (funcDecl->funcName == "main") {
+            cb->mov(x86::eax, 0);
+        }
+        
+        // Generate function epilogue
+        generateFunctionEpilogue(funcDecl);
+        
+        // Restore previous scope
+        currentScope = previousScope;
+    }
+    
+    std::cout << "Finished generating all functions from registry" << std::endl;
+}
+
 void CodeGenerator::generateProgram(ASTNode* root) {
     if (!root) {
         throw std::runtime_error("Null program root");
     }
     
-    std::cout << "Generating program - treating main as regular function" << std::endl;
+    std::cout << "Generating program - main should already be generated from registry" << std::endl;
     
     // Root should always be a FUNCTION_DECL (the main function)
     if (root->type == AstNodeType::FUNCTION_DECL) {
         FunctionDeclNode* mainFunc = static_cast<FunctionDeclNode*>(root);
         
-        // Pre-create the main function label
-        Label mainFuncLabel = cb->newLabel();
-        mainFunc->asmjitLabel = new Label(mainFuncLabel);
+        // The main function should already have been generated in generateAllFunctions
+        // But we still need to ensure its label exists (it should)
+        if (!mainFunc->asmjitLabel) {
+            throw std::runtime_error("Main function label should have been created in generateAllFunctions");
+        }
         
-        // Generate the main function like any other function
-        generateFunctionDecl(mainFunc);
+        // Process any classes in the main function's children
+        // Classes need special handling to create method closures at the class definition point
+        for (auto& child : mainFunc->children) {
+            if (child->type == AstNodeType::CLASS_DECL) {
+                // We don't regenerate the class methods (they're already generated)
+                // but we might need to do other class-related setup here
+                std::cout << "Skipping class in second pass (methods already generated)" << std::endl;
+            }
+        }
     } else {
         throw std::runtime_error("Invalid program root node type - expected FUNCTION_DECL");
     }
@@ -371,7 +447,6 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourc
             // Handle 'this' expression - load from first parameter
             // 'this' is always the first parameter in a method
             // It's stored in the scope like any other variable
-            auto thisNode = static_cast<ThisNode*>(valueNode);
             
             // Create a temporary identifier node to load 'this' variable
             IdentifierNode tempIdentifier("this");
@@ -647,65 +722,27 @@ void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
 }
 
 void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
-    if (funcDecl->isMethod) {
-        std::cout << "Generating method: " << funcDecl->funcName 
-                  << " (class: " << (funcDecl->owningClass ? funcDecl->owningClass->className : "unknown") 
-                  << ", params including 'this': " << funcDecl->paramsInfo.size() << ")" << std::endl;
-    } else {
-        std::cout << "Generating function: " << funcDecl->funcName << std::endl;
-    }
+    // This method should only be called from visitNode during the second pass
+    // for inline closure creation (not for actual function code generation)
+    std::cout << "generateFunctionDecl called during AST traversal for: " << funcDecl->funcName << std::endl;
+    std::cout << "  (Function code should already be generated from registry)" << std::endl;
     
-    Label* funcLabel;
-    // The label should already exist from hoisting phase
-    funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
+    // If we're visiting a function declaration during normal AST traversal,
+    // it means we need to create the closure for it in the current scope
+    // The actual function code should already be generated
+    
+    Label* funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
     if (!funcLabel) {
-        throw std::runtime_error("Function label not found for hoisted function: " + funcDecl->funcName);
+        throw std::runtime_error("Function label not found for: " + funcDecl->funcName);
     }
     
-    // Bind the function label (start of actual function code)
-    cb->bind(*funcLabel);
-    
-    // Generate function prologue (includes scope allocation and parameter copying)
-    generateFunctionPrologue(funcDecl);
-    
-    // Set this function as current scope for variable access
-    LexicalScopeNode* previousScope = currentScope;
-    currentScope = funcDecl;
-    
-    // Handle function hoisting - create closures for all functions in this scope
-    for (const auto& [name, varInfo] : funcDecl->variables) {
-        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
-            auto childFuncDecl = varInfo.funcNode;
-            // Create function label and store address in closure
-            createFunctionLabel(childFuncDecl);
-            storeFunctionAddressInClosure(childFuncDecl, funcDecl);
-        }
+    // Store the function address in the closure at the current scope
+    LexicalScopeNode* definingScope = currentScope;
+    if (definingScope) {
+        storeFunctionAddressInClosure(funcDecl, definingScope);
+    } else {
+        std::cout << "  Warning: No current scope to store closure" << std::endl;
     }
-    
-    // Process all NON-FUNCTION children (the actual function body)
-    for (auto& child : funcDecl->children) {
-        if (child->type != AstNodeType::FUNCTION_DECL) {
-            visitNode(child.get());
-        }
-    }
-    
-    // For main function, set return value
-    if (funcDecl->funcName == "main") {
-        cb->mov(x86::eax, 0); // Return 0 for main program
-    }
-    
-    // Generate function epilogue - end this function completely
-    generateFunctionEpilogue(funcDecl);
-    
-    // Now generate nested functions as separate standalone functions  
-    for (auto& child : funcDecl->children) {
-        if (child->type == AstNodeType::FUNCTION_DECL) {
-            visitNode(child.get());
-        }
-    }
-    
-    // Restore previous scope
-    currentScope = previousScope;
 }
 
 void CodeGenerator::createFunctionLabel(FunctionDeclNode* funcDecl) {
@@ -1466,7 +1503,7 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
 }
 
 void CodeGenerator::generateClassDecl(ClassDeclNode* classDecl) {
-    std::cout << "Generating class: " << classDecl->className << std::endl;
+    std::cout << "Generating class declaration (inline closure creation): " << classDecl->className << std::endl;
     
     // Get the runtime metadata for this class
     ClassMetadata* metadata = MetadataRegistry::getInstance().getClassMetadata(classDecl->className);
@@ -1474,23 +1511,31 @@ void CodeGenerator::generateClassDecl(ClassDeclNode* classDecl) {
         throw std::runtime_error("Class metadata not found for: " + classDecl->className);
     }
     
-    // Generate code for each method in the class
-    // Methods are just functions with "this" as the first parameter
+    // The method code should already be generated from the function registry
+    // Here we just need to ensure the metadata closures are set up
+    // The actual patching of function addresses happens in patchMetadataClosures after code commit
+    
+    std::cout << "Class " << classDecl->className << " has " << classDecl->methodLayout.size() 
+              << " methods (code already generated, closures will be patched)" << std::endl;
+    
     for (size_t i = 0; i < classDecl->methodLayout.size(); i++) {
         auto& methodInfo = classDecl->methodLayout[i];
         auto& method = methodInfo.method;
         
-        std::cout << "Generating method: " << methodInfo.methodName << " for class " << classDecl->className << std::endl;
+        std::cout << "  Method: " << methodInfo.methodName << " - closure will be patched later" << std::endl;
         
-        // Create a label for this method
-        createFunctionLabel(method);
+        // Verify the label exists
+        Label* funcLabel = static_cast<Label*>(method->asmjitLabel);
+        if (!funcLabel) {
+            throw std::runtime_error("Method label not created for: " + methodInfo.methodName);
+        }
         
-        // Generate the method using the standard function generation
-        // The method already has "this" as its first parameter from analysis
-        generateFunctionDecl(method);
-        
-        std::cout << "  Method '" << methodInfo.methodName << "' generated (label will be patched later)" << std::endl;
+        // The closure is already in the metadata, it will be patched after code commit
+        Closure* closure = metadata->methodClosures[i];
+        if (!closure) {
+            throw std::runtime_error("Method closure not found in metadata for: " + methodInfo.methodName);
+        }
     }
     
-    std::cout << "Class generation complete for: " << classDecl->className << std::endl;
+    std::cout << "Class declaration processing complete for: " << classDecl->className << std::endl;
 }

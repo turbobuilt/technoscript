@@ -101,6 +101,9 @@ std::unique_ptr<FunctionDeclNode> Parser::parse(const std::string& code) {
     currentLexicalScope = root.get();  // Set initial scope
     currentFunctionScope = root.get(); // Main is also the initial function scope
     
+    // Register the main function in the function registry
+    functionRegistry.push_back(root.get());
+    
     int iterations = 0;
     size_t lastPos = pos;
     
@@ -634,6 +637,9 @@ std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     closureVar.size = 16; // function_address (8) + size (8) - scope pointers added later by analyzer
     currentLexicalScope->variables[name] = closureVar;
     
+    // Register this function for early code generation
+    functionRegistry.push_back(func.get());
+    
     // Parse parameters
     while (!match(TokenType::RPAREN)) {
         std::string paramName = current().value;
@@ -1038,6 +1044,9 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
             currentFunctionScope = previousFunctionScope;
             
             std::cout << "DEBUG parseClassDecl: Finished parsing method '" << methodName << "'" << std::endl;
+            
+            // Register this method for early code generation
+            functionRegistry.push_back(method.get());
             
             // Add method to class
             classDecl->methods[methodName] = std::move(method);

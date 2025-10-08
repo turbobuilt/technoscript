@@ -25,6 +25,7 @@ private:
     LexicalScopeNode* currentLexicalScope = nullptr;  // Track current lexical scope during parsing
     LexicalScopeNode* currentFunctionScope = nullptr; // Track current function scope during parsing
     std::map<std::string, ClassDeclNode*> classRegistry; // Global registry of all classes
+    std::vector<FunctionDeclNode*> functionRegistry;  // Registry of all functions including methods
     
     Token& current() { return tokens[pos]; }
     void advance() { if (pos < tokens.size() - 1) pos++; }
@@ -55,4 +56,5 @@ private:
 public:
     std::unique_ptr<FunctionDeclNode> parse(const std::string& code);
     const std::map<std::string, ClassDeclNode*>& getClassRegistry() const { return classRegistry; }
+    const std::vector<FunctionDeclNode*>& getFunctionRegistry() const { return functionRegistry; }
 };

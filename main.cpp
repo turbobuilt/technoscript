@@ -46,7 +46,7 @@ a.printAge();
     std::cout << "DEBUG: Actual print_int64 address: 0x" << std::hex << actual_print_addr << std::dec << std::endl;
     
     std::cout << "DEBUG: Starting code generation..." << std::endl;
-    codeGen.generateProgram(*ast, parser.getClassRegistry());
+    codeGen.generateProgram(*ast, parser.getClassRegistry(), parser.getFunctionRegistry());
     std::cout << "DEBUG: Code generation completed successfully" << std::endl;
     
     // Start the garbage collector
