@@ -196,13 +196,6 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     // Set r14 to current r15 (the new scope's parent will be the current scope)
     cb->mov(x86::r14, x86::r15);
     
-    // save all 6 registers
-    cb->push(x86::rdi);
-    cb->push(x86::rsi);
-    cb->push(x86::rdx);
-    cb->push(x86::rcx);
-    cb->push(x86::r8);
-    cb->push(x86::r9);
     
     // Call calloc to allocate and zero-initialize scope
     // mov rdi, 1 (number of elements)
@@ -216,13 +209,6 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     cb->mov(x86::rax, callocAddr);
     cb->call(x86::rax);
     
-    // Restore
-    cb->pop(x86::r9);
-    cb->pop(x86::r8);
-    cb->pop(x86::rcx);
-    cb->pop(x86::rdx);
-    cb->pop(x86::rsi);
-    cb->pop(x86::rdi);
     
     // Store the allocated memory address in r15
     cb->mov(x86::r15, x86::rax);
@@ -235,20 +221,16 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     cb->mov(x86::qword_ptr(x86::r15, ScopeLayout::METADATA_OFFSET), x86::r11);
     
     // Track scope as an allocated object for GC
-    cb->push(x86::rdi);  // Save rdi
     cb->mov(x86::rdi, x86::r15);  // First argument: scope pointer
     uint64_t gcTrackAddr = reinterpret_cast<uint64_t>(&gc_track_object);
     cb->mov(x86::r11, gcTrackAddr);
     cb->call(x86::r11);
-    cb->pop(x86::rdi);  // Restore rdi
     
     // Track scope in GC (push scope to roots)
-    cb->push(x86::rdi);  // Save rdi
     cb->mov(x86::rdi, x86::r15);  // First argument: scope pointer
     uint64_t gcPushScopeAddr = reinterpret_cast<uint64_t>(&gc_push_scope);
     cb->mov(x86::r11, gcPushScopeAddr);
     cb->call(x86::r11);
-    cb->pop(x86::rdi);  // Restore rdi
     
     currentScope = scope;
 }
@@ -603,12 +585,12 @@ void CodeGenerator::patchMetadataClosures(void* codeBase, const std::map<std::st
         std::cout << "Patching " << metadata->numMethods << " methods for class " << className << std::endl;
         
         // Patch each method closure
-        for (size_t i = 0; i < classDecl->vtable.size(); i++) {
-            const auto& vtEntry = classDecl->vtable[i];
-            FunctionDeclNode* method = vtEntry.method;
+        for (size_t i = 0; i < classDecl->methodLayout.size(); i++) {
+            const auto& methodInfo = classDecl->methodLayout[i];
+            FunctionDeclNode* method = methodInfo.method;
             
             if (!method || !method->asmjitLabel) {
-                std::cout << "WARNING: No label for method " << vtEntry.methodName << std::endl;
+                std::cout << "WARNING: No label for method " << methodInfo.methodName << std::endl;
                 continue;
             }
             
@@ -617,12 +599,12 @@ void CodeGenerator::patchMetadataClosures(void* codeBase, const std::map<std::st
             uint32_t labelId = label->id();
             
             if (labelId == Globals::kInvalidId) {
-                throw std::runtime_error("Invalid label ID for method: " + vtEntry.methodName);
+                throw std::runtime_error("Invalid label ID for method: " + methodInfo.methodName);
             }
             
             LabelEntry* labelEntry = code.labelEntry(labelId);
             if (!labelEntry) {
-                throw std::runtime_error("Label entry not found for method: " + vtEntry.methodName);
+                throw std::runtime_error("Label entry not found for method: " + methodInfo.methodName);
             }
             
             size_t labelOffset = labelEntry->offset();
@@ -632,7 +614,7 @@ void CodeGenerator::patchMetadataClosures(void* codeBase, const std::map<std::st
             Closure* closure = metadata->methodClosures[i];
             closure->funcAddr = funcAddr;
             
-            std::cout << "  Patched " << className << "::" << vtEntry.methodName 
+            std::cout << "  Patched " << className << "::" << methodInfo.methodName 
                       << " -> " << funcAddr << " (offset: 0x" << std::hex << labelOffset << std::dec << ")" << std::endl;
         }
     }
@@ -1072,58 +1054,89 @@ void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
         throw std::runtime_error("Go statement target is not a function: " + funcCall->value);
     }
     
-    size_t regularArgCount = funcCall->args.size();
-    size_t hiddenParamCount = funcCall->varRef->funcNode->allNeeded.size();
-    size_t totalParamCount = regularArgCount + hiddenParamCount;
-    
-    // Allocate param array on heap
-    cb->mov(x86::rdi, totalParamCount * 8);
-    uint64_t mallocAddr = reinterpret_cast<uint64_t>(&malloc);
-    cb->mov(x86::rax, mallocAddr);
-    cb->call(x86::rax);
-    cb->mov(x86::r12, x86::rax);  // r12 = param array
-    
-    // Store regular args
-    for (size_t i = 0; i < regularArgCount; i++) {
-        loadValue(funcCall->args[i].get(), x86::r11);
-        cb->mov(x86::qword_ptr(x86::r12, i * 8), x86::r11);
+    FunctionDeclNode* targetFunc = funcCall->varRef->funcNode;
+    if (!targetFunc) {
+        throw std::runtime_error("Cannot resolve target function for go statement: " + funcCall->value);
     }
     
-    // Store hidden params from closure
-    loadVariableAddress(funcCall, x86::rbx);  // closure address
-    for (size_t i = 0; i < hiddenParamCount; i++) {
-        int closureOffset = 16 + (i * 8);
-        cb->mov(x86::r11, x86::qword_ptr(x86::rbx, closureOffset));
-        cb->mov(x86::qword_ptr(x86::r12, (regularArgCount + i) * 8), x86::r11);
+    std::cout << "Target function has " << targetFunc->paramsInfo.size() << " regular params and " 
+              << targetFunc->hiddenParamsInfo.size() << " hidden params" << std::endl;
+    
+    // Save current r15 (our scope) into r13 temporarily - we'll need it for loading arguments
+    cb->mov(x86::r13, x86::r15);
+    
+    // Allocate scope for the goroutine function (same as regular function call)
+    // This will:
+    // - Push r14 (save grandparent scope)
+    // - Set r14 = r15 (current scope becomes parent of new scope)
+    // - Allocate new scope memory
+    // - Set r15 = new scope
+    allocateScope(targetFunc);
+    
+    // Now r15 points to the new scope, r14 points to our scope (r13 also has our scope)
+    // Copy regular parameters into the goroutine's scope
+    for (size_t i = 0; i < funcCall->args.size(); i++) {
+        const VariableInfo& param = targetFunc->paramsInfo[i];
+        ASTNode* arg = funcCall->args[i].get();
+        
+        std::cout << "  Copying arg " << i << " (" << param.name << ") to scope[" << param.offset << "]" << std::endl;
+        
+        if (arg->type == AstNodeType::IDENTIFIER) {
+            // Load from our scope (r13 has our original scope)
+            loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax, 0, x86::r13);
+        } else {
+            loadValue(arg, x86::rax, x86::r13);
+        }
+        cb->mov(x86::ptr(x86::r15, param.offset), x86::rax);
     }
     
-    // Get function pointer from closure
-    cb->mov(x86::rdi, x86::qword_ptr(x86::rbx, 0));  // func ptr
-    cb->mov(x86::rsi, x86::r12);  // param array
-    cb->mov(x86::rdx, totalParamCount);  // count
+    // Load the closure address for accessing hidden parameters (parent scope pointers)
+    loadVariableAddress(funcCall, x86::rbx, 0, x86::r13);
     
-    // Save registers before calling runtime function
-    cb->push(x86::rax);
-    cb->push(x86::rcx);
-    cb->push(x86::r8);
-    cb->push(x86::r9);
-    cb->push(x86::r10);
-    cb->push(x86::r11);
+    // Copy hidden parameters (parent scope pointers) from closure into goroutine's scope
+    for (size_t i = 0; i < targetFunc->hiddenParamsInfo.size(); i++) {
+        const ParameterInfo& hiddenParam = targetFunc->hiddenParamsInfo[i];
+        int closureOffset = 16 + (i * 8); // function_address (8) + size (8) + scope_pointers
+        
+        std::cout << "  Copying hidden param " << i << " (depth " << hiddenParam.depth 
+                  << ") to scope[" << hiddenParam.offset << "]" << std::endl;
+        
+        // Load the scope pointer from closure and store in goroutine's scope
+        cb->mov(x86::rax, x86::ptr(x86::rbx, closureOffset));
+        cb->mov(x86::ptr(x86::r15, hiddenParam.offset), x86::rax);
+    }
     
-    // Call runtime_spawn_goroutine(funcPtr, paramArray, paramCount)
+    // Load the function address from closure (still in rbx)
+    cb->mov(x86::rax, x86::ptr(x86::rbx, 0)); // Load function address from closure
+    
+    // Now we have:
+    // - rax = function pointer to call
+    // - r15 = pointer to allocated scope with all parameters populated
+    // - r14 = pointer to parent scope (our scope)
+    
+    // We need to pass these to runtime_spawn_goroutine
+    // Signature: void runtime_spawn_goroutine(void* funcPtr, void* scopePtr, void* parentScopePtr)
+    cb->mov(x86::rdi, x86::rax);  // First arg: function pointer
+    cb->mov(x86::rsi, x86::r15);  // Second arg: scope pointer
+    cb->mov(x86::rdx, x86::r14);  // Third arg: parent scope pointer
+    
+    // Save our scope register r13 before calling runtime function
+    cb->push(x86::r13);
+    
+    // Call runtime_spawn_goroutine
     uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_spawn_goroutine);
     cb->mov(x86::rax, runtimeAddr);
     cb->call(x86::rax);
     
-    // Restore registers
-    cb->pop(x86::r11);
-    cb->pop(x86::r10);
-    cb->pop(x86::r9);
-    cb->pop(x86::r8);
-    cb->pop(x86::rcx);
-    cb->pop(x86::rax);
+    // Restore our scope register
+    cb->pop(x86::r13);
     
-    std::cout << "Generated GO statement call to runtime_spawn_goroutine" << std::endl;
+    // Restore r15 and r14 to their original state (before we allocated the goroutine's scope)
+    // The goroutine now owns the allocated scope, so we need to restore our state
+    cb->mov(x86::r15, x86::r13);  // Restore our scope to r15
+    cb->pop(x86::r14);            // Restore grandparent scope pointer
+    
+    std::cout << "Generated GO statement - scope allocated and ownership transferred to goroutine" << std::endl;
 }
 
 void CodeGenerator::generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt) {
@@ -1269,7 +1282,7 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     
     // Calculate total object size: header + closure pointers (8 bytes each) + fields
     // NOTE: Instances have POINTERS to closures, not embedded closures
-    int numMethods = classDecl->vtable.size();
+    int numMethods = classDecl->methodLayout.size();
     int closurePointersSize = numMethods * 8; // 8 bytes per pointer
     int totalObjectSize = ObjectLayout::HEADER_SIZE + closurePointersSize + classDecl->totalSize;
     
@@ -1306,17 +1319,17 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     
     // Initialize closure pointers in the object
     // Each closure pointer at [object + 16 + i*8] points to the closure in metadata
-    for (size_t i = 0; i < classDecl->vtable.size(); i++) {
-        const auto& vtEntry = classDecl->vtable[i];
+    for (size_t i = 0; i < classDecl->methodLayout.size(); i++) {
+        const auto& methodInfo = classDecl->methodLayout[i];
         int closurePtrOffset = ObjectLayout::HEADER_SIZE + (i * 8);
         
         std::cout << "DEBUG generateNewExpr: Setting closure pointer " << i 
-                  << " ('" << vtEntry.methodName << "') at object offset " << closurePtrOffset << std::endl;
+                  << " ('" << methodInfo.methodName << "') at object offset " << closurePtrOffset << std::endl;
         
         // Get the closure from metadata's simple array
         Closure* metadataClosure = metadata->methodClosures[i];
         if (!metadataClosure) {
-            throw std::runtime_error("Failed to get closure for method: " + vtEntry.methodName);
+            throw std::runtime_error("Failed to get closure for method: " + methodInfo.methodName);
         }
         
         uint64_t closureAddr = reinterpret_cast<uint64_t>(metadataClosure);
@@ -1463,11 +1476,11 @@ void CodeGenerator::generateClassDecl(ClassDeclNode* classDecl) {
     
     // Generate code for each method in the class
     // Methods are just functions with "this" as the first parameter
-    for (size_t i = 0; i < classDecl->vtable.size(); i++) {
-        auto& vtEntry = classDecl->vtable[i];
-        auto& method = vtEntry.method;
+    for (size_t i = 0; i < classDecl->methodLayout.size(); i++) {
+        auto& methodInfo = classDecl->methodLayout[i];
+        auto& method = methodInfo.method;
         
-        std::cout << "Generating method: " << vtEntry.methodName << " for class " << classDecl->className << std::endl;
+        std::cout << "Generating method: " << methodInfo.methodName << " for class " << classDecl->className << std::endl;
         
         // Create a label for this method
         createFunctionLabel(method);
@@ -1476,7 +1489,7 @@ void CodeGenerator::generateClassDecl(ClassDeclNode* classDecl) {
         // The method already has "this" as its first parameter from analysis
         generateFunctionDecl(method);
         
-        std::cout << "  Method '" << vtEntry.methodName << "' generated (label will be patched later)" << std::endl;
+        std::cout << "  Method '" << methodInfo.methodName << "' generated (label will be patched later)" << std::endl;
     }
     
     std::cout << "Class generation complete for: " << classDecl->className << std::endl;

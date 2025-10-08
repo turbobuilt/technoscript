@@ -167,6 +167,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
            current().type != TokenType::LBRACE &&  // Add LBRACE for block statements
            current().type != TokenType::CLASS &&   // Add CLASS token
            current().type != TokenType::IDENTIFIER &&
+           current().type != TokenType::THIS &&    // Add THIS token for method calls like this.method()
            current().type != TokenType::RBRACE) { // Allow } to end blocks naturally
         
         std::cout << "WARNING: Skipping unexpected token at position " << pos << ", type=" << (int)current().type << ", value='" << current().value << "'" << std::endl;
@@ -350,10 +351,51 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
             std::string memberName = current().value;
             expect(TokenType::IDENTIFIER);
             
-            // Create member access with 'this' as the object
-            auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
-            memberAccess->object = std::make_unique<ThisNode>();
-            return memberAccess;
+            std::cout << "DEBUG: Parsing this." << memberName << ", next token type: " << (int)current().type << std::endl;
+            
+            // Check if this is a method call (this.method(...))
+            if (match(TokenType::LPAREN)) {
+                std::cout << "DEBUG: Detected method call this." << memberName << "()" << std::endl;
+                advance(); // consume (
+                
+                auto methodCall = std::make_unique<MethodCallNode>(memberName);
+                methodCall->object = std::make_unique<ThisNode>();
+                
+                // Parse arguments
+                if (!match(TokenType::RPAREN)) {
+                    do {
+                        if (match(TokenType::LITERAL)) {
+                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value));
+                            advance();
+                        } else if (match(TokenType::IDENTIFIER)) {
+                            methodCall->args.push_back(std::make_unique<IdentifierNode>(current().value));
+                            advance();
+                        } else if (match(TokenType::THIS)) {
+                            methodCall->args.push_back(std::make_unique<ThisNode>());
+                            advance();
+                        } else {
+                            throw std::runtime_error("Expected argument in method call");
+                        }
+                        
+                        if (match(TokenType::COMMA)) {
+                            advance();
+                        } else {
+                            break;
+                        }
+                    } while (true);
+                }
+                
+                expect(TokenType::RPAREN);
+                expect(TokenType::SEMICOLON);
+                std::cout << "DEBUG: Successfully parsed this." << memberName << "() method call" << std::endl;
+                return methodCall;
+            } else {
+                // Create member access with 'this' as the object
+                std::cout << "DEBUG: Creating member access for this." << memberName << std::endl;
+                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+                memberAccess->object = std::make_unique<ThisNode>();
+                return memberAccess;
+            }
         } else {
             // Just 'this' by itself
             return std::make_unique<ThisNode>();
@@ -896,13 +938,24 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
     
     // Parse class body (fields and methods)
     while (!match(TokenType::RBRACE) && current().type != TokenType::EOF_TOKEN) {
-        // Check if this is a method (function keyword) or a field (identifier)
-        if (match(TokenType::FUNCTION)) {
-            // Parse method
+        // Check if this is a method or a field
+        // Method: identifier followed by '(' (with or without 'function' keyword)
+        // Field: identifier followed by ':'
+        
+        bool isFunction = match(TokenType::FUNCTION);
+        if (isFunction) {
             advance(); // consume 'function'
-            
-            std::string methodName = current().value;
-            expect(TokenType::IDENTIFIER);
+        }
+        
+        std::string memberName = current().value;
+        expect(TokenType::IDENTIFIER);
+        
+        // Check next token to determine if this is a method or field
+        bool isMethod = match(TokenType::LPAREN);
+        
+        if (isMethod || isFunction) {
+            // Parse method
+            std::string methodName = memberName;
             
             std::cout << "DEBUG parseClassDecl: Parsing method '" << methodName << "' in class '" << className << "'" << std::endl;
             
@@ -991,8 +1044,7 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
             
         } else {
             // Parse field
-            std::string fieldName = current().value;
-            expect(TokenType::IDENTIFIER);
+            std::string fieldName = memberName; // Use the memberName we already parsed
             expect(TokenType::COLON);
             
             DataType fieldType;
@@ -1024,7 +1076,7 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
     
     expect(TokenType::RBRACE);
     
-    // Don't pack here - the analyzer will do it after resolving inheritance and building vtable
+    // Don't pack here - the analyzer will do it after resolving inheritance and building method layout
     
     // Register the class in the global registry
     classRegistry[className] = classDecl.get();

@@ -353,16 +353,17 @@ public:
     std::map<std::string, int> parentOffsets;   // parent class name -> offset in object layout
     std::vector<std::string> allFieldsInOrder;  // All fields (parents + own) in layout order
     
-    // VTable information (build-time, converted to runtime ClassMetadata)
-    struct VTableEntry {
+    // Method closure layout information (build-time layout descriptor)
+    // Each object instance contains all method closures embedded directly in the object
+    struct MethodLayoutInfo {
         std::string methodName;
         FunctionDeclNode* method;  // Pointer to the method's FunctionDeclNode (build-time)
-        int thisOffset;            // Offset adjustment needed for this pointer
+        int thisOffset;            // Offset adjustment needed for this pointer (for inherited methods)
         ClassDeclNode* definingClass; // Which class originally defined this method
         int closureSize = 0;       // Size of the closure for this method
         int closureOffsetInObject = 0; // Offset in object where this method's closure is stored
     };
-    std::vector<VTableEntry> vtable;
+    std::vector<MethodLayoutInfo> methodLayout;
     
     int totalMethodClosuresSize = 0;  // Total size of all method closures in object
     int totalSize = 0;                 // Total size of all fields (no header, no methods, just data)
@@ -385,7 +386,7 @@ public:
         
         // Calculate method closure sizes and offsets
         totalMethodClosuresSize = 0;
-        for (auto& entry : vtable) {
+        for (auto& entry : methodLayout) {
             // Closure layout: [func_addr(8)][size(8)][scope_ptr1(8)]...[scope_ptrN(8)]
             int closureSize = 16; // func_addr + size field
             if (entry.method && entry.method->allNeeded.size() > 0) {
@@ -404,7 +405,7 @@ public:
         printf("  Fields size: %d bytes\n", totalSize);
         printf("  Total object data size: %d bytes\n", totalObjectDataSize);
         
-        for (auto& entry : vtable) {
+        for (auto& entry : methodLayout) {
             printf("  Method '%s' closure at offset %d (size=%d)\n", 
                    entry.methodName.c_str(), entry.closureOffsetInObject, entry.closureSize);
         }
@@ -456,7 +457,7 @@ public:
     
     // Resolved during analysis
     FunctionDeclNode* resolvedMethod = nullptr; // The actual method function
-    int vtableIndex = -1;                       // Index in the vtable
+    int methodLayoutIndex = -1;                 // Index in the method layout
     int thisOffset = 0;                         // Offset to adjust this pointer
     ClassDeclNode* objectClass = nullptr;       // Class of the object
     int methodClosureOffset = 0;                // Offset in object where method closure is stored

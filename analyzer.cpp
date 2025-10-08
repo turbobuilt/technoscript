@@ -4,7 +4,7 @@
 void Analyzer::analyze(LexicalScopeNode* root, const std::map<std::string, ClassDeclNode*>& classes) {
     classRegistry = &classes;
     
-    std::cout << "DEBUG Analyzer: Phase 1 - Analyzing classes (inheritance, layout, vtables)..." << std::endl;
+    std::cout << "DEBUG Analyzer: Phase 1 - Analyzing classes (inheritance, layout, method closures)..." << std::endl;
     
     // Phase 1: Process all classes FIRST - single pass through classes
     // This must happen before analyzing the AST because object layouts need to be known
@@ -17,10 +17,10 @@ void Analyzer::analyze(LexicalScopeNode* root, const std::map<std::string, Class
         // Step 2: Calculate object layout with inheritance
         calculateClassLayout(classDecl);
         
-        // Step 3: Build vtable
+        // Step 3: Build method layout
         buildClassVTable(classDecl);
         
-        // Step 4: Re-pack to calculate method closure sizes now that vtable is built
+        // Step 4: Re-pack to calculate method closure sizes now that layout is built
         classDecl->pack();
     }
     
@@ -69,6 +69,8 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
     
     // Step 2: Analyze current node for variable references
     if (node->type == AstNodeType::IDENTIFIER || node->type == AstNodeType::FUNCTION_CALL) {
+        std::cout << "DEBUG analyzeNodeSinglePass: Analyzing node type " << (int)node->type 
+                  << " with value '" << node->value << "'" << std::endl;
         node->varRef = findVariable(node->value, currentScope);
         
         // Set the accessedIn property for identifier nodes
@@ -289,28 +291,28 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
             throw std::runtime_error("Cannot resolve class for method call: " + methodCall->methodName);
         }
         
-        // Find the method in the class hierarchy (vtable)
-        auto* vtableEntry = findMethodInClass(objectClass, methodCall->methodName);
-        if (!vtableEntry) {
+        // Find the method in the class hierarchy (method layout)
+        auto* methodInfo = findMethodInClass(objectClass, methodCall->methodName);
+        if (!methodInfo) {
             throw std::runtime_error("Method '" + methodCall->methodName + "' not found in class '" + objectClass->className + "'");
         }
         
-        methodCall->resolvedMethod = vtableEntry->method;
-        methodCall->thisOffset = vtableEntry->thisOffset;
+        methodCall->resolvedMethod = methodInfo->method;
+        methodCall->thisOffset = methodInfo->thisOffset;
         methodCall->objectClass = objectClass;
         
-        // Find vtable index
-        for (size_t i = 0; i < objectClass->vtable.size(); i++) {
-            if (objectClass->vtable[i].methodName == methodCall->methodName) {
-                methodCall->vtableIndex = i;
-                methodCall->methodClosureOffset = objectClass->vtable[i].closureOffsetInObject;
+        // Find method layout index
+        for (size_t i = 0; i < objectClass->methodLayout.size(); i++) {
+            if (objectClass->methodLayout[i].methodName == methodCall->methodName) {
+                methodCall->methodLayoutIndex = i;
+                methodCall->methodClosureOffset = objectClass->methodLayout[i].closureOffsetInObject;
                 break;
             }
         }
         
         std::cout << "DEBUG: Resolved METHOD_CALL '" << methodCall->methodName 
                   << "' in class '" << objectClass->className 
-                  << "' at vtable index " << methodCall->vtableIndex
+                  << "' at method layout index " << methodCall->methodLayoutIndex
                   << " with this offset " << methodCall->thisOffset
                   << " and closure offset " << methodCall->methodClosureOffset << std::endl;
         
@@ -493,9 +495,9 @@ void Analyzer::calculateClassLayout(ClassDeclNode* classDecl) {
 
 // Build vtable for a class with multiple inheritance
 void Analyzer::buildClassVTable(ClassDeclNode* classDecl) {
-    std::cout << "DEBUG: Building vtable for class '" << classDecl->className << "'" << std::endl;
+    std::cout << "DEBUG: Building method layout for class '" << classDecl->className << "'" << std::endl;
     
-    classDecl->vtable.clear();
+    classDecl->methodLayout.clear();
     std::map<std::string, int> methodToIndex; // Track which methods we've added
     
     // Step 1: Add parent class methods with appropriate 'this' offset adjustments
@@ -506,19 +508,19 @@ void Analyzer::buildClassVTable(ClassDeclNode* classDecl) {
         // Add parent's methods (or their overridden versions if parent has vtable)
         for (auto& [methodName, method] : parent->methods) {
             if (methodToIndex.find(methodName) == methodToIndex.end()) {
-                // Method not yet in vtable, add it
-                ClassDeclNode::VTableEntry entry;
+                // Method not yet in layout, add it
+                ClassDeclNode::MethodLayoutInfo entry;
                 entry.methodName = methodName;
                 entry.method = method.get();
                 entry.thisOffset = parentOffset; // Adjust 'this' to point to parent's data
                 entry.definingClass = parent;
                 
-                methodToIndex[methodName] = classDecl->vtable.size();
-                classDecl->vtable.push_back(entry);
+                methodToIndex[methodName] = classDecl->methodLayout.size();
+                classDecl->methodLayout.push_back(entry);
                 
                 std::cout << "DEBUG:   Added parent method '" << methodName 
                           << "' from '" << parent->className 
-                          << "' at index " << (classDecl->vtable.size() - 1)
+                          << "' at index " << (classDecl->methodLayout.size() - 1)
                           << " with this offset " << parentOffset << std::endl;
             }
         }
@@ -535,36 +537,36 @@ void Analyzer::buildClassVTable(ClassDeclNode* classDecl) {
         if (it != methodToIndex.end()) {
             // Override parent method
             int index = it->second;
-            classDecl->vtable[index].method = method.get();
-            classDecl->vtable[index].thisOffset = 0; // Own methods use base object pointer
-            classDecl->vtable[index].definingClass = classDecl;
+            classDecl->methodLayout[index].method = method.get();
+            classDecl->methodLayout[index].thisOffset = 0; // Own methods use base object pointer
+            classDecl->methodLayout[index].definingClass = classDecl;
             
             std::cout << "DEBUG:   Overriding method '" << methodName 
                       << "' at index " << index 
                       << " with this offset 0" << std::endl;
         } else {
             // New method
-            ClassDeclNode::VTableEntry entry;
+            ClassDeclNode::MethodLayoutInfo entry;
             entry.methodName = methodName;
             entry.method = method.get();
             entry.thisOffset = 0; // Own methods use base object pointer
             entry.definingClass = classDecl;
             
-            methodToIndex[methodName] = classDecl->vtable.size();
-            classDecl->vtable.push_back(entry);
+            methodToIndex[methodName] = classDecl->methodLayout.size();
+            classDecl->methodLayout.push_back(entry);
             
             std::cout << "DEBUG:   Added own method '" << methodName 
-                      << "' at index " << (classDecl->vtable.size() - 1)
+                      << "' at index " << (classDecl->methodLayout.size() - 1)
                       << " with this offset 0" << std::endl;
         }
     }
     
-    std::cout << "DEBUG: Class '" << classDecl->className << "' vtable size: " << classDecl->vtable.size() << std::endl;
+    std::cout << "DEBUG: Class '" << classDecl->className << "' method layout size: " << classDecl->methodLayout.size() << std::endl;
 }
 
-// Find a method in a class's vtable
-ClassDeclNode::VTableEntry* Analyzer::findMethodInClass(ClassDeclNode* classDecl, const std::string& methodName) {
-    for (auto& entry : classDecl->vtable) {
+// Find a method in a class's method layout
+ClassDeclNode::MethodLayoutInfo* Analyzer::findMethodInClass(ClassDeclNode* classDecl, const std::string& methodName) {
+    for (auto& entry : classDecl->methodLayout) {
         if (entry.methodName == methodName) {
             return &entry;
         }

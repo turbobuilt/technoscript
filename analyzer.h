@@ -24,7 +24,7 @@ private:
     void buildClassVTable(ClassDeclNode* classDecl);
     
     // Method resolution for method calls
-    ClassDeclNode::VTableEntry* findMethodInClass(ClassDeclNode* classDecl, const std::string& methodName);
+    ClassDeclNode::MethodLayoutInfo* findMethodInClass(ClassDeclNode* classDecl, const std::string& methodName);
     
     // Dependency tracking helpers
     void addParentDep(LexicalScopeNode* scope, int depthIdx);

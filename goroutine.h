@@ -167,10 +167,8 @@ public:
 // Runtime functions callable from generated code
 extern "C" {
     // Called by 'go' statements to spawn new goroutines
-    void runtime_spawn_goroutine(void* funcPtr, void** paramArray, size_t paramCount);
-    
-    // Internal goroutine execution trampoline
-    void goroutine_execute(void* funcPtr, void** paramArray, size_t paramCount);
+    // Takes pre-allocated scope with parameters already populated
+    void runtime_spawn_goroutine(void* funcPtr, void* scopePtr, void* parentScopePtr);
     
     // Called by 'setTimeout' statements to schedule delayed function execution
     void runtime_set_timeout(void (*func)(void*), void* args, size_t argsSize, int delayMs);

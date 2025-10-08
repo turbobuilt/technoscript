@@ -12,13 +12,14 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
     std::string code = R"(
-var z: int64 = 22;
-function test(x: int64) {
-    print(x);
-    print(z);
+class Animal {
+    age: int64;
+    printAge() {
+        print(this.age);
+    }
 }
-var a: int64 = 42;
-test(a);a
+var a: Animal = new Animal();
+a.printAge();
 )";
     std::cout << "=== Testing class method with 'this' ===\n";
 

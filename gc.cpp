@@ -96,7 +96,7 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
                 // Field offset = header + field offset (no method closures in instance, just pointers)
                 // Actually, instances have closure POINTERS, not embedded closures
                 // So the offset calculation needs to account for method closure pointers
-                int absoluteOffset = 16 + (classDecl->vtable.size() * 8) + parentOffset + fieldInfo.offset;
+                int absoluteOffset = 16 + (classDecl->methodLayout.size() * 8) + parentOffset + fieldInfo.offset;
                 allFields.emplace_back(
                     absoluteOffset, 
                     fieldInfo.type, 
@@ -114,7 +114,7 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
             }
             
             // Field offset = header + closure pointers + field offset
-            int absoluteOffset = 16 + (classDecl->vtable.size() * 8) + fieldInfo.offset;
+            int absoluteOffset = 16 + (classDecl->methodLayout.size() * 8) + fieldInfo.offset;
             allFields.emplace_back(
                 absoluteOffset, 
                 fieldInfo.type, 
@@ -125,16 +125,16 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
         
         // Build simple method closure array
         Closure** methodClosures = nullptr;
-        if (!classDecl->vtable.empty()) {
-            methodClosures = new Closure*[classDecl->vtable.size()];
+        if (!classDecl->methodLayout.empty()) {
+            methodClosures = new Closure*[classDecl->methodLayout.size()];
             
-            for (size_t i = 0; i < classDecl->vtable.size(); i++) {
-                const auto& vtEntry = classDecl->vtable[i];
+            for (size_t i = 0; i < classDecl->methodLayout.size(); i++) {
+                const auto& methodInfo = classDecl->methodLayout[i];
                 
                 // Calculate closure size: size field + func_addr + scope pointers
                 size_t closureSize = 16; // size field + func_addr
-                if (vtEntry.method && vtEntry.method->allNeeded.size() > 0) {
-                    closureSize += vtEntry.method->allNeeded.size() * 8;
+                if (methodInfo.method && methodInfo.method->allNeeded.size() > 0) {
+                    closureSize += methodInfo.method->allNeeded.size() * 8;
                 }
                 
                 // Allocate closure
@@ -147,9 +147,9 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
                 
                 methodClosures[i] = closure;
                 
-                std::cout << "    - Method '" << vtEntry.methodName << "' closure size: " 
+                std::cout << "    - Method '" << methodInfo.methodName << "' closure size: " 
                           << closureSize << " bytes (needs " 
-                          << (vtEntry.method ? vtEntry.method->allNeeded.size() : 0) 
+                          << (methodInfo.method ? methodInfo.method->allNeeded.size() : 0) 
                           << " scopes)" << std::endl;
             }
         }
@@ -182,7 +182,7 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
             allFields.size(),
             fieldsArray,
             classDecl->totalSize,
-            classDecl->vtable.size(),
+            classDecl->methodLayout.size(),
             methodClosures,
             numParents,
             parentNames,
@@ -194,7 +194,7 @@ void MetadataRegistry::buildClassMetadata(const std::map<std::string, ClassDeclN
         
         std::cout << "  - Created metadata for class '" << className 
                   << "' with " << allFields.size() << " fields, " 
-                  << classDecl->vtable.size() << " methods, " 
+                  << classDecl->methodLayout.size() << " methods, " 
                   << numParents << " parents" << std::endl;
     }
     
