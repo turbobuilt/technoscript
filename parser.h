@@ -14,7 +14,11 @@ enum class TokenType {
 struct Token {
     TokenType type;
     std::string value;
-    Token(TokenType t, const std::string& v = "") : type(t), value(v) {}
+    size_t line;
+    size_t column;
+    size_t position;  // Absolute position in source
+    Token(TokenType t, const std::string& v = "", size_t l = 0, size_t c = 0, size_t p = 0) 
+        : type(t), value(v), line(l), column(c), position(p) {}
 };
 
 class Parser {
@@ -26,6 +30,7 @@ private:
     LexicalScopeNode* currentFunctionScope = nullptr; // Track current function scope during parsing
     std::map<std::string, ClassDeclNode*> classRegistry; // Global registry of all classes
     std::vector<FunctionDeclNode*> functionRegistry;  // Registry of all functions including methods
+    std::string sourceCode;  // Store original source code for error reporting
     
     Token& current() { return tokens[pos]; }
     void advance() { if (pos < tokens.size() - 1) pos++; }
@@ -37,6 +42,9 @@ private:
     
     // Helper method for error messages
     std::string tokenTypeToString(TokenType type);
+    
+    // Enhanced error reporting
+    void displayError(const std::string& message, const Token& token);
     
     std::vector<Token> tokenize(const std::string& code);
     std::unique_ptr<ASTNode> parseStatement(LexicalScopeNode* scope);

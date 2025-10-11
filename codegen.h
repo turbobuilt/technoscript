@@ -4,6 +4,7 @@
 #include "gc.h"  // Must be before goroutine.h since goroutine uses GoroutineGCState
 #include "library.h"
 #include "goroutine.h"
+#include "asm_library.h"
 #include <asmjit/asmjit.h>
 #include <capstone/capstone.h>
 #include <memory>
@@ -59,6 +60,9 @@ private:
     x86::Builder* cb = nullptr; // Builder pointer - created fresh each time
     csh capstoneHandle;
     
+    // Assembly library for built-in functions
+    std::unique_ptr<AsmLibrary> asmLibrary;
+    
     // Current function context
     LexicalScopeNode* currentScope;
     std::unordered_map<LexicalScopeNode*, x86::Gp> scopeRegisters;
@@ -81,6 +85,12 @@ private:
     void generateMemberAssign(MemberAssignNode* memberAssign);
     void generateClassDecl(ClassDeclNode* classDecl);
     
+    // Assembly library wrapper methods for internal use
+    void makeSafeUnorderedList(x86::Gp addressReg, x86::Gp offsetReg, int32_t initialSize = 16);
+    void addToSafeList(x86::Gp addressReg, x86::Gp offsetReg, x86::Gp valueReg);
+    void removeFromSafeList(x86::Gp addressReg, x86::Gp offsetReg, x86::Gp indexReg);
+    void compactSafeList(x86::Gp addressReg, x86::Gp offsetReg);
+    
     // Patch method addresses into metadata closures after code commit
     void patchMetadataClosures(void* codeBase, const std::map<std::string, ClassDeclNode*>& classRegistry);
     
@@ -94,9 +104,11 @@ private:
     void generateScopePrologue(LexicalScopeNode* scope);
     void generateScopeEpilogue(LexicalScopeNode* scope);
     
-    // Metadata generation for GC (scope metadata created on-the-fly, class metadata from registry)
-    // Note: Returns void* to avoid circular include dependencies
-    void* createScopeMetadata(LexicalScopeNode* scope);
+    // Metadata generation for GC
+    // Scope metadata is created ONCE at compile time and stored in scope->metadata
+    void initializeAllScopeMetadata(ASTNode* root, const std::vector<FunctionDeclNode*>& functionRegistry);
+    void initializeScopeMetadataRecursive(ASTNode* node);  // Helper for recursive traversal
+    void* createScopeMetadata(LexicalScopeNode* scope);  // Returns void* to avoid circular includes
     
     // Block statement utilities
     void generateBlockStmt(BlockStmtNode* blockStmt);
@@ -116,6 +128,7 @@ private:
     Label printInt64Label;
     Label mallocLabel;
     Label freeLabel;
+    Label callocLabel;
 };
 
 // Main interface class expected by main.cpp
@@ -135,5 +148,6 @@ private:
 // External C functions that will be linked
 extern "C" {
     void* malloc_wrapper(size_t size);
+    void* calloc_wrapper(size_t nmemb, size_t size);
     void free_wrapper(void* ptr);
 }

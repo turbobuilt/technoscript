@@ -2,12 +2,41 @@
 #include <stdexcept>
 #include <cctype>
 #include <iostream>
+#include <sstream>
+
+void Parser::displayError(const std::string& message, const Token& token) {
+    std::cout << "\n=== SYNTAX ERROR ===" << std::endl;
+    std::cout << message << std::endl;
+    std::cout << "at line " << token.line << ", column " << token.column << std::endl;
+    
+    // Extract the relevant line from source code
+    std::string lines;
+    std::istringstream stream(sourceCode);
+    std::string line;
+    size_t currentLine = 1;
+    
+    while (std::getline(stream, line) && currentLine <= token.line) {
+        if (currentLine == token.line) {
+            std::cout << "\n" << line << std::endl;
+            
+            // Create caret indicator
+            std::string caret(token.column - 1, ' ');
+            caret += "^";
+            std::cout << caret << std::endl;
+            break;
+        }
+        currentLine++;
+    }
+    std::cout << std::endl;
+}
 
 void Parser::expect(TokenType t) {
     if (current().type != t) {
         std::string expected = tokenTypeToString(t);
         std::string actual = tokenTypeToString(current().type);
-        throw std::runtime_error("Expected " + expected + " but got " + actual + " at position " + std::to_string(pos));
+        std::string message = "Expected " + expected + " but got " + actual;
+        displayError(message, current());
+        throw std::runtime_error(message + " at position " + std::to_string(pos));
     }
     advance();
 }
@@ -15,76 +44,106 @@ void Parser::expect(TokenType t) {
 std::vector<Token> Parser::tokenize(const std::string& code) {
     std::vector<Token> result;
     size_t i = 0;
+    size_t line = 1;
+    size_t column = 1;
     
     while (i < code.length()) {
-        if (std::isspace(code[i])) { i++; continue; }
+        size_t tokenStart = i;
+        size_t tokenLine = line;
+        size_t tokenColumn = column;
+        
+        if (std::isspace(code[i])) {
+            if (code[i] == '\n') {
+                line++;
+                column = 1;
+            } else {
+                column++;
+            }
+            i++;
+            continue;
+        }
         
         if (std::isalpha(code[i])) {
             std::string word;
-            while (i < code.length() && (std::isalnum(code[i]) || code[i] == '_')) 
+            while (i < code.length() && (std::isalnum(code[i]) || code[i] == '_')) {
                 word += code[i++];
+                column++;
+            }
             
-            if (word == "var") result.emplace_back(TokenType::VAR);
-            else if (word == "function") result.emplace_back(TokenType::FUNCTION);
-            else if (word == "go") result.emplace_back(TokenType::GO);
-            else if (word == "int32") result.emplace_back(TokenType::INT32_TYPE);
-            else if (word == "int64") result.emplace_back(TokenType::INT64_TYPE);
-            else if (word == "print") result.emplace_back(TokenType::PRINT);
-            else if (word == "setTimeout") result.emplace_back(TokenType::SETTIMEOUT);
-            else if (word == "async") result.emplace_back(TokenType::ASYNC);
-            else if (word == "await") result.emplace_back(TokenType::AWAIT);
-            else if (word == "promise") result.emplace_back(TokenType::PROMISE);
-            else if (word == "sleep") result.emplace_back(TokenType::SLEEP);
-            else if (word == "for") result.emplace_back(TokenType::FOR);
-            else if (word == "let") result.emplace_back(TokenType::LET);
-            else if (word == "class") result.emplace_back(TokenType::CLASS);
-            else if (word == "new") result.emplace_back(TokenType::NEW);
-            else if (word == "this") result.emplace_back(TokenType::THIS);
-            else if (word == "extends") result.emplace_back(TokenType::EXTENDS);
-            else result.emplace_back(TokenType::IDENTIFIER, word);
+            if (word == "var") result.emplace_back(TokenType::VAR, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "function") result.emplace_back(TokenType::FUNCTION, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "go") result.emplace_back(TokenType::GO, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "int32") result.emplace_back(TokenType::INT32_TYPE, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "int64") result.emplace_back(TokenType::INT64_TYPE, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "print") result.emplace_back(TokenType::PRINT, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "setTimeout") result.emplace_back(TokenType::SETTIMEOUT, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "async") result.emplace_back(TokenType::ASYNC, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "await") result.emplace_back(TokenType::AWAIT, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "promise") result.emplace_back(TokenType::PROMISE, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "sleep") result.emplace_back(TokenType::SLEEP, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "for") result.emplace_back(TokenType::FOR, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "let") result.emplace_back(TokenType::LET, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "class") result.emplace_back(TokenType::CLASS, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "new") result.emplace_back(TokenType::NEW, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "this") result.emplace_back(TokenType::THIS, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "extends") result.emplace_back(TokenType::EXTENDS, word, tokenLine, tokenColumn, tokenStart);
+            else result.emplace_back(TokenType::IDENTIFIER, word, tokenLine, tokenColumn, tokenStart);
         }
         else if (std::isdigit(code[i])) {
             std::string num;
-            while (i < code.length() && std::isdigit(code[i])) num += code[i++];
-            result.emplace_back(TokenType::LITERAL, num);
+            while (i < code.length() && std::isdigit(code[i])) {
+                num += code[i++];
+                column++;
+            }
+            result.emplace_back(TokenType::LITERAL, num, tokenLine, tokenColumn, tokenStart);
         }
         else if (code[i] == '"') {
             std::string str;
-            i++;
-            while (i < code.length() && code[i] != '"') str += code[i++];
-            if (i < code.length()) i++;
-            result.emplace_back(TokenType::STRING, str);
+            i++; column++;
+            while (i < code.length() && code[i] != '"') {
+                str += code[i++];
+                column++;
+            }
+            if (i < code.length()) {
+                i++; column++;
+            }
+            result.emplace_back(TokenType::STRING, str, tokenLine, tokenColumn, tokenStart);
         }
         else {
+            std::string tokenValue(1, code[i]);
             switch (code[i]) {
-                case '=': result.emplace_back(TokenType::ASSIGN); i++; break;
-                case ';': result.emplace_back(TokenType::SEMICOLON); i++; break;
-                case '(': result.emplace_back(TokenType::LPAREN); i++; break;
-                case ')': result.emplace_back(TokenType::RPAREN); i++; break;
-                case '{': result.emplace_back(TokenType::LBRACE); i++; break;
-                case '}': result.emplace_back(TokenType::RBRACE); i++; break;
-                case ':': result.emplace_back(TokenType::COLON); i++; break;
-                case ',': result.emplace_back(TokenType::COMMA); i++; break;
-                case '.': result.emplace_back(TokenType::DOT); i++; break;
-                case '<': result.emplace_back(TokenType::LESS_THAN); i++; break;
+                case '=': result.emplace_back(TokenType::ASSIGN, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case ';': result.emplace_back(TokenType::SEMICOLON, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case '(': result.emplace_back(TokenType::LPAREN, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case ')': result.emplace_back(TokenType::RPAREN, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case '{': result.emplace_back(TokenType::LBRACE, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case '}': result.emplace_back(TokenType::RBRACE, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case ':': result.emplace_back(TokenType::COLON, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case ',': result.emplace_back(TokenType::COMMA, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case '.': result.emplace_back(TokenType::DOT, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case '<': result.emplace_back(TokenType::LESS_THAN, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
                 case '+':
                     if (i + 1 < code.length() && code[i + 1] == '+') {
-                        result.emplace_back(TokenType::PLUS_PLUS);
+                        result.emplace_back(TokenType::PLUS_PLUS, "++", tokenLine, tokenColumn, tokenStart);
                         i += 2;
+                        column += 2;
                     } else {
-                        i++; // Skip unrecognized single '+'
+                        i++; column++; // Skip unrecognized single '+'
                     }
                     break;
-                default: i++; break; // Skip unrecognized characters
+                default: i++; column++; break; // Skip unrecognized characters
             }
         }
     }
-    result.emplace_back(TokenType::EOF_TOKEN);
+    result.emplace_back(TokenType::EOF_TOKEN, "", line, column, i);
     return result;
 }
 
 std::unique_ptr<FunctionDeclNode> Parser::parse(const std::string& code) {
     std::cout << "DEBUG Parser::parse: Starting parse" << std::endl;
+    
+    // Store source code for error reporting
+    sourceCode = code;
     
     tokens = tokenize(code);
     std::cout << "DEBUG Parser::parse: Tokenized into " << tokens.size() << " tokens" << std::endl;
@@ -116,35 +175,19 @@ std::unique_ptr<FunctionDeclNode> Parser::parse(const std::string& code) {
                                    std::to_string(RobustnessLimits::MAX_PARSER_ITERATIONS) + "), possible infinite loop");
         }
         
-        try {
-            auto stmt = parseStatement(root.get());
-            
-            if (stmt) {
-                root->ASTNode::children.push_back(std::move(stmt));
-            } else {
-                // Enhanced error recovery: synchronize to next statement
-                if (pos == lastPos) {
-                    std::cout << "ERROR: Parser stuck at position " << pos << ", token: " << (int)current().type << " value: '" << current().value << "'" << std::endl;
-                    
-                    // Try to recover by finding next synchronization point
-                    if (!synchronizeToNextStatement()) {
-                        throw std::runtime_error("Parser unable to recover from error at position " + std::to_string(pos));
-                    }
-                    std::cout << "INFO: Parser recovered at position " << pos << std::endl;
-                } else {
-                    // Position advanced, continue normally
-                    if (pos < tokens.size() - 1) advance();
-                }
+        auto stmt = parseStatement(root.get());
+        
+        if (stmt) {
+            root->ASTNode::children.push_back(std::move(stmt));
+        } else {
+            // If parseStatement returns null and position hasn't advanced, we're stuck
+            if (pos == lastPos) {
+                throw std::runtime_error("Parser stuck at position " + std::to_string(pos) + 
+                                       ", token: " + std::to_string((int)current().type) + 
+                                       " value: '" + current().value + "'");
             }
-        } catch (const std::runtime_error& e) {
-            std::cout << "ERROR: Parsing failed at position " << pos << ": " << e.what() << std::endl;
-            
-            // Try to recover by finding next synchronization point
-            if (!synchronizeToNextStatement()) {
-                std::cout << "FATAL: Unable to recover from parsing error" << std::endl;
-                throw; // Re-throw the original error
-            }
-            std::cout << "INFO: Parser recovered from error at position " << pos << std::endl;
+            // Position advanced, continue normally
+            if (pos < tokens.size() - 1) advance();
         }
         
         lastPos = pos;
@@ -1079,7 +1122,7 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
             fieldInfo.offset = 0; // Will be set during packing/layout
             
             classDecl->fields[fieldName] = fieldInfo;
-            expect(TokenType::SEMICOLON);
+            // Note: No semicolon expected for field declarations in TechnoScript
         }
     }
     

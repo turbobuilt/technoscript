@@ -1,4 +1,5 @@
 #include "analyzer.h"
+#include "codegen.h"
 #include <iostream>
 
 void Analyzer::analyze(LexicalScopeNode* root, const std::map<std::string, ClassDeclNode*>& classes) {
@@ -182,12 +183,15 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
                     // Found in parent - use parent's class and calculate offset
                     memberAccess->classRef = parent;
                     int parentOffset = objectClass->parentOffsets[parent->className];
-                    memberAccess->memberOffset = parentOffset + parentFieldIt->second.offset;
+                    // Include header size in the absolute offset
+                    memberAccess->memberOffset = ObjectLayout::HEADER_SIZE + parentOffset + parentFieldIt->second.offset;
                     foundInParent = true;
                     std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
                               << "' from parent '" << parent->className 
-                              << "' at offset " << memberAccess->memberOffset 
-                              << " in class '" << objectClass->className << "'" << std::endl;
+                              << "' at absolute offset " << memberAccess->memberOffset 
+                              << " (header=" << ObjectLayout::HEADER_SIZE 
+                              << " + parent=" << parentOffset 
+                              << " + field=" << parentFieldIt->second.offset << ") in class '" << objectClass->className << "'" << std::endl;
                     break;
                 }
             }
@@ -198,11 +202,13 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         } else {
             // Found in own class
             memberAccess->classRef = objectClass;
-            memberAccess->memberOffset = fieldIt->second.offset;
+            // Include header size in the absolute offset
+            memberAccess->memberOffset = ObjectLayout::HEADER_SIZE + fieldIt->second.offset;
             
             std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
-                      << "' at offset " << memberAccess->memberOffset 
-                      << " in class '" << objectClass->className << "'" << std::endl;
+                      << "' at absolute offset " << memberAccess->memberOffset 
+                      << " (header=" << ObjectLayout::HEADER_SIZE 
+                      << " + field=" << fieldIt->second.offset << ") in class '" << objectClass->className << "'" << std::endl;
         }
     } else if (node->type == AstNodeType::MEMBER_ASSIGN) {
         // Handle member assignment

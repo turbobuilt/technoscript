@@ -123,6 +123,9 @@ public:
     // -1 means it's the immediate parent scope itself (stored in current scope)
     std::map<int, int> scopeDepthToParentParameterIndexMap;
     
+    // GC metadata - created once at compile time, not at runtime!
+    void* metadata = nullptr;  // Points to ScopeMetadata (stored as void* to avoid circular header dependency)
+    
     LexicalScopeNode(LexicalScopeNode* p = nullptr, int d = 0) : ASTNode(AstNodeType::FUNCTION_DECL), parentFunctionScope(p), depth(d) {
         // Parent pointers are set later by setupParentPointers() in analyzer
         // Note: type will be properly set by derived classes (e.g., FunctionDeclNode)
@@ -362,6 +365,7 @@ public:
         ClassDeclNode* definingClass; // Which class originally defined this method
         int closureSize = 0;       // Size of the closure for this method
         int closureOffsetInObject = 0; // Offset in object where this method's closure is stored
+        VariableInfo closurePointerField; // Virtual field for the closure pointer in object layout
     };
     std::vector<MethodLayoutInfo> methodLayout;
     
@@ -377,14 +381,32 @@ public:
     
     // Pack class fields using the shared packing algorithm
     void pack() {
-        std::vector<VariableInfo*> fieldVars;
-        for (auto& [name, fieldInfo] : fields) {
-            fieldVars.push_back(&fieldInfo);
+        std::vector<VariableInfo*> allObjectFields;
+        
+        // First, add closure pointer "fields" for each method
+        for (auto& entry : methodLayout) {
+            // Create a virtual field for the closure pointer (8 bytes)
+            entry.closurePointerField.name = entry.methodName + "_closure_ptr";
+            entry.closurePointerField.type = DataType::CLOSURE;
+            entry.closurePointerField.size = 8;
+            entry.closurePointerField.offset = 0; // Will be set by packing
+            allObjectFields.push_back(&entry.closurePointerField);
         }
         
-        totalSize = VariablePacking::packVariables(fieldVars);
+        // Then add regular fields
+        for (auto& [name, fieldInfo] : fields) {
+            allObjectFields.push_back(&fieldInfo);
+        }
         
-        // Calculate method closure sizes and offsets
+        // Pack all fields together (closure pointers + regular fields)
+        totalSize = VariablePacking::packVariables(allObjectFields);
+        
+        // Extract closure pointer offsets from the packed results
+        for (auto& entry : methodLayout) {
+            entry.closureOffsetInObject = entry.closurePointerField.offset;
+        }
+        
+        // Calculate method closure sizes (for separate allocation)
         totalMethodClosuresSize = 0;
         for (auto& entry : methodLayout) {
             // Closure layout: [func_addr(8)][size(8)][scope_ptr1(8)]...[scope_ptrN(8)]
@@ -393,7 +415,6 @@ public:
                 closureSize += entry.method->allNeeded.size() * 8;
             }
             entry.closureSize = closureSize;
-            entry.closureOffsetInObject = totalMethodClosuresSize;
             totalMethodClosuresSize += closureSize;
         }
         
@@ -411,10 +432,8 @@ public:
         }
         
         for (const auto& [name, fieldInfo] : fields) {
-            // Fields start after method closures
-            int actualOffset = totalMethodClosuresSize + fieldInfo.offset;
-            printf("  Field '%s' at offset %d (relative to fields start: %d, size=%d)\n", 
-                   name.c_str(), actualOffset, fieldInfo.offset, fieldInfo.size);
+            printf("  Field '%s' at offset %d (size=%d)\n", 
+                   name.c_str(), fieldInfo.offset, fieldInfo.size);
         }
     }
 };
@@ -639,12 +658,12 @@ inline void LexicalScopeNode::pack() {
         offset = startOffset + varsSize;
     }
     
-    // Ensure total size is 8-byte aligned and includes the 8-byte flags header
+    // Ensure total size is 8-byte aligned and includes the flags + metadata headers
     totalSize = (offset + 7) & ~7;
     
-    // Ensure minimum size is at least FLAGS_SIZE (8 bytes) even for empty scopes
-    if (totalSize < 8) {
-        totalSize = 8;
+    // Ensure minimum size is at least FLAGS_SIZE + METADATA_SIZE (16 bytes) even for empty scopes
+    if (totalSize < 16) {
+        totalSize = 16;
     }
 }
 

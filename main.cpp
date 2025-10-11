@@ -11,17 +11,18 @@ int main(int argc, char* argv[]) {
     std::cout.flush();
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
-    std::string code = R"(
-class Animal {
-    age: int64;
+        std::string code = R"(
+class Dog {
+    age: int64
     printAge() {
         print(this.age);
     }
 }
-var a: Animal = new Animal();
-a.printAge();
+var d: Dog = new Dog();
+d.age = 5;
+d.printAge();
 )";
-    std::cout << "=== Testing class method with 'this' ===\n";
+    std::cout << "=== Testing safe unordered list ===\n";
 
     
     Parser parser;

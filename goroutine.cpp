@@ -174,12 +174,14 @@ void EventLoop::createWorkerIfNeeded() {
             // Set state to RUNNING since we're about to start it with a task
             worker->state.store(WorkerState::RUNNING, std::memory_order_release);
             
-            // Create the worker thread
-            worker->thread = std::make_unique<std::thread>([this, workerId]() {
+            // Add worker to vector BEFORE starting thread to avoid race condition
+            workerThreads.push_back(std::move(worker));
+            
+            // Create the worker thread AFTER adding to vector
+            workerThreads[workerId]->thread = std::make_unique<std::thread>([this, workerId]() {
                 workerThreadFunction(workerId);
             });
             
-            workerThreads.push_back(std::move(worker));
             std::cout << "Created worker thread " << workerId << " with assigned task (total: " << (currentActive + 1) << ")" << std::endl;
         } else {
             // Failed to create worker, put task back in queue

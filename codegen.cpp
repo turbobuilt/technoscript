@@ -69,7 +69,14 @@ void* CodeGenerator::generateCode(ASTNode* root, const std::map<std::string, Cla
     // Create builder with the code holder
     cb = new x86::Builder(&code);
     
+    // Initialize AsmLibrary with the current builder
+    asmLibrary = std::make_unique<AsmLibrary>(*cb, x86::r15);
+    
     std::cout << "=== Generated Assembly Code ===" << std::endl;
+    
+    // INITIALIZATION: Create all scope metadata at compile time before generating any code
+    std::cout << "\n=== Initializing Scope Metadata (Compile Time) ===" << std::endl;
+    initializeAllScopeMetadata(root, functionRegistry);
     
     // FIRST PASS: Generate all functions (including methods) upfront
     std::cout << "\n=== First Pass: Generating All Functions ===" << std::endl;
@@ -119,6 +126,7 @@ void CodeGenerator::declareExternalFunctions() {
     printInt64Label = cb->newLabel();
     mallocLabel = cb->newLabel();
     freeLabel = cb->newLabel();
+    callocLabel = cb->newLabel();
 }
 
 void CodeGenerator::generateAllFunctions(const std::vector<FunctionDeclNode*>& functionRegistry) {
@@ -182,6 +190,12 @@ void CodeGenerator::generateAllFunctions(const std::vector<FunctionDeclNode*>& f
         
         // Restore previous scope
         currentScope = previousScope;
+    }
+    
+    // Generate AsmLibrary utility functions
+    if (asmLibrary) {
+        std::cout << "Generating AsmLibrary utility functions" << std::endl;
+        asmLibrary->emitAllFunctionDefinitions();
     }
     
     std::cout << "Finished generating all functions from registry" << std::endl;
@@ -289,11 +303,12 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
     // Store the allocated memory address in r15
     cb->mov(x86::r15, x86::rax);
     
-    // Create and store scope metadata
-    ScopeMetadata* metadata = static_cast<ScopeMetadata*>(createScopeMetadata(scope));
-    
-    // Store metadata pointer at offset 8 in the scope
-    cb->mov(x86::r11, reinterpret_cast<uint64_t>(metadata));
+    // Store pre-computed metadata pointer at offset 8 in the scope
+    // The metadata was created at compile time, so we just load the pointer
+    if (!scope->metadata) {
+        throw std::runtime_error("Scope metadata not initialized at compile time!");
+    }
+    cb->mov(x86::r11, reinterpret_cast<uint64_t>(scope->metadata));
     cb->mov(x86::qword_ptr(x86::r15, ScopeLayout::METADATA_OFFSET), x86::r11);
     
     // Track scope as an allocated object for GC
@@ -313,6 +328,9 @@ void CodeGenerator::allocateScope(LexicalScopeNode* scope) {
 
 void* CodeGenerator::createScopeMetadata(LexicalScopeNode* scope) {
     if (!scope) return nullptr;
+    
+    // This function is now called at COMPILE TIME (during code generation setup)
+    // NOT at runtime! The metadata is created once and reused for all scope allocations.
     
     // Count variables that need GC tracking (objects and closures)
     std::vector<VarMetadata> trackedVars;
@@ -337,7 +355,7 @@ void* CodeGenerator::createScopeMetadata(LexicalScopeNode* scope) {
         }
     }
     
-    // Allocate metadata structure
+    // Allocate metadata structure ONCE at compile time
     ScopeMetadata* metadata = new ScopeMetadata();
     metadata->numVars = trackedVars.size();
     
@@ -350,9 +368,47 @@ void* CodeGenerator::createScopeMetadata(LexicalScopeNode* scope) {
         metadata->vars = nullptr;
     }
     
-    std::cout << "Created scope metadata with " << metadata->numVars << " tracked variables" << std::endl;
+    std::cout << "Created scope metadata at compile time with " << metadata->numVars << " tracked variables" << std::endl;
     
     return metadata;
+}
+
+void CodeGenerator::initializeAllScopeMetadata(ASTNode* root, const std::vector<FunctionDeclNode*>& functionRegistry) {
+    std::cout << "Initializing scope metadata for all scopes at compile time..." << std::endl;
+    
+    // Process all functions in the registry (includes methods)
+    for (auto* funcDecl : functionRegistry) {
+        // Create metadata for the function scope itself
+        if (!funcDecl->metadata) {
+            funcDecl->metadata = createScopeMetadata(funcDecl);
+            std::cout << "  Created metadata for function: " << funcDecl->funcName << std::endl;
+        }
+        
+        // Recursively process all nested scopes (blocks) within this function
+        initializeScopeMetadataRecursive(funcDecl);
+    }
+    
+    std::cout << "Scope metadata initialization complete!" << std::endl;
+}
+
+void CodeGenerator::initializeScopeMetadataRecursive(ASTNode* node) {
+    if (!node) return;
+    
+    // If this is a lexical scope (block), create its metadata
+    if (node->type == AstNodeType::BLOCK_STMT) {
+        BlockStmtNode* block = static_cast<BlockStmtNode*>(node);
+        if (!block->metadata) {
+            block->metadata = createScopeMetadata(block);
+            std::cout << "    Created metadata for block at depth " << block->depth << std::endl;
+        }
+    }
+    
+    // Recursively process children (skip nested functions - they're handled in the main loop)
+    for (auto& child : node->children) {
+        if (child->type != AstNodeType::FUNCTION_DECL && child->type != AstNodeType::CLASS_DECL) {
+            initializeScopeMetadataRecursive(child.get());
+        }
+    }
 }
 
 void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
@@ -1038,10 +1094,11 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     if (isMethodCall) {
         // Load object pointer into rbx
         loadValue(methodCall->object.get(), x86::rbx, x86::r14);
-        // Add offset to get to the method closure in the object
-        int closureOffset = ObjectLayout::HEADER_SIZE + methodCall->methodClosureOffset;
-        std::cout << "  Loading method closure from object at offset " << closureOffset << std::endl;
-        cb->add(x86::rbx, closureOffset);
+        // Add offset to get to the method closure pointer in the object
+        int closurePtrOffset = ObjectLayout::HEADER_SIZE + methodCall->methodClosureOffset;
+        std::cout << "  Loading method closure pointer from object at offset " << closurePtrOffset << std::endl;
+        // Load the closure pointer (not add offset to object, but load the pointer value)
+        cb->mov(x86::rbx, x86::qword_ptr(x86::rbx, closurePtrOffset));
     } else {
         // Load closure address from caller's scope (r14)
         loadVariableAddress(static_cast<IdentifierNode*>(funcCall), x86::rbx, 0, x86::r14);
@@ -1062,7 +1119,8 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     
     // Load the function address from closure
     // For both method and regular calls, rbx points to the closure
-    cb->mov(x86::rax, x86::ptr(x86::rbx, 0)); // Load function address from closure
+    // Closure layout: [size(8)][func_addr(8)][scope_ptr1(8)]...[scope_ptrN(8)]
+    cb->mov(x86::rax, x86::ptr(x86::rbx, 8)); // Load function address from closure (offset 8, after size)
     
     // Make the call - r15 already points to the pre-allocated and populated scope
     // The callee will use this scope directly
@@ -1144,7 +1202,8 @@ void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
     }
     
     // Load the function address from closure (still in rbx)
-    cb->mov(x86::rax, x86::ptr(x86::rbx, 0)); // Load function address from closure
+    // Closure layout: [size(8)][func_addr(8)][scope_ptr1(8)]...[scope_ptrN(8)]
+    cb->mov(x86::rax, x86::ptr(x86::rbx, 8)); // Load function address from closure (offset 8, after size)
     
     // Now we have:
     // - rax = function pointer to call
@@ -1317,16 +1376,12 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     
     ClassDeclNode* classDecl = newExpr->classRef;
     
-    // Calculate total object size: header + closure pointers (8 bytes each) + fields
-    // NOTE: Instances have POINTERS to closures, not embedded closures
-    int numMethods = classDecl->methodLayout.size();
-    int closurePointersSize = numMethods * 8; // 8 bytes per pointer
-    int totalObjectSize = ObjectLayout::HEADER_SIZE + closurePointersSize + classDecl->totalSize;
+    // Calculate total object size: header + packed fields (includes closure pointers + regular fields)
+    int totalObjectSize = ObjectLayout::HEADER_SIZE + classDecl->totalSize;
     
     std::cout << "DEBUG generateNewExpr: Allocating object of size " << totalObjectSize 
               << " (header=" << ObjectLayout::HEADER_SIZE 
-              << ", closure pointers=" << closurePointersSize << " (" << numMethods << " methods)"
-              << ", fields=" << classDecl->totalSize << ")" << std::endl;
+              << ", packed fields=" << classDecl->totalSize << ")" << std::endl;
     
     // Call calloc to allocate and zero-initialize object
     // mov rdi, 1 (number of elements)
@@ -1355,10 +1410,10 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     // cb->mov(x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET), 0);  // Not needed, calloc already zeroed
     
     // Initialize closure pointers in the object
-    // Each closure pointer at [object + 16 + i*8] points to the closure in metadata
+    // Set closure pointers using the packed offsets
     for (size_t i = 0; i < classDecl->methodLayout.size(); i++) {
         const auto& methodInfo = classDecl->methodLayout[i];
-        int closurePtrOffset = ObjectLayout::HEADER_SIZE + (i * 8);
+        int closurePtrOffset = ObjectLayout::HEADER_SIZE + methodInfo.closureOffsetInObject;
         
         std::cout << "DEBUG generateNewExpr: Setting closure pointer " << i 
                   << " ('" << methodInfo.methodName << "') at object offset " << closurePtrOffset << std::endl;
@@ -1414,13 +1469,11 @@ void CodeGenerator::generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp
     x86::Gp objectPtrReg = x86::r10;
     loadValue(memberAccess->object.get(), objectPtrReg);
     
-    // Calculate actual offset: header + method closures + field offset
-    int actualOffset = ObjectLayout::HEADER_SIZE + memberAccess->classRef->totalMethodClosuresSize + memberAccess->memberOffset;
+    // Use the pre-calculated absolute offset (already includes header)
+    int actualOffset = memberAccess->memberOffset;
     
     std::cout << "DEBUG generateMemberAccess: Loading from object pointer + " << actualOffset 
-              << " (header=" << ObjectLayout::HEADER_SIZE 
-              << ", method closures=" << memberAccess->classRef->totalMethodClosuresSize
-              << ", field offset=" << memberAccess->memberOffset << ")" << std::endl;
+              << " (absolute offset)" << std::endl;
     
     // Load the field value from [objectPtrReg + actualOffset] into destReg
     cb->mov(destReg, x86::qword_ptr(objectPtrReg, actualOffset));
@@ -1454,13 +1507,11 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
     x86::Gp valueReg = x86::rax;
     loadValue(memberAssign->value.get(), valueReg);
     
-    // Calculate actual offset: header + method closures + field offset
-    int actualOffset = ObjectLayout::HEADER_SIZE + member->classRef->totalMethodClosuresSize + member->memberOffset;
+    // Use the pre-calculated absolute offset (already includes header)
+    int actualOffset = member->memberOffset;
     
     std::cout << "DEBUG generateMemberAssign: Storing to object pointer + " << actualOffset 
-              << " (header=" << ObjectLayout::HEADER_SIZE 
-              << ", method closures=" << member->classRef->totalMethodClosuresSize
-              << ", field offset=" << member->memberOffset << ")" << std::endl;
+              << " (absolute offset)" << std::endl;
     
     // Store the value to [objectPtrReg + actualOffset]
     cb->mov(x86::qword_ptr(objectPtrReg, actualOffset), valueReg);
@@ -1538,4 +1589,29 @@ void CodeGenerator::generateClassDecl(ClassDeclNode* classDecl) {
     }
     
     std::cout << "Class declaration processing complete for: " << classDecl->className << std::endl;
+}
+
+// Assembly library wrapper methods for internal use
+void CodeGenerator::makeSafeUnorderedList(x86::Gp addressReg, x86::Gp offsetReg, int32_t initialSize) {
+    if (asmLibrary) {
+        asmLibrary->makeSafeUnorderedList(addressReg, offsetReg, initialSize);
+    }
+}
+
+void CodeGenerator::addToSafeList(x86::Gp addressReg, x86::Gp offsetReg, x86::Gp valueReg) {
+    if (asmLibrary) {
+        asmLibrary->addToSafeList(addressReg, offsetReg, valueReg);
+    }
+}
+
+void CodeGenerator::removeFromSafeList(x86::Gp addressReg, x86::Gp offsetReg, x86::Gp indexReg) {
+    if (asmLibrary) {
+        asmLibrary->removeFromSafeList(addressReg, offsetReg, indexReg);
+    }
+}
+
+void CodeGenerator::compactSafeList(x86::Gp addressReg, x86::Gp offsetReg) {
+    if (asmLibrary) {
+        asmLibrary->compactSafeList(addressReg, offsetReg);
+    }
 }
