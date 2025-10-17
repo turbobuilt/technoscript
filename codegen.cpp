@@ -3,6 +3,8 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include "codegen_torch.h"
+#include "codegen_array.h"
 
 // External C functions implementation
 extern "C" {
@@ -417,14 +419,34 @@ void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
     if (varDecl->children.empty()) {
         throw std::runtime_error("Variable declaration without assignment not supported");
     }
-    
-    ASTNode* valueNode = varDecl->children[0].get();
-    
-    // Load the value into a register
-    loadValue(valueNode, x86::rax);
-    
-    // Store the value in the current scope
-    storeVariableInScope(varDecl->varName, x86::rax, currentScope, valueNode);
+
+    if (varDecl->isArray) {
+        if (varDecl->varType != DataType::ANY) {
+            throw std::runtime_error("Array variable ANY not implemented yet");
+        }
+        if (varDecl->varType == DataType::INT64) {
+            auto makeArrayAddr = reinterpret_cast<uint64_t>(&makeArray<int64_t>);
+            cb->mov(x86::rdi, static_cast<uint32_t>(varDecl->varType)); // first argument: DataType
+            cb->mov(x86::rax, makeArrayAddr);
+            cb->call(x86::rax);
+            // store result in variable
+            storeVariableInScope(varDecl->varName, x86::rax, currentScope, varDecl);
+        } else {
+            throw std::runtime_error("Array variable type not implemented yet");
+        }
+        // // get pointer to makeTensor
+        // auto tensorFuncAddr = reinterpret_cast<uint64_t>(&makeTensor);
+        // cb->mov(x86::rdi, static_cast<uint32_t>(varDecl->varType)); // first argument: DataType
+        // cb->mov(x86::rax, tensorFuncAddr);
+        // cb->call(x86::rax);
+        // // store result in variable
+        // storeVariableInScope(varDecl->varName, x86::rax, currentScope, varDecl);
+    } else {
+        ASTNode* valueNode = varDecl->children[0].get();
+        // Load the value into a register
+        loadValue(valueNode, x86::rax);
+        storeVariableInScope(varDecl->varName, x86::rax, currentScope, valueNode);
+    }
 }
 
 void CodeGenerator::generateLetDecl(LetDeclNode* letDecl) {

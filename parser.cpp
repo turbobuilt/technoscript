@@ -118,6 +118,8 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
                 case ')': result.emplace_back(TokenType::RPAREN, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
                 case '{': result.emplace_back(TokenType::LBRACE, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
                 case '}': result.emplace_back(TokenType::RBRACE, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case '[': result.emplace_back(TokenType::LBRACKET, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
+                case ']': result.emplace_back(TokenType::RBRACKET, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
                 case ':': result.emplace_back(TokenType::COLON, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
                 case ',': result.emplace_back(TokenType::COMMA, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
                 case '.': result.emplace_back(TokenType::DOT, tokenValue, tokenLine, tokenColumn, tokenStart); i++; column++; break;
@@ -211,6 +213,7 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
            current().type != TokenType::FOR &&     // Add FOR token
            current().type != TokenType::LET &&     // Add LET token
            current().type != TokenType::LBRACE &&  // Add LBRACE for block statements
+           current().type != TokenType::LBRACKET && // Add LBRACKET for array declarations
            current().type != TokenType::CLASS &&   // Add CLASS token
            current().type != TokenType::IDENTIFIER &&
            current().type != TokenType::THIS &&    // Add THIS token for method calls like this.method()
@@ -459,6 +462,7 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     DataType varType;
     std::string customTypeName; // For object types
     
+    
     if (match(TokenType::INT32_TYPE)) {
         varType = DataType::INT32;
         advance();
@@ -474,8 +478,17 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
         throw std::runtime_error("Expected type");
     }
     
+
+    
     expect(TokenType::ASSIGN);
     auto varDecl = std::make_unique<VarDeclNode>(name, varType, customTypeName);
+    
+    // check if array
+    if (matchNext(TokenType::LBRACKET) && matchOffset(2, TokenType::RBRACKET)) {
+        varDecl->isArray = true;
+        advance();
+        advance();
+    }
     
     if (match(TokenType::NEW)) {
         // Parse new expression
@@ -523,6 +536,13 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
         std::cout << "DEBUG parseVarDecl: parsing identifier/function call" << std::endl;
         varDecl->children.push_back(std::make_unique<IdentifierNode>(current().value));
         advance();
+    } else if (match(TokenType::LBRACKET) && varDecl->isArray) {
+        // Array literal
+        std::cout << "DEBUG parseVarDecl: parsing array literal" << std::endl;
+        advance(); // consume [
+        // based on type, try to parse each value to into the expected type
+        
+        
     } else {
         throw std::runtime_error("Expected literal, await expression, or identifier after assignment");
     }

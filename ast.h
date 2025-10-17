@@ -25,7 +25,10 @@ enum class AstNodeType {
     METHOD_CALL, THIS_EXPR
 };
 
-enum class DataType { INT32, INT64, CLOSURE, PROMISE, OBJECT };
+enum class DataType {
+    INT32, INT64, ANY, STRING,
+    CLOSURE, PROMISE, OBJECT
+};
 
 // Forward declarations
 class FunctionDeclNode;
@@ -161,6 +164,8 @@ class VarDeclNode : public ASTNode {
 public:
     std::string varName;
     DataType varType;
+    bool isArray;
+    bool isTyped;
     std::string customTypeName; // For OBJECT type, the class name
     
     VarDeclNode(const std::string& name, DataType type, const std::string& customType = "") 

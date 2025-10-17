@@ -5,7 +5,7 @@
 
 enum class TokenType {
     VAR, FUNCTION, GO, IDENTIFIER, INT32_TYPE, INT64_TYPE, LITERAL, 
-    ASSIGN, SEMICOLON, LPAREN, RPAREN, LBRACE, RBRACE, 
+    ASSIGN, SEMICOLON, LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET,
     COLON, COMMA, STRING, PRINT, SETTIMEOUT, DOT, 
     ASYNC, AWAIT, PROMISE, SLEEP, FOR, LET, LESS_THAN, 
     PLUS_PLUS, CLASS, NEW, THIS, EXTENDS, EOF_TOKEN
@@ -35,6 +35,8 @@ private:
     Token& current() { return tokens[pos]; }
     void advance() { if (pos < tokens.size() - 1) pos++; }
     bool match(TokenType t) { return current().type == t; }
+    bool matchNext(TokenType t) { return (pos + 1 < tokens.size()) && tokens[pos + 1].type == t; }
+    bool matchOffset(int offset, TokenType t) { return (pos + offset < tokens.size()) && tokens[pos + offset].type == t; }
     void expect(TokenType t);
     
     // Error recovery method
