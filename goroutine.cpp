@@ -21,10 +21,17 @@ uint64_t EventLoop::nextPromiseId = 1;
 thread_local std::shared_ptr<Goroutine> currentTask = nullptr;
 
 // Goroutine implementation
-Goroutine::Goroutine(std::function<void()> entry) 
-    : id(++nextId), state(GoroutineState::READY), entryPoint(std::move(entry)) {
+Goroutine::Goroutine(std::function<void()> entry) : id(++nextId), state(GoroutineState::READY), entryPoint(std::move(entry)) {
     context = std::make_unique<GoroutineContext>();
     gcState = std::make_unique<GoroutineGCState>();
+    // initialize per-goroutine allocated objects list
+    gcState->allocatedObjects = new SafeUnorderedList();
+    allocatedItemsListPointer = malloc((3 + 8) * sizeof(uint64_t)); // initial space for 8 items + 3 metadata
+    // set first 0, second 8, third, 0
+    uint64_t* ptr = reinterpret_cast<uint64_t*>(allocatedItemsListPointer);
+    ptr[0] = 0; // lock
+    ptr[1] = 8; // data size
+    ptr[2] = 0; // position
 }
 
 void Goroutine::run() {

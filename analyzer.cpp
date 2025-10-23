@@ -1,6 +1,7 @@
 #include "analyzer.h"
 #include "codegen.h"
 #include <iostream>
+#include <unordered_set>
 
 void Analyzer::analyze(LexicalScopeNode* root, const std::map<std::string, ClassDeclNode*>& classes) {
     classRegistry = &classes;
@@ -156,6 +157,7 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         // Get the object's type to find the class
         ASTNode* objectNode = memberAccess->object.get();
         ClassDeclNode* objectClass = nullptr;
+        bool handledAsTensorSegment = false;
         
         if (objectNode->type == AstNodeType::IDENTIFIER) {
             auto identifier = static_cast<IdentifierNode*>(objectNode);
@@ -166,49 +168,60 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
             // Handle 'this.field' access in methods
             auto thisNode = static_cast<ThisNode*>(objectNode);
             objectClass = thisNode->classContext;
+        } else if (objectNode->type == AstNodeType::BRACKET_ACCESS) {
+            auto bracketAccess = static_cast<BracketAccessNode*>(objectNode);
+            if (bracketAccess->returnsTensorSegment) {
+                static const std::unordered_set<std::string> allowedFields = {"start", "stop", "step"};
+                if (!allowedFields.count(memberAccess->memberName)) {
+                    throw std::runtime_error("Invalid tensor access segment field: " + memberAccess->memberName);
+                }
+                handledAsTensorSegment = true;
+            }
         }
         
-        if (!objectClass) {
+        if (!handledAsTensorSegment && !objectClass) {
             throw std::runtime_error("Cannot resolve class for member access on: " + memberAccess->memberName);
         }
         
-        // Find the field in the class (including inherited fields)
-        auto fieldIt = objectClass->fields.find(memberAccess->memberName);
-        if (fieldIt == objectClass->fields.end()) {
-            // Check parent classes for the field
-            bool foundInParent = false;
-            for (ClassDeclNode* parent : objectClass->parentRefs) {
-                auto parentFieldIt = parent->fields.find(memberAccess->memberName);
-                if (parentFieldIt != parent->fields.end()) {
-                    // Found in parent - use parent's class and calculate offset
-                    memberAccess->classRef = parent;
-                    int parentOffset = objectClass->parentOffsets[parent->className];
-                    // Include header size in the absolute offset
-                    memberAccess->memberOffset = ObjectLayout::HEADER_SIZE + parentOffset + parentFieldIt->second.offset;
-                    foundInParent = true;
-                    std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
-                              << "' from parent '" << parent->className 
-                              << "' at absolute offset " << memberAccess->memberOffset 
-                              << " (header=" << ObjectLayout::HEADER_SIZE 
-                              << " + parent=" << parentOffset 
-                              << " + field=" << parentFieldIt->second.offset << ") in class '" << objectClass->className << "'" << std::endl;
-                    break;
+        if (!handledAsTensorSegment) {
+            // Find the field in the class (including inherited fields)
+            auto fieldIt = objectClass->fields.find(memberAccess->memberName);
+            if (fieldIt == objectClass->fields.end()) {
+                // Check parent classes for the field
+                bool foundInParent = false;
+                for (ClassDeclNode* parent : objectClass->parentRefs) {
+                    auto parentFieldIt = parent->fields.find(memberAccess->memberName);
+                    if (parentFieldIt != parent->fields.end()) {
+                        // Found in parent - use parent's class and calculate offset
+                        memberAccess->classRef = parent;
+                        int parentOffset = objectClass->parentOffsets[parent->className];
+                        // Include header size in the absolute offset
+                        memberAccess->memberOffset = ObjectLayout::HEADER_SIZE + parentOffset + parentFieldIt->second.offset;
+                        foundInParent = true;
+                        std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
+                                  << "' from parent '" << parent->className 
+                                  << "' at absolute offset " << memberAccess->memberOffset 
+                                  << " (header=" << ObjectLayout::HEADER_SIZE 
+                                  << " + parent=" << parentOffset 
+                                  << " + field=" << parentFieldIt->second.offset << ") in class '" << objectClass->className << "'" << std::endl;
+                        break;
+                    }
                 }
+                
+                if (!foundInParent) {
+                    throw std::runtime_error("Field '" + memberAccess->memberName + "' not found in class '" + objectClass->className + "' or its parents");
+                }
+            } else {
+                // Found in own class
+                memberAccess->classRef = objectClass;
+                // Include header size in the absolute offset
+                memberAccess->memberOffset = ObjectLayout::HEADER_SIZE + fieldIt->second.offset;
+                
+                std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
+                          << "' at absolute offset " << memberAccess->memberOffset 
+                          << " (header=" << ObjectLayout::HEADER_SIZE 
+                          << " + field=" << fieldIt->second.offset << ") in class '" << objectClass->className << "'" << std::endl;
             }
-            
-            if (!foundInParent) {
-                throw std::runtime_error("Field '" + memberAccess->memberName + "' not found in class '" + objectClass->className + "' or its parents");
-            }
-        } else {
-            // Found in own class
-            memberAccess->classRef = objectClass;
-            // Include header size in the absolute offset
-            memberAccess->memberOffset = ObjectLayout::HEADER_SIZE + fieldIt->second.offset;
-            
-            std::cout << "DEBUG: Resolved MEMBER_ACCESS for field '" << memberAccess->memberName 
-                      << "' at absolute offset " << memberAccess->memberOffset 
-                      << " (header=" << ObjectLayout::HEADER_SIZE 
-                      << " + field=" << fieldIt->second.offset << ") in class '" << objectClass->className << "'" << std::endl;
         }
     } else if (node->type == AstNodeType::MEMBER_ASSIGN) {
         // Handle member assignment
@@ -222,6 +235,12 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         // Analyze the value expression
         if (memberAssign->value) {
             analyzeNodeSinglePass(memberAssign->value.get(), currentScope, depth + 1);
+        }
+    } else if (node->type == AstNodeType::BRACKET_ACCESS) {
+        // Tensor-related bracket access removed; analyze inner expression only
+        auto bracketAccess = static_cast<BracketAccessNode*>(node);
+        if (bracketAccess->objectExpression) {
+            analyzeNodeSinglePass(bracketAccess->objectExpression.get(), currentScope, depth + 1);
         }
     } else if (node->type == AstNodeType::CLASS_DECL) {
         // Class declarations are already processed in Phase 1, but we need to analyze methods here

@@ -6,6 +6,7 @@ void printAST(ASTNode* node, int indent) {
     std::cout << spaces;
     
     switch (node->type) {
+        // Tensor nodes removed
         case AstNodeType::AWAIT_EXPR:
             std::cout << "AWAIT_EXPR";
             break;
@@ -66,6 +67,10 @@ void printAST(ASTNode* node, int indent) {
                         std::cout << "i32";
                     } else if (var.type == DataType::INT64) {
                         std::cout << "i64";
+                    } else if (var.type == DataType::FLOAT64) {
+                        std::cout << "f64";
+                    } else if (var.type == DataType::ANY) {
+                        std::cout << "any";
                     } else if (var.type == DataType::CLOSURE) {
                         int closureSize = 16; // function_address (8) + size (8)
                         if (var.funcNode) {
@@ -142,6 +147,8 @@ void printAST(ASTNode* node, int indent) {
                 std::cout << " " << fieldName << ":";
                 if (fieldInfo.type == DataType::INT32) std::cout << "int32";
                 else if (fieldInfo.type == DataType::INT64) std::cout << "int64";
+                else if (fieldInfo.type == DataType::FLOAT64) std::cout << "float64";
+                else if (fieldInfo.type == DataType::ANY) std::cout << "any";
                 else if (fieldInfo.type == DataType::OBJECT) std::cout << "object";
                 std::cout << "@" << fieldInfo.offset;
             }

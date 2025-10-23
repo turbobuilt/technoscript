@@ -22,12 +22,14 @@ enum class AstNodeType {
     AWAIT_EXPR, SLEEP_CALL, FOR_STMT, LET_DECL, 
     BINARY_EXPR, UNARY_EXPR, BLOCK_STMT,
     CLASS_DECL, NEW_EXPR, MEMBER_ACCESS, MEMBER_ASSIGN,
-    METHOD_CALL, THIS_EXPR
+    METHOD_CALL, THIS_EXPR,
+    BRACKET_ACCESS
 };
 
 enum class DataType {
-    INT32, INT64, ANY, STRING,
-    CLOSURE, PROMISE, OBJECT
+    INT32, INT64, FLOAT64, ANY, STRING,
+    CLOSURE, PROMISE, OBJECT,
+    // Tensor types removed
 };
 
 // Forward declarations
@@ -63,6 +65,8 @@ namespace VariablePacking {
         switch (type) {
             case DataType::INT32: return 4;
             case DataType::INT64: return 8;
+            case DataType::FLOAT64: return 8;
+            case DataType::ANY: return 16;
             case DataType::CLOSURE: return 8; // Base pointer size, actual size calculated elsewhere
             case DataType::PROMISE: return 8;
             case DataType::OBJECT: return 8; // Base pointer size, actual size calculated elsewhere
@@ -164,8 +168,8 @@ class VarDeclNode : public ASTNode {
 public:
     std::string varName;
     DataType varType;
-    bool isArray;
-    bool isTyped;
+    bool isArray = false;
+    bool isTyped = false;
     std::string customTypeName; // For OBJECT type, the class name
     
     VarDeclNode(const std::string& name, DataType type, const std::string& customType = "") 
@@ -175,6 +179,7 @@ public:
 class FunctionDeclNode : public LexicalScopeNode {
 public:
     std::string funcName;
+    DataType returnType;
     std::vector<std::string> params;
     void* asmjitLabel = nullptr;   // asmjit::Label for this function (stored as void* to avoid header dependency)
     bool isMethod = false;          // Set to true if this is a class method
@@ -252,9 +257,17 @@ public:
     }
 };
 
+enum class LiteralType {
+    NUMERIC,
+    STRING
+};
+
 class LiteralNode : public ASTNode {
 public:
-    LiteralNode(const std::string& val) : ASTNode(AstNodeType::LITERAL, val) {}
+    LiteralType literalKind;
+    
+    LiteralNode(const std::string& val, LiteralType kind) 
+        : ASTNode(AstNodeType::LITERAL, val), literalKind(kind) {}
 };
 
 class FunctionCallNode : public IdentifierNode {
@@ -492,6 +505,20 @@ public:
     }
 };
 
+// Tensor access segment (e.g., start:stop:step)
+// Tensor access segment removed
+
+class BracketAccessNode : public ASTNode {
+public:
+    std::unique_ptr<ASTNode> objectExpression;
+    std::vector<std::unique_ptr<ASTNode>> segments; // Each segment is either an expression or TensorAccessSegmentNode
+    VariableInfo* baseVar = nullptr;                // Resolved variable info for the base expression (if any)
+    bool baseIsTensorAccess = false;                // True when base expression is a TensorAccess parameter
+    bool returnsTensorSegment = false;              // True when this access yields a tensor segment (e.g., slice[0])
+    
+    BracketAccessNode() : ASTNode(AstNodeType::BRACKET_ACCESS) {}
+};
+
 // This expression - represents 'this' keyword in methods
 class ThisNode : public ASTNode {
 public:
@@ -612,8 +639,13 @@ inline void LexicalScopeNode::pack() {
             paramVars.push_back(var);
         }
         
-        // Use shared packing for parameters
-        offset = VariablePacking::packVariables(paramVars);
+        // Use shared packing for parameters starting at current offset
+        int paramStartOffset = offset;
+        int paramsSize = VariablePacking::packVariables(paramVars);
+        for (auto* var : paramVars) {
+            var->offset += paramStartOffset;
+        }
+        offset = paramStartOffset + paramsSize;
         
         // Store in paramsInfo for unified access
         for (auto& [name, var] : params) {

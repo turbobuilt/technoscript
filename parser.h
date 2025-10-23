@@ -4,11 +4,12 @@
 #include <vector>
 
 enum class TokenType {
-    VAR, FUNCTION, GO, IDENTIFIER, INT32_TYPE, INT64_TYPE, LITERAL, 
+    VAR, FUNCTION, GO, IDENTIFIER, INT32_TYPE, INT64_TYPE, ANY_TYPE, LITERAL, 
     ASSIGN, SEMICOLON, LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET,
     COLON, COMMA, STRING, PRINT, SETTIMEOUT, DOT, 
     ASYNC, AWAIT, PROMISE, SLEEP, FOR, LET, LESS_THAN, 
-    PLUS_PLUS, CLASS, NEW, THIS, EXTENDS, EOF_TOKEN
+    PLUS_PLUS, CLASS, NEW, THIS, EXTENDS, EOF_TOKEN,
+    OPERATOR  // Add token type for operator keyword
 };
 
 struct Token {
@@ -62,6 +63,13 @@ private:
     std::unique_ptr<ASTNode> parseExpression();  // For parsing expressions like i < 2, ++i
     std::unique_ptr<ClassDeclNode> parseClassDecl();
     std::unique_ptr<ASTNode> parsePrimaryExpression(); // For parsing identifiers, member access, new expressions
+    // Tensor features removed
+    std::unique_ptr<ASTNode> parseTensorAccess(std::unique_ptr<ASTNode> tensor) = delete;
+    std::unique_ptr<ASTNode> parseSliceExpr() = delete;
+    std::unique_ptr<ASTNode> parseSimpleValueExpression();
+    std::unique_ptr<ASTNode> parsePostfixChain(std::unique_ptr<ASTNode> base);
+    std::unique_ptr<ASTNode> parseBracketAccess(std::unique_ptr<ASTNode> base);
+    std::unique_ptr<ASTNode> parseMemberOrMethodAccess(std::unique_ptr<ASTNode> base);
     
 public:
     std::unique_ptr<FunctionDeclNode> parse(const std::string& code);
