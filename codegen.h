@@ -9,6 +9,7 @@
 #include <capstone/capstone.h>
 #include <memory>
 #include <unordered_map>
+#include <optional>
 
 using namespace asmjit;
 
@@ -27,6 +28,23 @@ namespace ObjectLayout {
     constexpr int HEADER_SIZE = 16;    // Metadata + flags
     // After header: method closures are stored (size varies by class)
     // Then fields start (offset calculated based on method closures size)
+}
+
+// Tensor slice layout constants
+namespace SliceLayout {
+    constexpr int NDIM_OFFSET = 0;    // Number of dimensions (qword)
+    constexpr int NDIM_SIZE = 8;
+    
+    constexpr int DIM_START = 8;      // Start of dimension data
+    constexpr int DIM_ENTRY_SIZE = 24; // start(8) + stop(8) + step(8)
+    constexpr int START_OFFSET = 0;    // Relative to dimension entry
+    constexpr int STOP_OFFSET = 8;     // Relative to dimension entry
+    constexpr int STEP_OFFSET = 16;    // Relative to dimension entry
+    
+    // Calculate dimension entry offset (0-based index)
+    constexpr int getDimOffset(int dimIndex) {
+        return DIM_START + (dimIndex * DIM_ENTRY_SIZE);
+    }
 }
 
 // Lexical Scope memory layout constants
@@ -74,7 +92,6 @@ private:
     void generateVarDecl(VarDeclNode* varDecl);
     void generateLetDecl(LetDeclNode* letDecl);
     void generatePrintStmt(ASTNode* printStmt);
-    void generateFunctionDecl(FunctionDeclNode* funcDecl);
     void generateFunctionCall(FunctionCallNode* funcCall);
     void generateGoStmt(GoStmtNode* goStmt);
     void generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt);
@@ -116,12 +133,16 @@ private:
     // Code generation utilities
     void setupMainFunction();
     void cleanupMainFunction();
-    void loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourceScopeReg = x86::r15);
-    void storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope, ASTNode* valueNode = nullptr);
+    void loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourceScopeReg = x86::r15, std::optional<DataType> expectedType = std::nullopt);
+    void loadAnyValue(ASTNode* valueNode, x86::Gp valueReg, x86::Gp typeReg, x86::Gp sourceScopeReg = x86::r15);
+    void storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope, ASTNode* valueNode = nullptr, x86::Gp typeReg = x86::rdx);
     void loadVariableFromScope(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0, x86::Gp sourceScopeReg = x86::r15);
     void loadVariableAddress(IdentifierNode* identifier, x86::Gp destReg, int offsetInVariable = 0, x86::Gp sourceScopeReg = x86::r15);
     void loadParameterIntoRegister(int paramIndex, x86::Gp destReg, x86::Gp scopeReg = x86::r15);
     x86::Gp getParameterByIndex(int paramIndex);
+    
+    // Tensor operation utilities
+    int vtableOffsetForOperatorIndex; // Offset in vtable for operator[] function
     
     // External function declarations
     void declareExternalFunctions();

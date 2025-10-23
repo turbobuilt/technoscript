@@ -9,6 +9,7 @@
 #include <mutex>
 #include <algorithm>
 #include <map>
+#include "data_structures/safe_unordered_list.h"
 
 // Forward declarations
 class Goroutine;
@@ -149,7 +150,8 @@ struct ScopeHeader {
 
 // Per-goroutine GC state
 struct GoroutineGCState {
-    std::vector<void*> allocatedObjects;  // All objects allocated by this goroutine
+    // All objects allocated by this goroutine (thread-local list)
+    SafeUnorderedList* allocatedObjects = nullptr;
     std::vector<void*> allocatedScopes;   // All scopes allocated by this goroutine
     std::vector<void*> scopeStack;        // Stack of active lexical scopes (roots)
     std::mutex allocationMutex;           // Protects allocatedObjects and allocatedScopes lists
@@ -161,18 +163,8 @@ struct GoroutineGCState {
     std::atomic<uint64_t> checkpointCounter{0};  // Incremented when signal handler runs
     pthread_t threadId;                           // Thread ID for sending signals
     
-    void addObject(void* obj) {
-        std::lock_guard<std::mutex> lock(allocationMutex);
-        allocatedObjects.push_back(obj);
-    }
-    
-    void removeObject(void* obj) {
-        std::lock_guard<std::mutex> lock(allocationMutex);
-        auto it = std::find(allocatedObjects.begin(), allocatedObjects.end(), obj);
-        if (it != allocatedObjects.end()) {
-            allocatedObjects.erase(it);
-        }
-    }
+    void addObject(void* obj);
+    void removeObject(void* obj);
     
     void addScope(void* scope) {
         std::lock_guard<std::mutex> lock(allocationMutex);

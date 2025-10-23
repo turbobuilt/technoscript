@@ -60,6 +60,7 @@ class Goroutine : public std::enable_shared_from_this<Goroutine> {
 public:
     static uint64_t nextId;
     uint64_t id;
+    void* allocatedItemsListPointer;
     GoroutineState state;
     std::unique_ptr<GoroutineContext> context;
     std::function<void()> entryPoint;

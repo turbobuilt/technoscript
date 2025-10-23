@@ -12,16 +12,24 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
         std::string code = R"(
-class Dog {
-    age: int64
-    printAge() {
-        print(this.age);
-    }
-}
-var d: Dog = new Dog();
-d.age = 5;
-d.printAge();
+var x = 10;
+print(x);
 )";
+// class Dog {
+//     age: int64
+//     printAge() {
+//         print(this.age);
+//     }
+//     operator [](slice: TensorAccess): int64 {
+//         print(slice[0].start);
+//         print(slice[0].stop);
+//         print(slice[0].step);
+//     }
+// }
+// var d: Dog = new Dog();
+// var x: int64 = 5;
+// d[0:10:2];
+// )";
     std::cout << "=== Testing safe unordered list ===\n";
 
     
@@ -42,31 +50,14 @@ d.printAge();
     MetadataRegistry::getInstance().buildClassMetadata(parser.getClassRegistry());
     std::cout << "DEBUG: Class metadata registry built successfully" << std::endl;
     
-    // Debug: Check what address print_int64 actually has
-    uint64_t actual_print_addr = reinterpret_cast<uint64_t>(print_int64);
-    std::cout << "DEBUG: Actual print_int64 address: 0x" << std::hex << actual_print_addr << std::dec << std::endl;
-    
     std::cout << "DEBUG: Starting code generation..." << std::endl;
     codeGen.generateProgram(*ast, parser.getClassRegistry(), parser.getFunctionRegistry());
     std::cout << "DEBUG: Code generation completed successfully" << std::endl;
     
-    // Start the garbage collector
-    GarbageCollector::getInstance().start();
-    std::cout << "DEBUG: Garbage collector started" << std::endl;
-    
-    // Spawn the main program as a goroutine instead of running it directly
-    EventLoop::getInstance().spawnGoroutine([&codeGen]() {
-        std::cout << "\n=== Main goroutine starting ===" << std::endl;
-        codeGen.run();
-        std::cout << "=== Main goroutine finished ===" << std::endl;
-    });
-    
-    // Start the event loop to handle the main goroutine and any spawned goroutines
-    runtime_start_event_loop();
-    
-    // Stop the garbage collector
-    GarbageCollector::getInstance().stop();
-    std::cout << "DEBUG: Garbage collector stopped" << std::endl;
+    // Directly run generated program for debugging
+    std::cout << "\n=== Running program directly ===" << std::endl;
+    codeGen.run();
+    std::cout << "=== Program finished ===" << std::endl;
     
     return 0;
 }

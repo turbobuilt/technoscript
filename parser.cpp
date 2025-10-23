@@ -75,6 +75,7 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             else if (word == "go") result.emplace_back(TokenType::GO, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "int32") result.emplace_back(TokenType::INT32_TYPE, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "int64") result.emplace_back(TokenType::INT64_TYPE, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "any") result.emplace_back(TokenType::ANY_TYPE, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "print") result.emplace_back(TokenType::PRINT, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "setTimeout") result.emplace_back(TokenType::SETTIMEOUT, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "async") result.emplace_back(TokenType::ASYNC, word, tokenLine, tokenColumn, tokenStart);
@@ -87,6 +88,7 @@ std::vector<Token> Parser::tokenize(const std::string& code) {
             else if (word == "new") result.emplace_back(TokenType::NEW, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "this") result.emplace_back(TokenType::THIS, word, tokenLine, tokenColumn, tokenStart);
             else if (word == "extends") result.emplace_back(TokenType::EXTENDS, word, tokenLine, tokenColumn, tokenStart);
+            else if (word == "operator") result.emplace_back(TokenType::OPERATOR, word, tokenLine, tokenColumn, tokenStart);
             else result.emplace_back(TokenType::IDENTIFIER, word, tokenLine, tokenColumn, tokenStart);
         }
         else if (std::isdigit(code[i])) {
@@ -290,10 +292,10 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
             auto print = std::make_unique<ASTNode>(AstNodeType::PRINT_STMT);
             while (!match(TokenType::RPAREN)) {
                 if (match(TokenType::STRING)) {
-                    print->children.push_back(std::make_unique<LiteralNode>(current().value));
+                    print->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::STRING));
                     advance();
                 } else if (match(TokenType::LITERAL)) {
-                    print->children.push_back(std::make_unique<LiteralNode>(current().value));
+                    print->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
                     advance();
                 } else if (match(TokenType::IDENTIFIER)) {
                     print->children.push_back(std::make_unique<IdentifierNode>(current().value));
@@ -303,6 +305,15 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
             }
             expect(TokenType::RPAREN);
             return print;
+        }
+        // Look ahead to see if this is a function call
+        else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LBRACKET) {
+            auto base = std::make_unique<IdentifierNode>(current().value);
+            advance(); // consume identifier
+            auto expression = parseBracketAccess(std::move(base));
+            expression = parsePostfixChain(std::move(expression));
+            expect(TokenType::SEMICOLON);
+            return expression;
         }
         // Look ahead to see if this is a function call
         else if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LPAREN) {
@@ -328,7 +339,10 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
                 if (!match(TokenType::RPAREN)) {
                     do {
                         if (match(TokenType::LITERAL)) {
-                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value));
+                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
+                            advance();
+                        } else if (match(TokenType::STRING)) {
+                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::STRING));
                             advance();
                         } else if (match(TokenType::IDENTIFIER)) {
                             methodCall->args.push_back(std::make_unique<IdentifierNode>(current().value));
@@ -363,7 +377,10 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
                 
                 // Parse the value being assigned
                 if (match(TokenType::LITERAL)) {
-                    memberAssign->value = std::make_unique<LiteralNode>(current().value);
+                    memberAssign->value = std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC);
+                    advance();
+                } else if (match(TokenType::STRING)) {
+                    memberAssign->value = std::make_unique<LiteralNode>(current().value, LiteralType::STRING);
                     advance();
                 } else if (match(TokenType::IDENTIFIER)) {
                     memberAssign->value = std::make_unique<IdentifierNode>(current().value);
@@ -414,7 +431,10 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
                 if (!match(TokenType::RPAREN)) {
                     do {
                         if (match(TokenType::LITERAL)) {
-                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value));
+                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
+                            advance();
+                        } else if (match(TokenType::STRING)) {
+                            methodCall->args.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::STRING));
                             advance();
                         } else if (match(TokenType::IDENTIFIER)) {
                             methodCall->args.push_back(std::make_unique<IdentifierNode>(current().value));
@@ -453,35 +473,173 @@ std::unique_ptr<ASTNode> Parser::parseStatement(LexicalScopeNode* scope) {
     return nullptr;
 }
 
+std::unique_ptr<ASTNode> Parser::parseSimpleValueExpression() {
+    if (match(TokenType::STRING)) {
+        auto literal = std::make_unique<LiteralNode>(current().value, LiteralType::STRING);
+        advance();
+        return literal;
+    }
+    if (match(TokenType::LITERAL)) {
+        auto literal = std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC);
+        advance();
+        return literal;
+    }
+    if (match(TokenType::THIS)) {
+        auto thisNode = std::make_unique<ThisNode>();
+        advance();
+        return parsePostfixChain(std::move(thisNode));
+    }
+    if (match(TokenType::IDENTIFIER)) {
+        auto identifier = std::make_unique<IdentifierNode>(current().value);
+        advance();
+        return parsePostfixChain(std::move(identifier));
+    }
+    throw std::runtime_error("Expected expression value");
+}
+
+std::unique_ptr<ASTNode> Parser::parsePostfixChain(std::unique_ptr<ASTNode> base) {
+    while (true) {
+        if (match(TokenType::LBRACKET)) {
+            base = parseBracketAccess(std::move(base));
+        } else if (match(TokenType::DOT)) {
+            base = parseMemberOrMethodAccess(std::move(base));
+        } else if (match(TokenType::LPAREN)) {
+            if (base->type != AstNodeType::IDENTIFIER) {
+                throw std::runtime_error("Unexpected '(' after expression");
+            }
+            auto identifierNode = static_cast<IdentifierNode*>(base.get());
+            std::string calleeName = identifierNode->value;
+            auto functionCall = std::make_unique<FunctionCallNode>(calleeName);
+            advance(); // consume '('
+            
+            if (!match(TokenType::RPAREN)) {
+                do {
+                    auto arg = parseSimpleValueExpression();
+                    functionCall->args.push_back(std::move(arg));
+                    
+                    if (match(TokenType::COMMA)) {
+                        advance();
+                    } else {
+                        break;
+                    }
+                } while (true);
+            }
+            
+            expect(TokenType::RPAREN);
+            base = std::move(functionCall);
+        } else {
+            break;
+        }
+    }
+    return base;
+}
+
+std::unique_ptr<ASTNode> Parser::parseBracketAccess(std::unique_ptr<ASTNode> base) {
+    auto bracketAccess = std::make_unique<BracketAccessNode>();
+    bracketAccess->objectExpression = std::move(base);
+    
+    expect(TokenType::LBRACKET);
+    
+    bool sawColon = false;
+    
+    while (!match(TokenType::RBRACKET)) {
+        if (match(TokenType::COLON)) {
+            sawColon = true;
+            advance();
+            continue;
+        }
+        
+        auto segmentExpr = parseSimpleValueExpression();
+        bracketAccess->segments.push_back(std::move(segmentExpr));
+        
+        if (match(TokenType::COMMA)) {
+            advance();
+            continue;
+        }
+        if (match(TokenType::COLON)) {
+            sawColon = true;
+            advance();
+            continue;
+        }
+        if (match(TokenType::RBRACKET)) {
+            break;
+        }
+        
+        throw std::runtime_error("Expected ',', ':', or ']' in bracket expression");
+    }
+    
+    expect(TokenType::RBRACKET);
+    bracketAccess->returnsTensorSegment = sawColon || !bracketAccess->segments.empty();
+    return bracketAccess;
+}
+
+std::unique_ptr<ASTNode> Parser::parseMemberOrMethodAccess(std::unique_ptr<ASTNode> base) {
+    expect(TokenType::DOT);
+    std::string memberName = current().value;
+    expect(TokenType::IDENTIFIER);
+    
+    if (match(TokenType::LPAREN)) {
+        advance(); // consume '('
+        auto methodCall = std::make_unique<MethodCallNode>(memberName);
+        methodCall->object = std::move(base);
+        
+        if (!match(TokenType::RPAREN)) {
+            do {
+                auto arg = parseSimpleValueExpression();
+                methodCall->args.push_back(std::move(arg));
+                
+                if (match(TokenType::COMMA)) {
+                    advance();
+                } else {
+                    break;
+                }
+            } while (true);
+        }
+        
+        expect(TokenType::RPAREN);
+        return methodCall;
+    }
+    
+    auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
+    memberAccess->object = std::move(base);
+    return memberAccess;
+}
+
 std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     expect(TokenType::VAR);
     std::string name = current().value;
     expect(TokenType::IDENTIFIER);
-    expect(TokenType::COLON);
     
-    DataType varType;
+    DataType varType = DataType::ANY;
     std::string customTypeName; // For object types
+    bool hasTypeAnnotation = false;
     
-    
-    if (match(TokenType::INT32_TYPE)) {
-        varType = DataType::INT32;
-        advance();
-    } else if (match(TokenType::INT64_TYPE)) {
-        varType = DataType::INT64;
-        advance();
-    } else if (match(TokenType::IDENTIFIER)) {
-        // Custom type (class name)
-        varType = DataType::OBJECT;
-        customTypeName = current().value;
-        advance();
-    } else {
-        throw std::runtime_error("Expected type");
+    if (match(TokenType::COLON)) {
+        advance(); // consume ':'
+        hasTypeAnnotation = true;
+        
+        if (match(TokenType::INT32_TYPE)) {
+            varType = DataType::INT32;
+            advance();
+        } else if (match(TokenType::INT64_TYPE)) {
+            varType = DataType::INT64;
+            advance();
+        } else if (match(TokenType::ANY_TYPE)) {
+            varType = DataType::ANY;
+            advance();
+        } else if (match(TokenType::IDENTIFIER)) {
+            // Custom type (class name)
+            varType = DataType::OBJECT;
+            customTypeName = current().value;
+            advance();
+        } else {
+            throw std::runtime_error("Expected type");
+        }
     }
-    
-
     
     expect(TokenType::ASSIGN);
     auto varDecl = std::make_unique<VarDeclNode>(name, varType, customTypeName);
+    varDecl->isTyped = hasTypeAnnotation;
     
     // check if array
     if (matchNext(TokenType::LBRACKET) && matchOffset(2, TokenType::RBRACKET)) {
@@ -501,7 +659,10 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
         auto newExpr = std::make_unique<NewExprNode>(className);
         varDecl->children.push_back(std::move(newExpr));
     } else if (match(TokenType::LITERAL)) {
-        varDecl->children.push_back(std::make_unique<LiteralNode>(current().value));
+        varDecl->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
+        advance();
+    } else if (match(TokenType::STRING)) {
+        varDecl->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::STRING));
         advance();
     } else if (match(TokenType::AWAIT)) {
         std::cout << "DEBUG parseVarDecl: parsing AWAIT expression" << std::endl;
@@ -519,7 +680,7 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
             auto sleepCall = std::make_unique<SleepCallNode>();
             
             if (match(TokenType::LITERAL)) {
-                sleepCall->children.push_back(std::make_unique<LiteralNode>(current().value));
+                sleepCall->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
                 advance();
             } else {
                 throw std::runtime_error("Expected literal argument for sleep()");
@@ -568,6 +729,8 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
         varInfo.size = 4;
     } else if (varType == DataType::OBJECT) {
         varInfo.size = 8; // Pointer to heap-allocated object
+    } else if (varType == DataType::ANY) {
+        varInfo.size = 16;
     } else {
         varInfo.size = 8; // INT64 and other types
     }
@@ -599,7 +762,7 @@ std::unique_ptr<LetDeclNode> Parser::parseLetDecl() {
     auto letDecl = std::make_unique<LetDeclNode>(name, varType);
     
     if (match(TokenType::LITERAL)) {
-        letDecl->children.push_back(std::make_unique<LiteralNode>(current().value));
+        letDecl->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
         advance();
     } else if (match(TokenType::IDENTIFIER)) {
         letDecl->children.push_back(std::make_unique<IdentifierNode>(current().value));
@@ -650,6 +813,8 @@ std::unique_ptr<ASTNode> Parser::parseExpression() {
         std::string leftSide = current().value;
         advance();
         
+        // Tensor access removed; ignore bracketed syntax for now
+        
         // Check if this is a comparison
         if (match(TokenType::LESS_THAN)) {
             advance(); // consume <
@@ -660,7 +825,10 @@ std::unique_ptr<ASTNode> Parser::parseExpression() {
             comparison->left = std::make_unique<IdentifierNode>(leftSide);
             
             if (match(TokenType::LITERAL)) {
-                comparison->right = std::make_unique<LiteralNode>(current().value);
+                comparison->right = std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC);
+                advance();
+            } else if (match(TokenType::STRING)) {
+                comparison->right = std::make_unique<LiteralNode>(current().value, LiteralType::STRING);
                 advance();
             } else if (match(TokenType::IDENTIFIER)) {
                 comparison->right = std::make_unique<IdentifierNode>(current().value);
@@ -675,13 +843,15 @@ std::unique_ptr<ASTNode> Parser::parseExpression() {
             return std::make_unique<IdentifierNode>(leftSide);
         }
     } else if (match(TokenType::LITERAL)) {
-        auto literal = std::make_unique<LiteralNode>(current().value);
+        auto literal = std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC);
         advance();
         return literal;
     } else {
         throw std::runtime_error("Expected expression");
     }
 }
+
+// Tensor slice/access removed
 
 std::unique_ptr<FunctionDeclNode> Parser::parseFunctionDecl() {
     expect(TokenType::FUNCTION);
@@ -770,10 +940,10 @@ std::unique_ptr<ASTNode> Parser::parseFunctionCall() {
             call->args.push_back(std::make_unique<IdentifierNode>(current().value));
             advance();
         } else if (match(TokenType::STRING)) {
-            call->args.push_back(std::make_unique<LiteralNode>(current().value));
+            call->args.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::STRING));
             advance();
         } else if (match(TokenType::LITERAL)) {
-            call->args.push_back(std::make_unique<LiteralNode>(current().value));
+            call->args.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
             advance();
         }
         if (match(TokenType::COMMA)) {
@@ -791,46 +961,14 @@ std::unique_ptr<ASTNode> Parser::parsePrintStmt() {
     
     auto print = std::make_unique<ASTNode>(AstNodeType::PRINT_STMT);
     while (!match(TokenType::RPAREN)) {
-        if (match(TokenType::STRING)) {
-            print->children.push_back(std::make_unique<LiteralNode>(current().value));
+        auto valueExpr = parseSimpleValueExpression();
+        print->children.push_back(std::move(valueExpr));
+        
+        if (match(TokenType::COMMA)) {
             advance();
-        } else if (match(TokenType::LITERAL)) {
-            print->children.push_back(std::make_unique<LiteralNode>(current().value));
-            advance();
-        } else if (match(TokenType::THIS)) {
-            // Check for 'this.member' access
-            advance(); // consume 'this'
-            if (match(TokenType::DOT)) {
-                advance(); // consume '.'
-                std::string memberName = current().value;
-                expect(TokenType::IDENTIFIER);
-                
-                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
-                memberAccess->object = std::make_unique<ThisNode>();
-                print->children.push_back(std::move(memberAccess));
-            } else {
-                // Just 'this' by itself
-                print->children.push_back(std::make_unique<ThisNode>());
-            }
-        } else if (match(TokenType::IDENTIFIER)) {
-            // Check for member access (obj.member)
-            if (pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::DOT) {
-                std::string objName = current().value;
-                advance(); // consume identifier
-                expect(TokenType::DOT);
-                
-                std::string memberName = current().value;
-                expect(TokenType::IDENTIFIER);
-                
-                auto memberAccess = std::make_unique<MemberAccessNode>(memberName);
-                memberAccess->object = std::make_unique<IdentifierNode>(objName);
-                print->children.push_back(std::move(memberAccess));
-            } else {
-                print->children.push_back(std::make_unique<IdentifierNode>(current().value));
-                advance();
-            }
+        } else if (!match(TokenType::RPAREN)) {
+            throw std::runtime_error("Expected ',' or ')' in print statement");
         }
-        if (match(TokenType::COMMA)) advance();
     }
     expect(TokenType::RPAREN);
     return print;
@@ -874,7 +1012,7 @@ std::unique_ptr<ASTNode> Parser::parseSetTimeoutStmt() {
     if (!match(TokenType::LITERAL)) {
         throw std::runtime_error("Expected delay in milliseconds as second parameter to setTimeout");
     }
-    setTimeout->delay = std::make_unique<LiteralNode>(current().value);
+    setTimeout->delay = std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC);
     advance();
     
     expect(TokenType::RPAREN);
@@ -915,11 +1053,12 @@ std::unique_ptr<ForStmtNode> Parser::parseForStmt() {
     if (!match(TokenType::RPAREN)) {
         forStmt->update = parseExpression();
     }
-    expect(TokenType::RPAREN);
-    
-    expect(TokenType::LBRACE);
-    
-    // Parse body statements
+            expect(TokenType::RPAREN);
+            
+            // Parse return type (if specified)
+            // Return type annotations are not supported here for 'for' parsing; removed
+            
+            expect(TokenType::LBRACE);    // Parse body statements
     while (!match(TokenType::RBRACE)) {
         auto stmt = parseStatement(forStmt.get());
         if (stmt) {
@@ -1007,20 +1146,38 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
     
     // Parse class body (fields and methods)
     while (!match(TokenType::RBRACE) && current().type != TokenType::EOF_TOKEN) {
-        // Check if this is a method or a field
+        // Check if this is a method, operator, or field
         // Method: identifier followed by '(' (with or without 'function' keyword)
+        // Operator: 'operator' keyword followed by symbol
         // Field: identifier followed by ':'
         
         bool isFunction = match(TokenType::FUNCTION);
+        bool isOperator = match(TokenType::OPERATOR);
+        std::string memberName;
+        
         if (isFunction) {
             advance(); // consume 'function'
+            memberName = current().value;
+            expect(TokenType::IDENTIFIER);
+        } else if (isOperator) {
+            advance(); // consume 'operator'
+            // Parse operator symbol
+            if (match(TokenType::LBRACKET)) {
+                advance(); // consume '['
+                expect(TokenType::RBRACKET); // expect ']'
+                isFunction = true; // treat as a function
+                memberName = "operator[]";
+            } else {
+                throw std::runtime_error("Unsupported operator");
+            }
+        } else {
+            // Regular method or field
+            memberName = current().value;
+            expect(TokenType::IDENTIFIER);
         }
         
-        std::string memberName = current().value;
-        expect(TokenType::IDENTIFIER);
-        
         // Check next token to determine if this is a method or field
-        bool isMethod = match(TokenType::LPAREN);
+        bool isMethod = isFunction || isOperator || match(TokenType::LPAREN);
         
         if (isMethod || isFunction) {
             // Parse method
@@ -1037,30 +1194,61 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
             expect(TokenType::LPAREN);
             
             // Parse parameters
+            method->returnType = DataType::INT64;  // Default return type
+            
+            // Parse parameters
             if (!match(TokenType::RPAREN)) {
                 do {
                     std::string paramName = current().value;
                     expect(TokenType::IDENTIFIER);
-                    expect(TokenType::COLON);
+                    expect(TokenType::COLON);  // Type annotation is required
                     
                     DataType paramType;
+                    std::string typeName;
+                    
                     if (match(TokenType::INT32_TYPE)) {
                         paramType = DataType::INT32;
                         advance();
                     } else if (match(TokenType::INT64_TYPE)) {
                         paramType = DataType::INT64;
                         advance();
+                    } else if (match(TokenType::ANY_TYPE)) {
+                        paramType = DataType::ANY;
+                        advance();
+                    } else if (match(TokenType::IDENTIFIER)) {
+                        // Custom type (class name)
+                        paramType = DataType::OBJECT;
+                        typeName = current().value;
+                        advance();
+                        
+                        // TensorAccess parameters removed
                     } else {
                         throw std::runtime_error("Expected type for parameter in method");
                     }
                     
+                    // Add parameter info
                     method->params.push_back(paramName);
                     
-                    // Add to paramsInfo (will be properly set up during analysis)
                     VariableInfo paramInfo;
-                    paramInfo.type = paramType;
                     paramInfo.name = paramName;
-                    paramInfo.size = (paramType == DataType::INT32) ? 4 : 8;
+                    paramInfo.type = paramType;
+                    paramInfo.definedIn = method.get();
+                    if (paramType == DataType::INT32) {
+                        paramInfo.size = 4;
+                    } else if (paramType == DataType::ANY) {
+                        paramInfo.size = 16;
+                    } else {
+                        paramInfo.size = 8;
+                    }
+                    method->variables[paramName] = paramInfo;
+                    paramInfo.name = paramName;
+                    if (paramType == DataType::INT32) {
+                        paramInfo.size = 4;
+                    } else if (paramType == DataType::ANY) {
+                        paramInfo.size = 16;
+                    } else {
+                        paramInfo.size = 8;
+                    }
                     method->paramsInfo.push_back(paramInfo);
                     
                     if (match(TokenType::COMMA)) {
@@ -1075,9 +1263,21 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
             
             // Optional return type
             if (match(TokenType::COLON)) {
-                advance();
-                if (match(TokenType::INT32_TYPE) || match(TokenType::INT64_TYPE)) {
-                    advance(); // consume return type (we'll handle this properly later)
+                advance(); // consume :
+                if (match(TokenType::INT32_TYPE)) {
+                    method->returnType = DataType::INT32;
+                    advance();
+                } else if (match(TokenType::INT64_TYPE)) {
+                    method->returnType = DataType::INT64;
+                    advance();
+                } else if (match(TokenType::ANY_TYPE)) {
+                    method->returnType = DataType::ANY;
+                    advance();
+                } else if (match(TokenType::IDENTIFIER)) {
+                    method->returnType = DataType::OBJECT;
+                    advance();
+                } else {
+                    throw std::runtime_error("Expected return type after colon");
                 }
             }
             
@@ -1129,6 +1329,10 @@ std::unique_ptr<ClassDeclNode> Parser::parseClassDecl() {
             } else if (match(TokenType::INT64_TYPE)) {
                 fieldType = DataType::INT64;
                 fieldSize = 8;
+                advance();
+            } else if (match(TokenType::ANY_TYPE)) {
+                fieldType = DataType::ANY;
+                fieldSize = 16;
                 advance();
             } else {
                 throw std::runtime_error("Expected type for field");
@@ -1220,6 +1424,7 @@ std::string Parser::tokenTypeToString(TokenType type) {
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::INT32_TYPE: return "INT32_TYPE";
         case TokenType::INT64_TYPE: return "INT64_TYPE";
+        case TokenType::ANY_TYPE: return "ANY_TYPE";
         case TokenType::LITERAL: return "LITERAL";
         case TokenType::ASSIGN: return "ASSIGN (=)";
         case TokenType::SEMICOLON: return "SEMICOLON (;)";

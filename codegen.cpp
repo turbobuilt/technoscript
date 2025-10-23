@@ -3,7 +3,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
-#include "codegen_torch.h"
+// #include "codegen_torch.h"
 #include "codegen_array.h"
 
 // External C functions implementation
@@ -248,7 +248,7 @@ void CodeGenerator::visitNode(ASTNode* node) {
             generatePrintStmt(node);
             break;
         case AstNodeType::FUNCTION_DECL:
-            generateFunctionDecl(static_cast<FunctionDeclNode*>(node));
+            // Function bodies are generated during the upfront function pass.
             break;
         case AstNodeType::FUNCTION_CALL:
             generateFunctionCall(static_cast<FunctionCallNode*>(node));
@@ -271,6 +271,14 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::CLASS_DECL:
             generateClassDecl(static_cast<ClassDeclNode*>(node));
             break;
+        case AstNodeType::BRACKET_ACCESS: {
+            auto bracketAccess = static_cast<BracketAccessNode*>(node);
+            if (bracketAccess->objectExpression) {
+                visitNode(bracketAccess->objectExpression.get());
+            }
+            // Tensor segments removed; ignore segments
+            break;
+        }
         default:
             // For other nodes, just visit children
             for (auto& child : node->children) {
@@ -443,9 +451,14 @@ void CodeGenerator::generateVarDecl(VarDeclNode* varDecl) {
         // storeVariableInScope(varDecl->varName, x86::rax, currentScope, varDecl);
     } else {
         ASTNode* valueNode = varDecl->children[0].get();
-        // Load the value into a register
-        loadValue(valueNode, x86::rax);
-        storeVariableInScope(varDecl->varName, x86::rax, currentScope, valueNode);
+        if (varDecl->varType == DataType::ANY) {
+            loadAnyValue(valueNode, x86::rax, x86::rdx);
+            storeVariableInScope(varDecl->varName, x86::rax, currentScope, valueNode, x86::rdx);
+        } else {
+            // Load the value into a register using declared type
+            loadValue(valueNode, x86::rax, x86::r15, varDecl->varType);
+            storeVariableInScope(varDecl->varName, x86::rax, currentScope, valueNode);
+        }
     }
 }
 
@@ -460,31 +473,78 @@ void CodeGenerator::generateLetDecl(LetDeclNode* letDecl) {
     
     ASTNode* valueNode = letDecl->children[0].get();
     
-    // Load the value into a register
-    loadValue(valueNode, x86::rax);
+    // Load the value into a register using declared type
+    loadValue(valueNode, x86::rax, x86::r15, letDecl->varType);
     
     // Store the value in the current scope
     storeVariableInScope(letDecl->varName, x86::rax, currentScope, valueNode);
 }
 
 void CodeGenerator::assignVariable(VarDeclNode* varDecl, ASTNode* value) {
-    // Load the value into rax
-    loadValue(value, x86::rax);
+    // Load the value into rax using declared type
+    loadValue(value, x86::rax, x86::r15, varDecl->varType);
     
     // Store in the lexical scope at the variable's offset
     storeVariableInScope(varDecl->varName, x86::rax, currentScope, value);
 }
 
-void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourceScopeReg) {
+void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourceScopeReg, std::optional<DataType> expectedType) {
     if (!valueNode) return;
     
     std::cout << "DEBUG loadValue: node type = " << static_cast<int>(valueNode->type) << std::endl;
     
     switch (valueNode->type) {
         case AstNodeType::LITERAL: {
-            // Parse the literal value and load it
-            int64_t value = std::stoll(valueNode->value);
-            cb->mov(destReg, value);
+            auto* literal = static_cast<LiteralNode*>(valueNode);
+            DataType parseType = expectedType.value_or(DataType::INT64);
+            switch (parseType) {
+                case DataType::INT32: {
+                    if (literal->literalKind == LiteralType::STRING) {
+                        throw std::runtime_error("Expected numeric literal for int32");
+                    }
+                    int64_t value = std::stoll(literal->value);
+                    cb->mov(destReg, static_cast<int32_t>(value));
+                    break;
+                }
+                case DataType::INT64: {
+                    if (literal->literalKind == LiteralType::STRING) {
+                        throw std::runtime_error("Expected numeric literal for int64");
+                    }
+                    int64_t value = std::stoll(literal->value);
+                    cb->mov(destReg, value);
+                    break;
+                }
+                case DataType::FLOAT64: {
+                    if (literal->literalKind == LiteralType::STRING) {
+                        throw std::runtime_error("Expected numeric literal for float64");
+                    }
+                    double value = std::stod(literal->value);
+                    uint64_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    cb->mov(destReg, bits);
+                    break;
+                }
+                case DataType::ANY: {
+                    if (literal->literalKind == LiteralType::STRING) {
+                        throw std::runtime_error("String literal not supported for any without explicit handling");
+                    }
+                    double value = std::stod(literal->value);
+                    uint64_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    cb->mov(destReg, bits);
+                    break;
+                }
+                case DataType::STRING: {
+                    if (literal->literalKind != LiteralType::STRING) {
+                        throw std::runtime_error("Expected string literal for string type");
+                    }
+                    uint64_t strAddr = reinterpret_cast<uint64_t>(literal->value.c_str());
+                    cb->mov(destReg, strAddr);
+                    break;
+                }
+                default:
+                    throw std::runtime_error("Unsupported expected type for literal");
+            }
             break;
         }
         case AstNodeType::IDENTIFIER: {
@@ -548,7 +608,81 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourc
     }
 }
 
-void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope, ASTNode* valueNode) {
+void CodeGenerator::loadAnyValue(ASTNode* valueNode, x86::Gp valueReg, x86::Gp typeReg, x86::Gp sourceScopeReg) {
+    if (!valueNode) {
+        throw std::runtime_error("Null value node for any load");
+    }
+    
+    switch (valueNode->type) {
+        case AstNodeType::LITERAL: {
+            auto* literal = static_cast<LiteralNode*>(valueNode);
+            if (literal->literalKind == LiteralType::STRING) {
+                throw std::runtime_error("String literal not yet supported in any value");
+            }
+            double floatValue = std::stod(literal->value);
+            uint64_t bits;
+            std::memcpy(&bits, &floatValue, sizeof(bits));
+            cb->mov(valueReg, bits);
+            cb->mov(typeReg, static_cast<uint32_t>(DataType::FLOAT64));
+            break;
+        }
+        case AstNodeType::IDENTIFIER: {
+            auto* identifier = static_cast<IdentifierNode*>(valueNode);
+            if (!identifier->varRef) {
+                throw std::runtime_error("Identifier not analyzed for any load: " + identifier->value);
+            }
+            
+            switch (identifier->varRef->type) {
+                case DataType::ANY:
+                    loadVariableFromScope(identifier, typeReg, 0, sourceScopeReg);
+                    loadVariableFromScope(identifier, valueReg, 8, sourceScopeReg);
+                    break;
+                case DataType::INT32:
+                case DataType::INT64:
+                case DataType::FLOAT64:
+                case DataType::OBJECT:
+                    loadVariableFromScope(identifier, valueReg, 0, sourceScopeReg);
+                    cb->mov(typeReg, static_cast<uint32_t>(identifier->varRef->type));
+                    break;
+                default:
+                    throw std::runtime_error("Unsupported identifier type for any value: " + identifier->value);
+            }
+            break;
+        }
+        case AstNodeType::NEW_EXPR: {
+            generateNewExpr(static_cast<NewExprNode*>(valueNode), valueReg);
+            cb->mov(typeReg, static_cast<uint32_t>(DataType::OBJECT));
+            break;
+        }
+        case AstNodeType::MEMBER_ACCESS: {
+            auto* memberAccess = static_cast<MemberAccessNode*>(valueNode);
+            if (!memberAccess->classRef) {
+                throw std::runtime_error("Class reference missing for member access in any value");
+            }
+            auto fieldIt = memberAccess->classRef->fields.find(memberAccess->memberName);
+            if (fieldIt == memberAccess->classRef->fields.end()) {
+                throw std::runtime_error("Field not found for member access in any value: " + memberAccess->memberName);
+            }
+            DataType fieldType = fieldIt->second.type;
+            
+            x86::Gp objectReg = x86::r11;
+            loadValue(memberAccess->object.get(), objectReg);
+            
+            if (fieldType == DataType::ANY) {
+                cb->mov(typeReg, x86::qword_ptr(objectReg, memberAccess->memberOffset));
+                cb->mov(valueReg, x86::qword_ptr(objectReg, memberAccess->memberOffset + 8));
+            } else {
+                generateMemberAccess(memberAccess, valueReg);
+                cb->mov(typeReg, static_cast<uint32_t>(fieldType));
+            }
+            break;
+        }
+        default:
+            throw std::runtime_error("Unsupported node type for any value");
+    }
+}
+
+void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp valueReg, LexicalScopeNode* scope, ASTNode* valueNode, x86::Gp typeReg) {
     // Find the variable in the scope
     auto it = scope->variables.find(varName);
     if (it == scope->variables.end()) {
@@ -557,6 +691,31 @@ void CodeGenerator::storeVariableInScope(const std::string& varName, x86::Gp val
     
     int offset = it->second.offset;
     std::cout << "Storing variable '" << varName << "' at offset " << offset << " in scope" << std::endl;
+    
+    if (it->second.type == DataType::ANY) {
+        cb->mov(x86::ptr(x86::r15, offset), typeReg);
+        cb->mov(x86::ptr(x86::r15, offset + 8), valueReg);
+        
+        // If we're storing an object reference that's not a NEW expression, run the write barrier
+        if (valueNode && valueNode->type != AstNodeType::NEW_EXPR) {
+            Label skipObjectBarrier = cb->newLabel();
+            cb->cmp(typeReg, static_cast<uint32_t>(DataType::OBJECT));
+            cb->jne(skipObjectBarrier);
+            
+            cb->mov(x86::rcx, x86::qword_ptr(valueReg, ObjectLayout::FLAGS_OFFSET));  // Load flags
+            cb->test(x86::rcx, ObjectFlags::NEEDS_SET_FLAG);
+            
+            Label skipWriteBarrier = cb->newLabel();
+            cb->jz(skipWriteBarrier);  // Jump if NEEDS_SET_FLAG not set
+            
+            cb->or_(x86::qword_ptr(valueReg, ObjectLayout::FLAGS_OFFSET), ObjectFlags::SET_FLAG);
+            cb->mfence();
+            
+            cb->bind(skipWriteBarrier);
+            cb->bind(skipObjectBarrier);
+        }
+        return;
+    }
     
     // Store the value at [r15 + offset]
     cb->mov(x86::ptr(x86::r15, offset), valueReg);
@@ -697,19 +856,84 @@ void CodeGenerator::generatePrintStmt(ASTNode* printStmt) {
     
     ASTNode* arg = printStmt->children[0].get();
     
-    std::cout << "Generating call to print_int64" << std::endl;
-    
-    // Load the value to print into rdi (first argument register)
-    if (arg->type == AstNodeType::IDENTIFIER) {
-        loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rdi);
-    } else {
-        loadValue(arg, x86::rdi);
+    DataType detectedType = DataType::INT64;
+    if (arg->type == AstNodeType::LITERAL) {
+        auto* literal = static_cast<LiteralNode*>(arg);
+        detectedType = (literal->literalKind == LiteralType::STRING) ? DataType::STRING : DataType::INT64;
+    } else if (arg->type == AstNodeType::IDENTIFIER) {
+        auto* identifier = static_cast<IdentifierNode*>(arg);
+        if (identifier->varRef) {
+            detectedType = identifier->varRef->type;
+        }
+    } else if (arg->type == AstNodeType::MEMBER_ACCESS) {
+        auto* memberAccess = static_cast<MemberAccessNode*>(arg);
+        if (memberAccess->classRef) {
+            auto it = memberAccess->classRef->fields.find(memberAccess->memberName);
+            if (it != memberAccess->classRef->fields.end()) {
+                detectedType = it->second.type;
+            }
+        }
     }
     
-    // Call the external print function
-    uint64_t printAddr = reinterpret_cast<uint64_t>(&print_int64);
-    cb->mov(x86::rax, printAddr);
-    cb->call(x86::rax);
+    switch (detectedType) {
+        case DataType::ANY: {
+            if (arg->type == AstNodeType::IDENTIFIER) {
+                auto* identifier = static_cast<IdentifierNode*>(arg);
+                loadVariableFromScope(identifier, x86::rdi, 0);
+                loadVariableFromScope(identifier, x86::rsi, 8);
+            } else {
+                loadAnyValue(arg, x86::rsi, x86::rdi);
+            }
+            uint64_t printAddr = reinterpret_cast<uint64_t>(&print_any);
+            cb->sub(x86::rsp, 8); // Maintain 16-byte alignment for variadic call
+            cb->mov(x86::rax, printAddr);
+            cb->call(x86::rax);
+            cb->add(x86::rsp, 8);
+            break;
+        }
+        case DataType::FLOAT64: {
+            uint64_t bits = 0;
+            if (arg->type == AstNodeType::LITERAL) {
+                double floatValue = std::stod(static_cast<LiteralNode*>(arg)->value);
+                std::memcpy(&bits, &floatValue, sizeof(bits));
+                cb->mov(x86::rax, bits);
+            } else if (arg->type == AstNodeType::IDENTIFIER) {
+                loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax);
+            } else if (arg->type == AstNodeType::MEMBER_ACCESS) {
+                generateMemberAccess(static_cast<MemberAccessNode*>(arg), x86::rax);
+            } else {
+                throw std::runtime_error("Unsupported expression for float64 print");
+            }
+            cb->movq(x86::xmm0, x86::rax);
+            uint64_t printAddr = reinterpret_cast<uint64_t>(&print_float64);
+            cb->mov(x86::rax, printAddr);
+            cb->call(x86::rax);
+            break;
+        }
+        case DataType::STRING: {
+            if (arg->type != AstNodeType::LITERAL) {
+                throw std::runtime_error("String print currently supports only literals");
+            }
+            auto* literal = static_cast<LiteralNode*>(arg);
+            uint64_t strAddr = reinterpret_cast<uint64_t>(literal->value.c_str());
+            cb->mov(x86::rdi, strAddr);
+            uint64_t printAddr = reinterpret_cast<uint64_t>(&print_string);
+            cb->mov(x86::rax, printAddr);
+            cb->call(x86::rax);
+            break;
+        }
+        default: {
+            if (arg->type == AstNodeType::IDENTIFIER) {
+                loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rdi);
+            } else {
+                loadValue(arg, x86::rdi);
+            }
+            uint64_t printAddr = reinterpret_cast<uint64_t>(&print_int64);
+            cb->mov(x86::rax, printAddr);
+            cb->call(x86::rax);
+            break;
+        }
+    }
 }
 
 void CodeGenerator::printInt64(IdentifierNode* identifier) {
@@ -799,30 +1023,6 @@ void CodeGenerator::disassembleAndPrint(void* code, size_t codeSize) {
     }
 }
 
-void CodeGenerator::generateFunctionDecl(FunctionDeclNode* funcDecl) {
-    // This method should only be called from visitNode during the second pass
-    // for inline closure creation (not for actual function code generation)
-    std::cout << "generateFunctionDecl called during AST traversal for: " << funcDecl->funcName << std::endl;
-    std::cout << "  (Function code should already be generated from registry)" << std::endl;
-    
-    // If we're visiting a function declaration during normal AST traversal,
-    // it means we need to create the closure for it in the current scope
-    // The actual function code should already be generated
-    
-    Label* funcLabel = static_cast<Label*>(funcDecl->asmjitLabel);
-    if (!funcLabel) {
-        throw std::runtime_error("Function label not found for: " + funcDecl->funcName);
-    }
-    
-    // Store the function address in the closure at the current scope
-    LexicalScopeNode* definingScope = currentScope;
-    if (definingScope) {
-        storeFunctionAddressInClosure(funcDecl, definingScope);
-    } else {
-        std::cout << "  Warning: No current scope to store closure" << std::endl;
-    }
-}
-
 void CodeGenerator::createFunctionLabel(FunctionDeclNode* funcDecl) {
     // Create a new label for this function
     Label funcLabel = cb->newLabel();
@@ -837,6 +1037,10 @@ void CodeGenerator::generateFunctionPrologue(FunctionDeclNode* funcDecl) {
     // Standard function prologue
     cb->push(x86::rbp);
     cb->mov(x86::rbp, x86::rsp);
+    
+    // Preserve callee-saved registers we use for scope management
+    cb->push(x86::r14);
+    cb->push(x86::r15);
     
     // Special case: main function needs to allocate its own scope since it's not called via our convention
     if (funcDecl->funcName == "main") {
@@ -866,6 +1070,10 @@ void CodeGenerator::generateFunctionEpilogue(FunctionDeclNode* funcDecl) {
     
     // Use generic scope epilogue to free scope and restore parent scope pointer
     generateScopeEpilogue(funcDecl);
+    
+    // Restore preserved callee-saved registers
+    cb->pop(x86::r15);
+    cb->pop(x86::r14);
     
     // Standard function epilogue
     cb->mov(x86::rsp, x86::rbp);
@@ -906,37 +1114,56 @@ void CodeGenerator::storeFunctionAddressInClosure(FunctionDeclNode* funcDecl, Le
     int scopeIndex = 0;
     for (const auto& neededDepth : funcDecl->allNeeded) {
         int scopeOffset = offset + 16 + (scopeIndex * 8); // function_address (8) + size (8) + scope_pointers
-        
+        bool handled = false;
+
         // Special case: if we're in the scope that matches the needed depth,
         // we don't need to look up parameter mapping - use current scope directly
         if (scope->depth == neededDepth) {
             cb->mov(x86::rax, x86::r15); // current scope address
-            cb->mov(x86::ptr(x86::r15, scopeOffset), x86::rax); // store in closure at proper offset
-            scopeIndex++;
-            continue;
-        }
-        
-        // find parameter index in scopeDepthToParentParameterIndexMap
-        auto it = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
-        if (it == scope->scopeDepthToParentParameterIndexMap.end()) {
-            throw std::runtime_error("Needed variable not found in scope: " + std::to_string(neededDepth));
-        }
-        // r14 value if -1
-        if (it->second == -1) {
-            cb->mov(x86::ptr(x86::r15, scopeOffset), x86::r14); // parent scope address at proper offset
-            scopeIndex++;
-            continue;
-        } 
-        // cast to FunctionDeclNode
-        auto funcDeclParent = dynamic_cast<FunctionDeclNode*>(scope);
+            handled = true;
+        } else {
+            // find parameter index in scopeDepthToParentParameterIndexMap
+            auto mapIt = scope->scopeDepthToParentParameterIndexMap.find(neededDepth);
+            if (mapIt == scope->scopeDepthToParentParameterIndexMap.end()) {
+                throw std::runtime_error("Needed variable not found in scope: " + std::to_string(neededDepth));
+            }
 
-        // index - paramsInfo.size() gives the hidden parameter index in hiddenParamsInfo
-        int hiddenParamIndex = it->second - funcDeclParent->paramsInfo.size();
-        if (hiddenParamIndex < 0 || hiddenParamIndex >= static_cast<int>(funcDeclParent->hiddenParamsInfo.size())) {
-            throw std::runtime_error("Hidden parameter index out of range for needed variable: " + std::to_string(neededDepth));
+            int paramIndex = mapIt->second;
+            if (paramIndex == -1) {
+                // Immediate parent scope lives in r14
+                cb->mov(x86::rax, x86::r14);
+                handled = true;
+            } else if (auto funcDeclParent = dynamic_cast<FunctionDeclNode*>(scope)) {
+                // Function scope: parent pointers are stored in hidden parameters
+                int hiddenParamIndex = paramIndex - static_cast<int>(funcDeclParent->paramsInfo.size());
+                if (hiddenParamIndex < 0 || hiddenParamIndex >= static_cast<int>(funcDeclParent->hiddenParamsInfo.size())) {
+                    throw std::runtime_error("Hidden parameter index out of range for needed variable: " + std::to_string(neededDepth));
+                }
+                int hiddenParamOffset = funcDeclParent->hiddenParamsInfo[hiddenParamIndex].offset;
+                cb->mov(x86::rax, x86::ptr(x86::r15, hiddenParamOffset)); // load parent scope address from current scope's parameters
+                handled = true;
+            } else {
+                // Block scope: parent pointers are stored sequentially after metadata
+                int blockIndex = -1;
+                for (size_t i = 0; i < scope->allNeeded.size(); ++i) {
+                    if (scope->allNeeded[i] == neededDepth) {
+                        blockIndex = static_cast<int>(i);
+                        break;
+                    }
+                }
+                if (blockIndex < 0) {
+                    throw std::runtime_error("Block scope missing needed depth: " + std::to_string(neededDepth));
+                }
+                int parentPtrOffset = 8 + (blockIndex * 8);
+                cb->mov(x86::rax, x86::ptr(x86::r15, parentPtrOffset));
+                handled = true;
+            }
         }
-        int hiddenParamOffset = funcDeclParent->hiddenParamsInfo[hiddenParamIndex].offset;
-        cb->mov(x86::rax, x86::ptr(x86::r15, hiddenParamOffset)); // load parent scope address from current scope's parameters
+
+        if (!handled) {
+            throw std::runtime_error("Failed to resolve scope pointer for closure: " + funcDecl->funcName);
+        }
+
         cb->mov(x86::ptr(x86::r15, scopeOffset), x86::rax); // store in closure at proper offset
         scopeIndex++;
     }
@@ -987,6 +1214,13 @@ void CodeGenerator::generateScopePrologue(LexicalScopeNode* scope) {
         }
         
         scopeIndex++;
+    }
+
+    // Create closures for any nested functions declared in this block scope
+    for (const auto& [name, varInfo] : scope->variables) {
+        if (varInfo.type == DataType::CLOSURE && varInfo.funcNode) {
+            storeFunctionAddressInClosure(varInfo.funcNode, scope);
+        }
     }
 }
 
@@ -1075,7 +1309,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
         // First parameter is "this"
         const VariableInfo& thisParam = targetFunc->paramsInfo[0];
         std::cout << "  Copying 'this' to scope[" << thisParam.offset << "]" << std::endl;
-        loadValue(methodCall->object.get(), x86::rax, x86::r14);
+        loadValue(methodCall->object.get(), x86::rax, x86::r14, DataType::OBJECT);
         cb->mov(x86::ptr(x86::r15, thisParam.offset), x86::rax);
         
         // Then copy explicit method arguments
@@ -1089,7 +1323,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
                 // Load from caller's scope (r14) 
                 loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax, 0, x86::r14);
             } else {
-                loadValue(arg, x86::rax, x86::r14);
+                loadValue(arg, x86::rax, x86::r14, param.type);
             }
             cb->mov(x86::ptr(x86::r15, param.offset), x86::rax);
         }
@@ -1105,7 +1339,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
                 // Load from caller's scope (r14)
                 loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax, 0, x86::r14);
             } else {
-                loadValue(arg, x86::rax, x86::r14);
+                loadValue(arg, x86::rax, x86::r14, param.type);
             }
             cb->mov(x86::ptr(x86::r15, param.offset), x86::rax);
         }
@@ -1115,7 +1349,7 @@ void CodeGenerator::generateFunctionCall(FunctionCallNode* funcCall) {
     // For method calls, load from object; for regular calls, load from variable
     if (isMethodCall) {
         // Load object pointer into rbx
-        loadValue(methodCall->object.get(), x86::rbx, x86::r14);
+        loadValue(methodCall->object.get(), x86::rbx, x86::r14, DataType::OBJECT);
         // Add offset to get to the method closure pointer in the object
         int closurePtrOffset = ObjectLayout::HEADER_SIZE + methodCall->methodClosureOffset;
         std::cout << "  Loading method closure pointer from object at offset " << closurePtrOffset << std::endl;
@@ -1202,7 +1436,7 @@ void CodeGenerator::generateGoStmt(GoStmtNode* goStmt) {
             // Load from our scope (r13 has our original scope)
             loadVariableFromScope(static_cast<IdentifierNode*>(arg), x86::rax, 0, x86::r13);
         } else {
-            loadValue(arg, x86::rax, x86::r13);
+            loadValue(arg, x86::rax, x86::r13, param.type);
         }
         cb->mov(x86::ptr(x86::r15, param.offset), x86::rax);
     }
@@ -1317,24 +1551,11 @@ void CodeGenerator::generateAwaitExpr(ASTNode* awaitExpr, x86::Gp destReg) {
     ASTNode* asyncOp = awaitExpr->children[0].get();
     generateSleepCall(asyncOp, x86::rdi); // Put promise ID directly in rdi (first argument register)
     
-    // Save registers before calling runtime function
-    cb->push(x86::rcx);
-    cb->push(x86::r8);
-    cb->push(x86::r9);
-    cb->push(x86::r10);
-    cb->push(x86::r11);
     
     // Call runtime_await_promise(promiseId) - promise ID is already in rdi
     uint64_t runtimeAddr = reinterpret_cast<uint64_t>(&runtime_await_promise);
     cb->mov(x86::rax, runtimeAddr);
     cb->call(x86::rax);
-    
-    // Restore registers
-    cb->pop(x86::r11);
-    cb->pop(x86::r10);
-    cb->pop(x86::r9);
-    cb->pop(x86::r8);
-    cb->pop(x86::rcx);
     
     // Result (resolved value) is in rax, move to destReg if different
     if (destReg.id() != x86::rax.id()) {
@@ -1525,12 +1746,45 @@ void CodeGenerator::generateMemberAssign(MemberAssignNode* memberAssign) {
     x86::Gp objectPtrReg = x86::r10;
     loadValue(member->object.get(), objectPtrReg);
     
-    // Load the value to assign into another register
-    x86::Gp valueReg = x86::rax;
-    loadValue(memberAssign->value.get(), valueReg);
+    DataType fieldType = DataType::INT64;
+    auto fieldIt = member->classRef->fields.find(member->memberName);
+    if (fieldIt != member->classRef->fields.end()) {
+        fieldType = fieldIt->second.type;
+    }
     
     // Use the pre-calculated absolute offset (already includes header)
     int actualOffset = member->memberOffset;
+    
+    if (fieldType == DataType::ANY) {
+        loadAnyValue(memberAssign->value.get(), x86::rax, x86::rdx);
+        cb->mov(x86::qword_ptr(objectPtrReg, actualOffset), x86::rdx);
+        cb->mov(x86::qword_ptr(objectPtrReg, actualOffset + 8), x86::rax);
+        
+        if (memberAssign->value->type != AstNodeType::NEW_EXPR) {
+            Label skipObjectBarrier = cb->newLabel();
+            cb->cmp(x86::rdx, static_cast<uint32_t>(DataType::OBJECT));
+            cb->jne(skipObjectBarrier);
+            
+            cb->mov(x86::rcx, x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET));
+            cb->test(x86::rcx, ObjectFlags::NEEDS_SET_FLAG);
+            
+            Label skipWriteBarrier = cb->newLabel();
+            cb->jz(skipWriteBarrier);
+            
+            cb->or_(x86::qword_ptr(x86::rax, ObjectLayout::FLAGS_OFFSET), ObjectFlags::SET_FLAG);
+            cb->mfence();
+            
+            cb->bind(skipWriteBarrier);
+            cb->bind(skipObjectBarrier);
+        }
+        
+        std::cout << "Generated member assignment for ANY field" << std::endl;
+        return;
+    }
+    
+    // Load the value to assign into another register
+    x86::Gp valueReg = x86::rax;
+    loadValue(memberAssign->value.get(), valueReg, x86::r15, fieldType);
     
     std::cout << "DEBUG generateMemberAssign: Storing to object pointer + " << actualOffset 
               << " (absolute offset)" << std::endl;

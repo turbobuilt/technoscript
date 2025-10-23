@@ -1,6 +1,7 @@
 #include "gc.h"
 #include "goroutine.h"
 #include "ast.h"
+#include "data_structures/safe_unordered_list.h"
 #include <iostream>
 #include <algorithm>
 #include <atomic>
@@ -243,6 +244,20 @@ void GoroutineGCState::popScope() {
     }
 }
 
+// Add and remove object methods (defined here since they use SafeUnorderedList)
+void GoroutineGCState::addObject(void* obj) {
+    // Ensure list exists
+    if (!allocatedObjects) {
+        allocatedObjects = new SafeUnorderedList();
+    }
+    allocatedObjects->add(obj);
+}
+
+void GoroutineGCState::removeObject(void* obj) {
+    if (!allocatedObjects) return;
+    allocatedObjects->remove(obj);
+}
+
 // GarbageCollector implementation
 GarbageCollector::GarbageCollector() {
     std::cout << "GarbageCollector initialized with signal-based checkpointing" << std::endl;
@@ -318,19 +333,21 @@ void GarbageCollector::requestCollection() {
 
 std::vector<void*> GarbageCollector::collectAllAllocatedObjects() {
     std::vector<void*> allObjects;
-    
+
     // Get all goroutines from EventLoop
     auto allGoroutines = EventLoop::getInstance().getAllGoroutines();
-    
+
     for (auto& goroutine : allGoroutines) {
         if (goroutine && goroutine->gcState) {
-            std::lock_guard<std::mutex> lock(goroutine->gcState->allocationMutex);
-            allObjects.insert(allObjects.end(), 
-                             goroutine->gcState->allocatedObjects.begin(),
-                             goroutine->gcState->allocatedObjects.end());
+            // Snapshot from per-goroutine SafeUnorderedList
+            std::vector<void*> snapshot;
+            if (goroutine->gcState->allocatedObjects) {
+                goroutine->gcState->allocatedObjects->snapshot(snapshot);
+                allObjects.insert(allObjects.end(), snapshot.begin(), snapshot.end());
+            }
         }
     }
-    
+
     return allObjects;
 }
 
@@ -1011,11 +1028,11 @@ extern "C" {
         }
     }
     
-    void gc_pop_scope() {
-        if (currentTask && currentTask->gcState) {
-            currentTask->gcState->popScope();
-        }
+void gc_pop_scope() {
+    if (currentTask && currentTask->gcState) {
+        currentTask->gcState->popScope();
     }
+}
     
     // NOTE: gc_handle_assignment and gc_handle_scope_assignment are now inlined
     // directly in the generated assembly code for better performance.
