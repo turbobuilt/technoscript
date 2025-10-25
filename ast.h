@@ -28,7 +28,7 @@ enum class AstNodeType {
 
 enum class DataType {
     INT32, INT64, FLOAT64, ANY, STRING,
-    CLOSURE, PROMISE, OBJECT,
+    CLOSURE, PROMISE, OBJECT, RAW_MEMORY,
     // Tensor types removed
 };
 
@@ -70,6 +70,7 @@ namespace VariablePacking {
             case DataType::CLOSURE: return 8; // Base pointer size, actual size calculated elsewhere
             case DataType::PROMISE: return 8;
             case DataType::OBJECT: return 8; // Base pointer size, actual size calculated elsewhere
+            case DataType::RAW_MEMORY: return 8;
             default: return 8;
         }
     }
@@ -460,6 +461,8 @@ class NewExprNode : public ASTNode {
 public:
     std::string className;
     ClassDeclNode* classRef = nullptr; // Set during analysis
+    std::vector<std::unique_ptr<ASTNode>> args;
+    bool isRawMemory = false;
     
     NewExprNode(const std::string& name) 
         : ASTNode(AstNodeType::NEW_EXPR), className(name) {}

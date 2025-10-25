@@ -628,10 +628,16 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
             varType = DataType::ANY;
             advance();
         } else if (match(TokenType::IDENTIFIER)) {
-            // Custom type (class name)
-            varType = DataType::OBJECT;
-            customTypeName = current().value;
-            advance();
+            std::string typeName = current().value;
+            if (typeName == "RawMemory") {
+                varType = DataType::RAW_MEMORY;
+                advance();
+            } else {
+                // Custom type (class name)
+                varType = DataType::OBJECT;
+                customTypeName = typeName;
+                advance();
+            }
         } else {
             throw std::runtime_error("Expected type");
         }
@@ -653,10 +659,31 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
         advance(); // consume NEW
         std::string className = current().value;
         expect(TokenType::IDENTIFIER);
-        expect(TokenType::LPAREN);
-        expect(TokenType::RPAREN); // For now, no constructor arguments
-        
         auto newExpr = std::make_unique<NewExprNode>(className);
+        expect(TokenType::LPAREN);
+
+        if (!match(TokenType::RPAREN)) {
+            while (true) {
+                auto arg = parseExpression();
+                newExpr->args.push_back(std::move(arg));
+                if (!match(TokenType::COMMA)) {
+                    break;
+                }
+                advance(); // consume comma
+            }
+        }
+
+        expect(TokenType::RPAREN);
+
+        if (className == "RawMemory") {
+            newExpr->isRawMemory = true;
+            if (newExpr->args.size() != 1) {
+                throw std::runtime_error("RawMemory constructor expects exactly one argument");
+            }
+            varType = DataType::RAW_MEMORY;
+            customTypeName.clear();
+        }
+
         varDecl->children.push_back(std::move(newExpr));
     } else if (match(TokenType::LITERAL)) {
         varDecl->children.push_back(std::make_unique<LiteralNode>(current().value, LiteralType::NUMERIC));
@@ -707,6 +734,9 @@ std::unique_ptr<VarDeclNode> Parser::parseVarDecl() {
     } else {
         throw std::runtime_error("Expected literal, await expression, or identifier after assignment");
     }
+    
+    varDecl->varType = varType;
+    varDecl->customTypeName = customTypeName;
     
     expect(TokenType::SEMICOLON);
     

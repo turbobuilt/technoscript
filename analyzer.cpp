@@ -143,10 +143,20 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
             analyzeNodeSinglePass(unaryExpr->operand.get(), currentScope, depth + 1);
         }
     } else if (node->type == AstNodeType::NEW_EXPR) {
-        // Handle new expressions - resolve the class reference
         auto newExpr = static_cast<NewExprNode*>(node);
-        newExpr->classRef = findClass(newExpr->className);
-        std::cout << "DEBUG: Resolved NEW_EXPR for class '" << newExpr->className << "'" << std::endl;
+
+        // Analyze constructor arguments first
+        for (auto& arg : newExpr->args) {
+            analyzeNodeSinglePass(arg.get(), currentScope, depth + 1);
+        }
+
+        if (newExpr->isRawMemory) {
+            std::cout << "DEBUG: Encountered RawMemory NEW_EXPR" << std::endl;
+        } else {
+            // Handle new expressions - resolve the class reference
+            newExpr->classRef = findClass(newExpr->className);
+            std::cout << "DEBUG: Resolved NEW_EXPR for class '" << newExpr->className << "'" << std::endl;
+        }
     } else if (node->type == AstNodeType::MEMBER_ACCESS) {
         // Handle member access - resolve class and field offset
         auto memberAccess = static_cast<MemberAccessNode*>(node);
@@ -301,15 +311,38 @@ void Analyzer::analyzeNodeSinglePass(ASTNode* node, LexicalScopeNode* parentScop
         // Get the object's class
         ASTNode* objectNode = methodCall->object.get();
         ClassDeclNode* objectClass = nullptr;
+        bool objectIsRawMemory = false;
         
         if (objectNode->type == AstNodeType::IDENTIFIER) {
             auto identifier = static_cast<IdentifierNode*>(objectNode);
-            if (identifier->varRef && identifier->varRef->type == DataType::OBJECT) {
-                objectClass = identifier->varRef->classNode;
+            if (identifier->varRef) {
+                if (identifier->varRef->type == DataType::OBJECT) {
+                    objectClass = identifier->varRef->classNode;
+                } else if (identifier->varRef->type == DataType::RAW_MEMORY) {
+                    objectIsRawMemory = true;
+                }
             }
         } else if (objectNode->type == AstNodeType::THIS_EXPR) {
             // 'this' in a method call
             objectClass = currentClassContext;
+        } else if (objectNode->type == AstNodeType::NEW_EXPR) {
+            auto newExpr = static_cast<NewExprNode*>(objectNode);
+            if (newExpr->isRawMemory) {
+                objectIsRawMemory = true;
+            } else {
+                objectClass = newExpr->classRef;
+            }
+        }
+
+        if (objectIsRawMemory) {
+            if (methodCall->methodName != "release") {
+                throw std::runtime_error("RawMemory only supports .release()");
+            }
+            if (!methodCall->args.empty()) {
+                throw std::runtime_error("RawMemory.release() does not take arguments");
+            }
+            std::cout << "DEBUG: Resolved RawMemory release call" << std::endl;
+            return;
         }
         
         if (!objectClass) {

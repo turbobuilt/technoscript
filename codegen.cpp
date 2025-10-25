@@ -253,9 +253,15 @@ void CodeGenerator::visitNode(ASTNode* node) {
         case AstNodeType::FUNCTION_CALL:
             generateFunctionCall(static_cast<FunctionCallNode*>(node));
             break;
-        case AstNodeType::METHOD_CALL:
-            generateFunctionCall(static_cast<MethodCallNode*>(node));
+        case AstNodeType::METHOD_CALL: {
+            auto methodCall = static_cast<MethodCallNode*>(node);
+            if (isRawMemoryReleaseCall(methodCall)) {
+                generateRawMemoryRelease(methodCall);
+            } else {
+                generateFunctionCall(methodCall);
+            }
             break;
+        }
         case AstNodeType::GO_STMT:
             generateGoStmt(static_cast<GoStmtNode*>(node));
             break;
@@ -573,7 +579,7 @@ void CodeGenerator::loadValue(ASTNode* valueNode, x86::Gp destReg, x86::Gp sourc
         }
         case AstNodeType::NEW_EXPR: {
             // Handle new expression
-            generateNewExpr(static_cast<NewExprNode*>(valueNode), destReg);
+            generateNewExpr(static_cast<NewExprNode*>(valueNode), destReg, sourceScopeReg);
             break;
         }
         case AstNodeType::MEMBER_ACCESS: {
@@ -641,6 +647,7 @@ void CodeGenerator::loadAnyValue(ASTNode* valueNode, x86::Gp valueReg, x86::Gp t
                 case DataType::INT64:
                 case DataType::FLOAT64:
                 case DataType::OBJECT:
+                case DataType::RAW_MEMORY:
                     loadVariableFromScope(identifier, valueReg, 0, sourceScopeReg);
                     cb->mov(typeReg, static_cast<uint32_t>(identifier->varRef->type));
                     break;
@@ -650,8 +657,10 @@ void CodeGenerator::loadAnyValue(ASTNode* valueNode, x86::Gp valueReg, x86::Gp t
             break;
         }
         case AstNodeType::NEW_EXPR: {
-            generateNewExpr(static_cast<NewExprNode*>(valueNode), valueReg);
-            cb->mov(typeReg, static_cast<uint32_t>(DataType::OBJECT));
+            auto* newExpr = static_cast<NewExprNode*>(valueNode);
+            generateNewExpr(newExpr, valueReg, sourceScopeReg);
+            DataType resultType = newExpr->isRawMemory ? DataType::RAW_MEMORY : DataType::OBJECT;
+            cb->mov(typeReg, static_cast<uint32_t>(resultType));
             break;
         }
         case AstNodeType::MEMBER_ACCESS: {
@@ -1609,8 +1618,33 @@ void CodeGenerator::generateSleepCall(ASTNode* sleepCall, x86::Gp destReg) {
     std::cout << "Generated sleep call - promise ID returned" << std::endl;
 }
 
-void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
+void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg, x86::Gp sourceScopeReg) {
     std::cout << "Generating new expression for class: " << newExpr->className << std::endl;
+
+    if (newExpr->isRawMemory) {
+        if (newExpr->args.size() != 1) {
+            throw std::runtime_error("RawMemory allocation expects exactly one size argument");
+        }
+
+        // Load size argument into rsi (second argument for calloc)
+        loadValue(newExpr->args[0].get(), x86::rsi, sourceScopeReg, DataType::INT64);
+
+        // Set number of elements to 1 (first argument for calloc)
+        cb->mov(x86::rdi, 1);
+
+        // Call calloc wrapper to allocate zeroed memory
+        uint64_t callocAddr = reinterpret_cast<uint64_t>(&calloc_wrapper);
+        cb->mov(x86::rax, callocAddr);
+        cb->call(x86::rax);
+
+        // Result pointer returned in rax
+        if (destReg.id() != x86::rax.id()) {
+            cb->mov(destReg, x86::rax);
+        }
+
+        std::cout << "Generated RawMemory allocation - pointer returned" << std::endl;
+        return;
+    }
     
     // Verify that the class reference was set during analysis
     if (!newExpr->classRef) {
@@ -1693,6 +1727,67 @@ void CodeGenerator::generateNewExpr(NewExprNode* newExpr, x86::Gp destReg) {
     }
     
     std::cout << "Generated new expression - object pointer returned" << std::endl;
+}
+
+void CodeGenerator::generateRawMemoryRelease(MethodCallNode* methodCall) {
+    std::cout << "Generating RawMemory release call" << std::endl;
+
+    if (!methodCall->args.empty()) {
+        throw std::runtime_error("RawMemory.release() does not take arguments");
+    }
+
+    // Load the raw memory pointer into rdi (first argument for free)
+    loadValue(methodCall->object.get(), x86::rdi, x86::r15, DataType::RAW_MEMORY);
+
+    uint64_t freeAddr = reinterpret_cast<uint64_t>(&free_wrapper);
+    cb->mov(x86::rax, freeAddr);
+    cb->call(x86::rax);
+
+    std::cout << "Emitted RawMemory release call" << std::endl;
+}
+
+bool CodeGenerator::isRawMemoryReleaseCall(MethodCallNode* methodCall) const {
+    if (!methodCall) {
+        return false;
+    }
+    if (methodCall->methodName != "release") {
+        return false;
+    }
+    if (methodCall->args.size() != 0) {
+        return false;
+    }
+    if (!methodCall->object) {
+        return false;
+    }
+
+    ASTNode* objectNode = methodCall->object.get();
+
+    switch (objectNode->type) {
+        case AstNodeType::IDENTIFIER: {
+            auto identifier = static_cast<IdentifierNode*>(objectNode);
+            return identifier->varRef && identifier->varRef->type == DataType::RAW_MEMORY;
+        }
+        case AstNodeType::NEW_EXPR: {
+            auto newExpr = static_cast<NewExprNode*>(objectNode);
+            return newExpr->isRawMemory;
+        }
+        case AstNodeType::MEMBER_ACCESS: {
+            auto memberAccess = static_cast<MemberAccessNode*>(objectNode);
+            if (!memberAccess->classRef) {
+                return false;
+            }
+            auto fieldIt = memberAccess->classRef->fields.find(memberAccess->memberName);
+            return fieldIt != memberAccess->classRef->fields.end() &&
+                   fieldIt->second.type == DataType::RAW_MEMORY;
+        }
+        case AstNodeType::FUNCTION_CALL:
+        case AstNodeType::METHOD_CALL: {
+            auto funcCall = static_cast<FunctionCallNode*>(objectNode);
+            return funcCall->varRef && funcCall->varRef->type == DataType::RAW_MEMORY;
+        }
+        default:
+            return false;
+    }
 }
 
 void CodeGenerator::generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp destReg) {

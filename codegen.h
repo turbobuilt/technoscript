@@ -97,9 +97,11 @@ private:
     void generateSetTimeoutStmt(SetTimeoutStmtNode* setTimeoutStmt);
     void generateAwaitExpr(ASTNode* awaitExpr, x86::Gp destReg);
     void generateSleepCall(ASTNode* sleepCall, x86::Gp destReg);
-    void generateNewExpr(NewExprNode* newExpr, x86::Gp destReg);
+    void generateNewExpr(NewExprNode* newExpr, x86::Gp destReg, x86::Gp sourceScopeReg = x86::r15);
     void generateMemberAccess(MemberAccessNode* memberAccess, x86::Gp destReg);
     void generateMemberAssign(MemberAssignNode* memberAssign);
+    void generateRawMemoryRelease(MethodCallNode* methodCall);
+    bool isRawMemoryReleaseCall(MethodCallNode* methodCall) const;
     void generateClassDecl(ClassDeclNode* classDecl);
     
     // Assembly library wrapper methods for internal use

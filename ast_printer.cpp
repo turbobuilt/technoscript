@@ -77,6 +77,10 @@ void printAST(ASTNode* node, int indent) {
                             closureSize += var.funcNode->allNeeded.size() * 8;
                         }
                         std::cout << "closure:" << closureSize;
+                    } else if (var.type == DataType::OBJECT) {
+                        std::cout << "object";
+                    } else if (var.type == DataType::RAW_MEMORY) {
+                        std::cout << "raw_memory";
                     }
                     std::cout << ")";
                 }
@@ -150,6 +154,7 @@ void printAST(ASTNode* node, int indent) {
                 else if (fieldInfo.type == DataType::FLOAT64) std::cout << "float64";
                 else if (fieldInfo.type == DataType::ANY) std::cout << "any";
                 else if (fieldInfo.type == DataType::OBJECT) std::cout << "object";
+                else if (fieldInfo.type == DataType::RAW_MEMORY) std::cout << "raw_memory";
                 std::cout << "@" << fieldInfo.offset;
             }
             if (!classDecl->methods.empty()) {

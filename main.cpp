@@ -12,8 +12,9 @@ int main(int argc, char* argv[]) {
     
     std::cout << "DEBUG: Using built-in test program" << std::endl;
         std::string code = R"(
-var x = 10;
-print(x);
+var x: RawMemory = new RawMemory(32);
+x[0] = 42;
+print(x[0]);
 )";
 // class Dog {
 //     age: int64
